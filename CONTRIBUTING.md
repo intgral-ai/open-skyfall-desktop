@@ -2,11 +2,22 @@
 
 Agents: start from the router in [AGENTS.md](AGENTS.md), which points to a short skill in [`skills/`](skills/README.md) for each kind of work. This page stays the full human guide.
 
-SolidCraft is an open-source parametric 3D CAD app written in pure Rust.
+SolidCraft is an open-source parametric 3D CAD app whose application, native host and core
+remain Rust and wasm-compatible.
 You sketch on a plane, constrain the sketch, turn profiles into solids, and
 change a parameter to watch the timeline rebuild. It runs as a desktop app (Windows, macOS, Linux), in
 the browser (wasm + WebGPU/WebGL2), headless from a CLI, and as an MCP server that AI agents can
 model with.
+
+The **desktop-only Mastra distribution exception** permits a separate opt-in
+TypeScript companion under `packages/mastra-runtime/`: its workflows/client adapters,
+a pinned Node executable and necessary production dependencies. It does not permit
+TypeScript in the engine or host, or in the web build. The browser advertises this
+runtime as unavailable and has no Node dependency. Follow the
+[hosting contract](docs/mastra-runtime.md#1-product-and-distribution-decisions) and
+[distribution gates](docs/mastra-distribution.md); this permission is not approval
+of an actual runtime. #7's real source/build audits and #14's installed-package,
+signature and non-inclusion evidence remain required.
 
 Help is welcome, whether that's a one-line fix or owning a whole area. This page covers how to
 build it, how the code is laid out, the few rules that aren't negotiable, and where help is
@@ -111,8 +122,9 @@ The [architecture page](docs/architecture.md) has the layer table. The short ver
 1. **Independent.** SolidCraft is independent. Behaviour is designed from public
    documentation, general CAD conventions and user feedback. Reference tests use analytic values
    and open-source tools. We don't drive, script, automate or extract data from commercial CAD
-   products, and we never copy another product's code, icons, artwork, help text, tooltips,
-   templates or materials. Command ids are our own (`solid.fillet`).
+   products. Other-product code, icons, artwork, help text, tooltips, templates and materials
+   remain excluded; only the scoped intgral-ai source grant below permits selected non-CAD
+   code adaptation. Command ids are our own (`solid.fillet`).
 2. **No GPL/LGPL/AGPL code, not even reading it.** That rules out OpenCASCADE, FreeCAD
    (including planegcs), SolveSpace, CadQuery/OCP, LibreCAD and QCAD. SolidCraft is
    MIT OR Apache-2.0, and its solver and blends are written from the maths. (Running an
@@ -120,6 +132,19 @@ The [architecture page](docs/architecture.md) has the layer table. The short ver
    not.) Permissive
    dependencies are fine. Note which one you're adding and why in the PR. THIRD-PARTY-LICENSES.txt
    lists it once the change lands: the Generated files workflow rewrites it on `main`.
+   `cargo xtask licences --check` inventories Cargo crates (and bundled font notices),
+   not npm/Node or per-file source rights. It cannot approve the desktop companion.
+   The [durable source-rights record](docs/mastra-distribution.md#scoped-owner-instruction)
+   and [`source-records.json`](packaging/mastra/source-records.json) bind the grant to
+   `intgral-ai/intgral-vector-studio` at `acb5048120b53ae1b4502724b70d1283e8c9daf4`:
+   selected intgral-ai-owned orchestration/agent-loop/model-runtime code may be adapted
+   for public redistribution under `MIT OR Apache-2.0` only after per-file ownership,
+   source/adapted bytes, applicable-license, notice, dependency and independent third-party
+   review. The grant neither asserts every file is original nor relicenses third-party
+   content. Account/database/server-bootstrap/script-execution code and every `ee/`
+   input remain excluded; it covers no CAD/UI assets. Record verified evidence before
+   copying; admitted files retain applicable notices and need real pending attribution.
+   The five selected source records remain `unverified`, and real artifact approvals remain empty.
    Nightly/manual CI also scans advisories, bans and sources with cargo-deny, and a PR that
    changes Cargo.lock or a Cargo.toml checks the advisories; see
    [the local command and coverage limits](docs/book/src/dev/testing.md#dependency-advisories).

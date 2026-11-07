@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "1.0",
+  "policyId": "solidcraft-desktop-mastra-v1",
+  "sourceRecordsPath": "packaging/mastra/source-records.json",
+  "supportedTargets": [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu"
+  ],
+  "allowedLicenseExpressions": [
+    "Apache-2.0",
+    "MIT",
+    "MIT OR Apache-2.0"
+  ],
+  "forbiddenPathComponents": ["ee"],
+  "approvals": []
+}

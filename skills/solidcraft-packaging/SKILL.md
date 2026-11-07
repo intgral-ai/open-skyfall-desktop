@@ -7,6 +7,9 @@ description: "Use when preparing or shipping a SolidCraft release, changing inst
 
 Development pushes are not application releases. Pushing to `main` or pushing a tag does not start a release. The full procedure is `docs/releasing.md`; follow it when asked to prepare or ship a release.
 
+## desktop-only Mastra distribution exception
+For the opt-in desktop TS companion in `packages/mastra-runtime/`, follow `docs/mastra-distribution.md` and `skills/solidcraft-ground-rules/SKILL.md`; host/core stay Rust/wasm, web has no Node/runtime. Cargo is not npm/Node or file-rights clearance. #7 real source/build audits and #14 installed/signature checks remain required. Runtime-required jobs need `artifact`/`verified` and JSON status + exit 0, never policy or host-only.
+
 ## Preparing
 1. Choose one version for the whole batch from the actual changes (patch, minor, major, `-rc.N`). Do not infer it from commit prefixes. Moving to `1.0` is the owner's decision.
 2. Update `[workspace.package] version` in `Cargo.toml`, then `cargo update --workspace --offline`; only our own crates' `version =` lines in `Cargo.lock` change.

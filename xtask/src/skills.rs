@@ -312,6 +312,15 @@ mod tests {
     }
 
     #[test]
+    fn distribution_router_remains_a_short_valid_router() {
+        let router = std::fs::read_to_string(crate::root().join("AGENTS.md")).unwrap().replace("\r\n", "\n");
+        let chars = router.chars().count();
+        assert!(chars <= ROUTER_MAX_CHARS, "AGENTS.md is {chars} characters; limit {ROUTER_MAX_CHARS}");
+        assert!(xtask_commands(crate::USAGE).iter().any(|name| name == "runtime-artifact"));
+        // this_repository_passes exercises path resolution and the complete router via check().
+    }
+
+    #[test]
     fn a_consistent_router_passes() {
         let docs = [router("| a | `skills/solidcraft-a/SKILL.md` |"), doc("skills/solidcraft-a/SKILL.md", SKILL)];
         assert_eq!(problems(&docs, &["skills/solidcraft-a/SKILL.md"]), Vec::<String>::new());
