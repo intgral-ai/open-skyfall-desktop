@@ -1,0 +1,1 @@
+{"kind":"request","method":"session.reset","params":{"instructions":"hi","nextSessionId":"next"},"protocolVersion":"1.0","requestId":"h:","scope":{"sessionId":"s","turnId":null}}

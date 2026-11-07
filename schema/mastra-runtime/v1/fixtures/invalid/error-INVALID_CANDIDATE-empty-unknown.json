@@ -1,0 +1,8 @@
+{
+  "code": "INVALID_CANDIDATE",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

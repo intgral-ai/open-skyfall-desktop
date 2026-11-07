@@ -1,0 +1,21 @@
+{
+  "candidateId": "candidate",
+  "capturedAt": "2026-11-05T12:00:00.000Z",
+  "engineVersion": "1",
+  "formatVersion": "solidcraft/fixture",
+  "inputs": [
+    {
+      "dependencyId": "design",
+      "dependencyVersion": null,
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "design",
+      "path": "../live.sc",
+      "sizeBytes": 1
+    }
+  ],
+  "schemaVersion": "1.0",
+  "source": {
+    "documentId": "doc-A",
+    "revision": "9007199254740993"
+  }
+}

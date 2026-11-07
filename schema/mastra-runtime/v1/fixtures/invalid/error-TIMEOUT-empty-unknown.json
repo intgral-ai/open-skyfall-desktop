@@ -1,0 +1,8 @@
+{
+  "code": "TIMEOUT",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

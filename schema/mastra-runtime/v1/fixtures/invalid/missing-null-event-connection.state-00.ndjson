@@ -1,0 +1,1 @@
+{"data":{"authMethods":[{"description":"Host UI","id":"sign-in","name":"Sign in"}],"connectionId":"c","state":"auth_required"},"event":"connection.state","kind":"event","protocolVersion":"1.0","scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"},"sequence":1}

@@ -1,0 +1,11 @@
+{
+  "code": "STALE_DOCUMENT",
+  "details": {
+    "expected": {
+      "documentId": "doc-A",
+      "revision": "9007199254740993"
+    }
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

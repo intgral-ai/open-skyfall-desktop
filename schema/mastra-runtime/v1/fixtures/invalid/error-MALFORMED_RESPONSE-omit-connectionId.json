@@ -1,0 +1,8 @@
+{
+  "code": "MALFORMED_RESPONSE",
+  "details": {
+    "httpStatus": 429
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

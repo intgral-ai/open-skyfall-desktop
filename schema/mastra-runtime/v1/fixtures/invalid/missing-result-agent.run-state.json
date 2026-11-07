@@ -1,0 +1,11 @@
+{
+  "agentSessionId": "as",
+  "content": [
+    {
+      "text": "hi",
+      "type": "text"
+    }
+  ],
+  "stopReason": "stop",
+  "usage": null
+}

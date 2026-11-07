@@ -1,0 +1,7 @@
+{
+  "code": "OUTCOME_UNKNOWN",
+  "details": {
+    "operation": "request.cancel"
+  },
+  "message": "Redacted diagnostic."
+}

@@ -1,0 +1,9 @@
+{
+  "code": "STALE_DOCUMENT",
+  "details": {
+    "current": null,
+    "expected": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

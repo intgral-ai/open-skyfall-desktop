@@ -1,0 +1,7 @@
+{
+  "code": "INTERNAL_ERROR",
+  "details": {
+    "operation": "request.cancel"
+  },
+  "retry": "never"
+}

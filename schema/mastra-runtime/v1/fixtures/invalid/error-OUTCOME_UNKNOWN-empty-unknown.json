@@ -1,0 +1,8 @@
+{
+  "code": "OUTCOME_UNKNOWN",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

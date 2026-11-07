@@ -1,0 +1,8 @@
+{
+  "code": "DEPENDENCY_CHANGED",
+  "details": {
+    "dependencyId": "dependency"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

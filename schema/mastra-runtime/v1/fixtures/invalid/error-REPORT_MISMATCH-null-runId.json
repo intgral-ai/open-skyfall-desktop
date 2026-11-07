@@ -1,0 +1,9 @@
+{
+  "code": "REPORT_MISMATCH",
+  "details": {
+    "profileId": "profile",
+    "runId": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

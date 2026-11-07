@@ -1,0 +1,7 @@
+{
+  "code": "INVALID_PROPOSAL",
+  "details": {
+    "connectionId": "c"
+  },
+  "retry": "never"
+}

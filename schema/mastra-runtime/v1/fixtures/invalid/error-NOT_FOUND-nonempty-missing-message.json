@@ -1,0 +1,8 @@
+{
+  "code": "NOT_FOUND",
+  "details": {
+    "artifactId": "artifact",
+    "runId": "run"
+  },
+  "retry": "never"
+}

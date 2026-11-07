@@ -1,0 +1,7 @@
+{
+  "code": "IDEMPOTENCY_CONFLICT",
+  "details": {
+    "submissionRequestId": "submission"
+  },
+  "retry": "never"
+}

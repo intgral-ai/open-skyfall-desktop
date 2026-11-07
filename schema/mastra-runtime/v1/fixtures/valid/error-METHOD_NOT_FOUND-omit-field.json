@@ -1,0 +1,8 @@
+{
+  "code": "METHOD_NOT_FOUND",
+  "details": {
+    "method": "model.generate"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

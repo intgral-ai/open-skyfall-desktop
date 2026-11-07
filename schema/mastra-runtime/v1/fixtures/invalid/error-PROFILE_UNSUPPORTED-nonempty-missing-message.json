@@ -1,0 +1,8 @@
+{
+  "code": "PROFILE_UNSUPPORTED",
+  "details": {
+    "profileId": "profile",
+    "runId": "run"
+  },
+  "retry": "never"
+}

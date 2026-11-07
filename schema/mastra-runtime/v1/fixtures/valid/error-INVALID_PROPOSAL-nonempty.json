@@ -1,0 +1,8 @@
+{
+  "code": "INVALID_PROPOSAL",
+  "details": {
+    "connectionId": "c"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

@@ -1,0 +1,9 @@
+{
+  "code": "IDEMPOTENCY_CONFLICT",
+  "details": {
+    "submissionRequestId": "submission",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

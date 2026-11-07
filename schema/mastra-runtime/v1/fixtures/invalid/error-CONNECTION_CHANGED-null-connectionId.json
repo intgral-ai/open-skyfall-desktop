@@ -1,0 +1,8 @@
+{
+  "code": "CONNECTION_CHANGED",
+  "details": {
+    "connectionId": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

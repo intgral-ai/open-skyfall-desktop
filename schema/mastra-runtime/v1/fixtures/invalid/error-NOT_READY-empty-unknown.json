@@ -1,0 +1,8 @@
+{
+  "code": "NOT_READY",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

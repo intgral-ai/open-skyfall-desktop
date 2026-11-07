@@ -1,0 +1,1 @@
+{"data":{"agentSessionId":"as","content":{"permissionId":"p","state":"waiting","title":"Allow?"},"kind":"permission"},"event":"agent.progress","kind":"event","protocolVersion":"1.0","scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"},"sequence":1}

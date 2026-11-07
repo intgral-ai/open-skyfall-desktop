@@ -1,0 +1,10 @@
+{
+  "code": "INVALID_CANDIDATE",
+  "details": {
+    "candidateId": "candidate",
+    "dependencyId": "dependency",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

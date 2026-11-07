@@ -1,0 +1,9 @@
+{
+  "code": "MODEL_ERROR",
+  "details": {
+    "connectionId": "c",
+    "httpStatus": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

@@ -1,0 +1,1 @@
+{"data":{"connectionId":"c","state":"auth_required"},"event":"connection.state","kind":"event","protocolVersion":"1.0","requestId":null,"scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"},"sequence":1}

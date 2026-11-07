@@ -1,0 +1,9 @@
+{
+  "code": "DEPENDENCY_CHANGED",
+  "details": {
+    "candidateId": null,
+    "dependencyId": "dependency"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

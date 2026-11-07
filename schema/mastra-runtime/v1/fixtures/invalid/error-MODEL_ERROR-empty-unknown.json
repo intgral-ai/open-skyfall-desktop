@@ -1,0 +1,8 @@
+{
+  "code": "MODEL_ERROR",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

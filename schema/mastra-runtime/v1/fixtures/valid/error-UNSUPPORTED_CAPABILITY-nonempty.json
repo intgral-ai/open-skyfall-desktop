@@ -1,0 +1,8 @@
+{
+  "code": "UNSUPPORTED_CAPABILITY",
+  "details": {
+    "capability": "tools"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

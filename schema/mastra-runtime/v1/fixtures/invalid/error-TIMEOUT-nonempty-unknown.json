@@ -1,0 +1,9 @@
+{
+  "code": "TIMEOUT",
+  "details": {
+    "operation": "request.cancel",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

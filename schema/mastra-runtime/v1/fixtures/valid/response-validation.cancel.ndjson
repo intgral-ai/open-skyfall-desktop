@@ -1,0 +1,1 @@
+{"kind":"response","outcome":"ok","protocolVersion":"1.0","requestId":"r:","result":{"runId":"v","state":"cancelled"},"scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"}}

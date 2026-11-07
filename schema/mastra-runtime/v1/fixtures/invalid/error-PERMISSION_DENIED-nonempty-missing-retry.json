@@ -1,0 +1,7 @@
+{
+  "code": "PERMISSION_DENIED",
+  "details": {
+    "permissionId": "permission"
+  },
+  "message": "Redacted diagnostic."
+}

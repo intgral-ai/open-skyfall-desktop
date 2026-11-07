@@ -1,0 +1,9 @@
+{
+  "code": "INCOMPATIBLE_VERSION",
+  "details": {
+    "supported": [
+      "1.0"
+    ]
+  },
+  "message": "Redacted diagnostic."
+}

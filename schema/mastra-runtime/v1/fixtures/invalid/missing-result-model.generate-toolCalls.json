@@ -1,0 +1,12 @@
+{
+  "content": [
+    {
+      "text": "hi",
+      "type": "text"
+    }
+  ],
+  "continuation": null,
+  "delivery": "buffered",
+  "finishReason": "tool_calls",
+  "usage": null
+}

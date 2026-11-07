@@ -1,0 +1,13 @@
+{
+  "agentSessionId": "as",
+  "content": [
+    {
+      "text": "hi",
+      "type": "text"
+    }
+  ],
+  "state": "completed",
+  "stopReason": "stop",
+  "undeclared": true,
+  "usage": null
+}

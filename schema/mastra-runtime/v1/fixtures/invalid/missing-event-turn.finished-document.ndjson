@@ -1,0 +1,1 @@
+{"data":{"changes":"unknown","reason":"user","report":null,"state":"cancelled","validationRunId":null},"event":"turn.finished","kind":"event","protocolVersion":"1.0","requestId":null,"scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"},"sequence":1}

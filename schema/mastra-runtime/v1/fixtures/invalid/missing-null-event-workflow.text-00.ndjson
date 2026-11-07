@@ -1,0 +1,1 @@
+{"data":{"channel":"answer","text":"hello"},"event":"workflow.text","kind":"event","protocolVersion":"1.0","scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"},"sequence":1}

@@ -1,0 +1,495 @@
+{
+  "id": "nested-callback",
+  "initialLimits": {
+    "activeTurns": 1,
+    "attachmentBytes": 4194304,
+    "attachmentTotalBytes": 16777216,
+    "attachments": 4,
+    "cadReadsInFlight": 4,
+    "cadWritesInFlight": 1,
+    "callDefaultSeconds": 300,
+    "callMaxSeconds": 600,
+    "cancelAckSeconds": 5,
+    "checks": 128,
+    "continuationBytes": 16777216,
+    "continuationHandles": 32,
+    "continuationTtlSeconds": 86400,
+    "controlLaneBytes": 65536,
+    "controlSlots": 1,
+    "evidenceArtifacts": 64,
+    "evidenceBytes": 16777216,
+    "evidenceTotalBytes": 67108864,
+    "frameBytes": 8388608,
+    "handshakeSeconds": 10,
+    "historyBytes": 16777216,
+    "historyMessages": 128,
+    "httpPerConnection": 2,
+    "httpPerHost": 8,
+    "jobRecords": 10000,
+    "jsonDepth": 64,
+    "manifestBytes": 1048576,
+    "modelMessages": 128,
+    "pendingRequests": 32,
+    "queueBytes": 16777216,
+    "reportBytes": 4194304,
+    "requestLedgerEntries": 4096,
+    "retentionSeconds": 604800,
+    "runtimeInstances": 8,
+    "sessionStartSeconds": 30,
+    "sessions": 1,
+    "shutdownSeconds": 3,
+    "snapshotBytes": 1073741824,
+    "snapshotInputs": 256,
+    "stderrBytes": 65536,
+    "stderrLineScalars": 400,
+    "stderrLines": 40,
+    "storeBytes": "8589934592",
+    "textBytes": 262144,
+    "toolCalls": 32,
+    "toolDefinitions": 64,
+    "toolJsonBytes": 65536,
+    "validationQueue": 8,
+    "validationQueueSeconds": 300,
+    "validationSeconds": 600,
+    "validationWorkers": 2
+  },
+  "schemaVersion": "1.0",
+  "steps": [
+    {
+      "path": "fixtures/valid/trace-nested-callback-000.ndjson",
+      "phase": "bootstrap",
+      "tag": "host_request"
+    },
+    {
+      "actions": [
+        {
+          "action": "send",
+          "frame": {
+            "kind": "request",
+            "method": "runtime.hello",
+            "params": {
+              "hostVersion": "1",
+              "limits": {
+                "activeTurns": 1,
+                "attachmentBytes": 4194304,
+                "attachmentTotalBytes": 16777216,
+                "attachments": 4,
+                "cadReadsInFlight": 4,
+                "cadWritesInFlight": 1,
+                "callDefaultSeconds": 300,
+                "callMaxSeconds": 600,
+                "cancelAckSeconds": 5,
+                "checks": 128,
+                "continuationBytes": 16777216,
+                "continuationHandles": 32,
+                "continuationTtlSeconds": 86400,
+                "controlLaneBytes": 65536,
+                "controlSlots": 1,
+                "evidenceArtifacts": 64,
+                "evidenceBytes": 16777216,
+                "evidenceTotalBytes": 67108864,
+                "frameBytes": 8388608,
+                "handshakeSeconds": 10,
+                "historyBytes": 16777216,
+                "historyMessages": 128,
+                "httpPerConnection": 2,
+                "httpPerHost": 8,
+                "jobRecords": 10000,
+                "jsonDepth": 64,
+                "manifestBytes": 1048576,
+                "modelMessages": 128,
+                "pendingRequests": 32,
+                "queueBytes": 16777216,
+                "reportBytes": 4194304,
+                "requestLedgerEntries": 4096,
+                "retentionSeconds": 604800,
+                "runtimeInstances": 8,
+                "sessionStartSeconds": 30,
+                "sessions": 1,
+                "shutdownSeconds": 3,
+                "snapshotBytes": 1073741824,
+                "snapshotInputs": 256,
+                "stderrBytes": 65536,
+                "stderrLineScalars": 400,
+                "stderrLines": 40,
+                "storeBytes": "8589934592",
+                "textBytes": 262144,
+                "toolCalls": 32,
+                "toolDefinitions": 64,
+                "toolJsonBytes": 65536,
+                "validationQueue": 8,
+                "validationQueueSeconds": 300,
+                "validationSeconds": 600,
+                "validationWorkers": 2
+              },
+              "supportedVersions": [
+                "1.0"
+              ]
+            },
+            "protocolVersion": "1.0",
+            "requestId": "h:hello",
+            "scope": {
+              "sessionId": null,
+              "turnId": null,
+              "workflowRunId": null
+            }
+          },
+          "lane": "data"
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-002.ndjson",
+      "phase": "bootstrap",
+      "tag": "runtime_frame"
+    },
+    {
+      "actions": [
+        {
+          "action": "finished",
+          "method": "runtime.hello",
+          "requestId": "h:hello",
+          "result": {
+            "capabilities": {
+              "guardedBatch": false,
+              "guardedExecute": false,
+              "hostAgentTasks": true,
+              "hostModelCalls": true,
+              "snapshotValidation": false,
+              "workflowIds": [
+                "w"
+              ]
+            },
+            "limits": {
+              "activeTurns": 1,
+              "attachmentBytes": 4194304,
+              "attachmentTotalBytes": 16777216,
+              "attachments": 4,
+              "cadReadsInFlight": 4,
+              "cadWritesInFlight": 1,
+              "callDefaultSeconds": 300,
+              "callMaxSeconds": 600,
+              "cancelAckSeconds": 5,
+              "checks": 128,
+              "continuationBytes": 16777216,
+              "continuationHandles": 32,
+              "continuationTtlSeconds": 86400,
+              "controlLaneBytes": 65536,
+              "controlSlots": 1,
+              "evidenceArtifacts": 64,
+              "evidenceBytes": 16777216,
+              "evidenceTotalBytes": 67108864,
+              "frameBytes": 8388608,
+              "handshakeSeconds": 10,
+              "historyBytes": 16777216,
+              "historyMessages": 128,
+              "httpPerConnection": 2,
+              "httpPerHost": 8,
+              "jobRecords": 10000,
+              "jsonDepth": 64,
+              "manifestBytes": 1048576,
+              "modelMessages": 128,
+              "pendingRequests": 32,
+              "queueBytes": 16777216,
+              "reportBytes": 4194304,
+              "requestLedgerEntries": 4096,
+              "retentionSeconds": 604800,
+              "runtimeInstances": 8,
+              "sessionStartSeconds": 30,
+              "sessions": 1,
+              "shutdownSeconds": 3,
+              "snapshotBytes": 1073741824,
+              "snapshotInputs": 256,
+              "stderrBytes": 65536,
+              "stderrLineScalars": 400,
+              "stderrLines": 40,
+              "storeBytes": "8589934592",
+              "textBytes": 262144,
+              "toolCalls": 32,
+              "toolDefinitions": 64,
+              "toolJsonBytes": 65536,
+              "validationQueue": 8,
+              "validationQueueSeconds": 300,
+              "validationSeconds": 600,
+              "validationWorkers": 2
+            },
+            "runtimeInstanceId": "i",
+            "runtimeVersion": "1",
+            "selectedVersion": "1.0"
+          },
+          "scope": {
+            "sessionId": null,
+            "turnId": null,
+            "workflowRunId": null
+          }
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-004.ndjson",
+      "phase": "negotiated",
+      "tag": "runtime_frame"
+    },
+    {
+      "actions": [
+        {
+          "action": "ready",
+          "runtimeInstanceId": "i"
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-006.ndjson",
+      "phase": "negotiated",
+      "tag": "host_request"
+    },
+    {
+      "actions": [
+        {
+          "action": "send",
+          "frame": {
+            "kind": "request",
+            "method": "session.start",
+            "params": {
+              "bridge": null,
+              "instructions": "hi",
+              "workflowId": "w"
+            },
+            "protocolVersion": "1.0",
+            "requestId": "h:session",
+            "scope": {
+              "sessionId": "s",
+              "turnId": null,
+              "workflowRunId": null
+            }
+          },
+          "lane": "data"
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-008.ndjson",
+      "phase": "negotiated",
+      "tag": "runtime_frame"
+    },
+    {
+      "actions": [
+        {
+          "action": "finished",
+          "method": "session.start",
+          "requestId": "h:session",
+          "result": {
+            "state": "ready",
+            "workflowId": "w"
+          },
+          "scope": {
+            "sessionId": "s",
+            "turnId": null,
+            "workflowRunId": null
+          }
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-010.ndjson",
+      "phase": "negotiated",
+      "tag": "host_request"
+    },
+    {
+      "actions": [
+        {
+          "action": "send",
+          "frame": {
+            "kind": "request",
+            "method": "turn.start",
+            "params": {
+              "binding": {
+                "connectionId": "c",
+                "document": {
+                  "documentId": "d",
+                  "revision": "18446744073709551615"
+                },
+                "modelId": "m",
+                "profile": {
+                  "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                  "profileId": "p",
+                  "version": "1"
+                },
+                "workflowId": "w"
+              },
+              "budgets": {
+                "agentTasks": 4,
+                "cadCommands": 64,
+                "modelCalls": 20,
+                "repairs": 2,
+                "validationRuns": 3,
+                "wallTimeSeconds": 1200
+              },
+              "context": {
+                "requirements": null,
+                "selection": [
+                  {
+                    "large": 9007199254740992,
+                    "x": -1.25
+                  }
+                ]
+              },
+              "parts": [
+                {
+                  "text": "hi",
+                  "type": "text"
+                }
+              ]
+            },
+            "protocolVersion": "1.0",
+            "requestId": "h:turn",
+            "scope": {
+              "sessionId": "s",
+              "turnId": "t",
+              "workflowRunId": "w"
+            }
+          },
+          "lane": "data"
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-012.ndjson",
+      "phase": "negotiated",
+      "tag": "runtime_frame"
+    },
+    {
+      "actions": [
+        {
+          "action": "dispatch",
+          "cancelled": false,
+          "deadlineMs": 1000,
+          "method": "model.generate",
+          "params": {
+            "connectionId": "c",
+            "continuation": null,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "text": "hi",
+                    "type": "text"
+                  }
+                ],
+                "role": "user",
+                "toolCallId": null,
+                "toolCalls": []
+              }
+            ],
+            "modelId": "m",
+            "options": {
+              "delivery": "buffered",
+              "maxOutputTokens": null,
+              "outputSchema": null,
+              "reasoningEffort": null,
+              "temperature": null,
+              "timeoutSeconds": 1
+            },
+            "tools": [
+              {
+                "description": "exact",
+                "inputSchema": {
+                  "properties": {
+                    "x": {
+                      "minimum": -1.25
+                    }
+                  },
+                  "type": "object"
+                },
+                "name": "measure"
+              }
+            ]
+          },
+          "scope": {
+            "sessionId": "s",
+            "turnId": "t",
+            "workflowRunId": "w"
+          }
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "operation": "callback",
+      "path": "fixtures/valid/trace-nested-callback-reply-14.json",
+      "requestId": "r:call",
+      "tag": "host_complete"
+    },
+    {
+      "actions": [
+        {
+          "action": "send",
+          "frame": {
+            "kind": "response",
+            "outcome": "ok",
+            "protocolVersion": "1.0",
+            "requestId": "r:call",
+            "result": {
+              "content": [
+                {
+                  "text": "hi",
+                  "type": "text"
+                }
+              ],
+              "continuation": null,
+              "delivery": "buffered",
+              "finishReason": "tool_calls",
+              "toolCalls": [
+                {
+                  "arguments": {
+                    "n": 9007199254740992,
+                    "x": -1.25
+                  },
+                  "id": "call",
+                  "name": "measure"
+                }
+              ],
+              "usage": null
+            },
+            "scope": {
+              "sessionId": "s",
+              "turnId": "t",
+              "workflowRunId": "w"
+            }
+          },
+          "lane": "data"
+        }
+      ],
+      "tag": "expect_actions"
+    },
+    {
+      "path": "fixtures/valid/trace-nested-callback-016.ndjson",
+      "phase": "negotiated",
+      "tag": "runtime_frame"
+    },
+    {
+      "actions": [
+        {
+          "action": "finished",
+          "method": "turn.start",
+          "requestId": "h:turn",
+          "result": {
+            "state": "accepted"
+          },
+          "scope": {
+            "sessionId": "s",
+            "turnId": "t",
+            "workflowRunId": "w"
+          }
+        }
+      ],
+      "tag": "expect_actions"
+    }
+  ]
+}

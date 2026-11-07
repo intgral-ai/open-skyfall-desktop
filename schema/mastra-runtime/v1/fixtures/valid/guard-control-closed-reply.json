@@ -1,0 +1,1 @@
+{"id":4,"ok":false,"error":"stale","errorDetails":{"code":"STALE_DOCUMENT","message":"stale","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}}}

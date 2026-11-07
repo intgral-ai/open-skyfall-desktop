@@ -1,0 +1,1 @@
+{"id":2,"ok":true,"result":{"completed":2,"results":[{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},{"name":"width","expression":"30 mm","value":30.0,"display_value":30.0,"recomputed":0,"restored":0,"errors":[]}],"undone":0},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}

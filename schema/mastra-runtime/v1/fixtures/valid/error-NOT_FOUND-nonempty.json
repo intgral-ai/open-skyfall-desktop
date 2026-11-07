@@ -1,0 +1,9 @@
+{
+  "code": "NOT_FOUND",
+  "details": {
+    "artifactId": "artifact",
+    "runId": "run"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

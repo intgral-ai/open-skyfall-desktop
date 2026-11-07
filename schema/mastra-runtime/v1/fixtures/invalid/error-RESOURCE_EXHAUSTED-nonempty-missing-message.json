@@ -1,0 +1,8 @@
+{
+  "code": "RESOURCE_EXHAUSTED",
+  "details": {
+    "limit": 32,
+    "resource": "pendingRequests"
+  },
+  "retry": "never"
+}

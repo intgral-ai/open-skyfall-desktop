@@ -1,0 +1,1 @@
+{"kind":"request","method":"turn.cancel","params":{"reason":"user"},"protocolVersion":"1.0","requestId":"r:wrong","scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"}}

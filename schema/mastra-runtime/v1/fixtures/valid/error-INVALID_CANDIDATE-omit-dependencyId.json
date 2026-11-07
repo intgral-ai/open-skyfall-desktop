@@ -1,0 +1,8 @@
+{
+  "code": "INVALID_CANDIDATE",
+  "details": {
+    "candidateId": "candidate"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

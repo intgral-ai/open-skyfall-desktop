@@ -1,0 +1,8 @@
+{
+  "code": "TASK_FAILED",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

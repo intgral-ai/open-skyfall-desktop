@@ -1,0 +1,30 @@
+{
+  "reference": {
+    "artifactId": "a",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "mediaType": "application/json",
+    "sizeBytes": 1
+  },
+  "report": {
+    "candidateDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "candidateId": "c",
+    "checks": [],
+    "error": null,
+    "finishedAt": "2026-11-05T12:00:00.000Z",
+    "manifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "profile": {
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "profileId": "p",
+      "version": "1"
+    },
+    "runId": "v",
+    "runner": {
+      "engineVersion": "1",
+      "runnerId": "r",
+      "version": "1"
+    },
+    "schemaVersion": "1.0",
+    "startedAt": null,
+    "state": "cancelled"
+  }
+}

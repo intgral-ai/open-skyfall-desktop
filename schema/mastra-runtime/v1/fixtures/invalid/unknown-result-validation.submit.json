@@ -1,0 +1,25 @@
+{
+  "candidate": {
+    "artifact": {
+      "artifactId": "a",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "mediaType": "application/json",
+      "sizeBytes": 1
+    },
+    "candidateDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "candidateId": "c",
+    "manifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "source": {
+      "documentId": "d",
+      "revision": "18446744073709551615"
+    }
+  },
+  "profile": {
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "profileId": "p",
+    "version": "1"
+  },
+  "runId": "v",
+  "state": "queued",
+  "undeclared": true
+}

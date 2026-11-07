@@ -1,0 +1,9 @@
+{
+  "code": "RESOURCE_EXHAUSTED",
+  "details": {
+    "limit": null,
+    "resource": "pendingRequests"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}
