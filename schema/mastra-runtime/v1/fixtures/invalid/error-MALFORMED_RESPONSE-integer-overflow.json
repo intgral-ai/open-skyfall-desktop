@@ -1,0 +1,9 @@
+{
+  "code": "MALFORMED_RESPONSE",
+  "details": {
+    "connectionId": "c",
+    "httpStatus": 2147483648
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

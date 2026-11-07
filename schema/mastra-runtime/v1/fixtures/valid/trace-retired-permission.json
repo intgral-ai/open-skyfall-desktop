@@ -1,0 +1,9 @@
+{
+  "agentSessionId": "old-agent",
+  "content": {
+    "permissionId": "old-permission",
+    "state": "waiting",
+    "title": "Retired"
+  },
+  "kind": "permission"
+}

@@ -1,0 +1,5 @@
+{
+  "code": "IDEMPOTENCY_CONFLICT",
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

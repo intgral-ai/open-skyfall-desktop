@@ -1,0 +1,22 @@
+{
+  "after": null,
+  "before": {
+    "documentId": "doc-A",
+    "revision": "9007199254740993"
+  },
+  "completed": null,
+  "error": null,
+  "expectation": null,
+  "request": {
+    "bridgeId": "bridge",
+    "mcpSessionId": "mcp",
+    "requestId": "request"
+  },
+  "rollback": {
+    "attempted": false,
+    "requested": false,
+    "restored": null,
+    "undone": null
+  },
+  "state": "unknown"
+}

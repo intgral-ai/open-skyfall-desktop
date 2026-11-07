@@ -1,0 +1,11 @@
+{
+  "details": {
+    "current": null,
+    "expected": {
+      "documentId": "doc-A",
+      "revision": "9007199254740993"
+    }
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

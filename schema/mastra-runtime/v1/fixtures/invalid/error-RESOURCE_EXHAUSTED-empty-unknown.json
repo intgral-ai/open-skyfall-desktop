@@ -1,0 +1,8 @@
+{
+  "code": "RESOURCE_EXHAUSTED",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

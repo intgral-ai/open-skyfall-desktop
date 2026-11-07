@@ -1,0 +1,11 @@
+{
+  "code": "INCOMPATIBLE_VERSION",
+  "details": {
+    "supported": [
+      "1.0"
+    ],
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

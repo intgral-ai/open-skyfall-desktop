@@ -1,0 +1,16 @@
+{
+  "continuation": null,
+  "delivery": "buffered",
+  "finishReason": "tool_calls",
+  "toolCalls": [
+    {
+      "arguments": {
+        "n": 9007199254740992,
+        "x": -1.25
+      },
+      "id": "call",
+      "name": "measure"
+    }
+  ],
+  "usage": null
+}

@@ -1,0 +1,8 @@
+{
+  "details": {
+    "candidateId": "candidate",
+    "dependencyId": "dependency"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

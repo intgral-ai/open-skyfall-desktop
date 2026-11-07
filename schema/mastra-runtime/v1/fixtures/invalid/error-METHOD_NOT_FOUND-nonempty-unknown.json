@@ -1,0 +1,10 @@
+{
+  "code": "METHOD_NOT_FOUND",
+  "details": {
+    "field": "params",
+    "method": "model.generate",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

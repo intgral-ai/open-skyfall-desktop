@@ -1,0 +1,9 @@
+{
+  "code": "CONNECTION_CHANGED",
+  "details": {
+    "connectionId": "c",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

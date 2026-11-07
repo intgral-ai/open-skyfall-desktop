@@ -1,0 +1,7 @@
+{
+  "code": "CONNECTION_CHANGED",
+  "details": {
+    "connectionId": "c"
+  },
+  "message": "Redacted diagnostic."
+}

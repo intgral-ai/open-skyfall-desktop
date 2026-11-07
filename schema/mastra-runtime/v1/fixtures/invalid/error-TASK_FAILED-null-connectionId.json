@@ -1,0 +1,8 @@
+{
+  "code": "TASK_FAILED",
+  "details": {
+    "connectionId": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

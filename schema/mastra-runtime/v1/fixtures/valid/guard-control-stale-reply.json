@@ -1,0 +1,1 @@
+{"id":3,"ok":false,"error":"The document changed before this write could apply.","errorDetails":{"code":"STALE_DOCUMENT","message":"The document changed before this write could apply.","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":{"documentId":"doc-A","revision":"9007199254740994"}}}}

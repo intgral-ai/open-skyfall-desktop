@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"execute","arguments":{"command":"file.new","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}}

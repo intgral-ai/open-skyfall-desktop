@@ -1,0 +1,9 @@
+{
+  "code": "PROFILE_UNSUPPORTED",
+  "details": {
+    "profileId": null,
+    "runId": "run"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

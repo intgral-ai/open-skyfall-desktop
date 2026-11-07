@@ -1,0 +1,1 @@
+{"kind":"request","method":"session.reset","params":{"instructions":"reset","nextSessionId":"next"},"protocolVersion":"1.0","requestId":"h:reset","scope":{"sessionId":"s","turnId":null,"workflowRunId":null}}

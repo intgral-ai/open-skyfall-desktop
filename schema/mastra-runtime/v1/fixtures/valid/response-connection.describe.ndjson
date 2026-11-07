@@ -1,0 +1,1 @@
+{"kind":"response","outcome":"ok","protocolVersion":"1.0","requestId":"r:","result":{"authMethods":[],"capabilities":{"agentRun":false,"delivery":"buffered","documents":false,"images":false,"modelGenerate":false,"modelSelection":false,"structuredOutput":false,"tools":false,"usage":false},"state":"available"},"scope":{"sessionId":"s","turnId":null,"workflowRunId":null}}

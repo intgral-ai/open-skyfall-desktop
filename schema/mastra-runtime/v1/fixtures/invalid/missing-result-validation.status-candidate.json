@@ -1,0 +1,11 @@
+{
+  "profile": {
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "profileId": "p",
+    "version": "1"
+  },
+  "reportAvailable": false,
+  "runId": "v",
+  "state": "running",
+  "updatedAt": "2026-11-05T12:00:00.000Z"
+}

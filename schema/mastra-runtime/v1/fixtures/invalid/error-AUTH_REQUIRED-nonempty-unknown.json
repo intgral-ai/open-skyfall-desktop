@@ -1,0 +1,9 @@
+{
+  "code": "AUTH_REQUIRED",
+  "details": {
+    "connectionId": "c",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

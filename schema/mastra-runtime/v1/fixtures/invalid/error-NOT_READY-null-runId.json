@@ -1,0 +1,9 @@
+{
+  "code": "NOT_READY",
+  "details": {
+    "artifactId": "artifact",
+    "runId": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

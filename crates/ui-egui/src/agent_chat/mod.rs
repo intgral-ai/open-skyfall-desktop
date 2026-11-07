@@ -30,11 +30,14 @@ pub mod discover;
 pub mod gate;
 mod markdown;
 mod markdown_view;
+pub mod mastra_protocol;
 mod panel;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod paste;
 #[cfg(not(target_arch = "wasm32"))]
 mod process;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod runtime_client;
 pub mod settings;
 pub mod summary;
 

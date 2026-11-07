@@ -14,7 +14,7 @@
 //! listed in [`LIST`], one a line, `<path>:<function> <what it decides with the mesh>`, sorted
 //! (the kernel rig's known-failing format). The list only shrinks: the check fails on a site the
 //! list does not name, and on a listed site that no longer uses a mesh (its fix removes its
-//! line), as `tests/KNOWN_FAILING_TESTS` and `schema/unconverted.txt` do.
+//! line), as `tests/KNOWN_FAILING_TESTS` and `crates/engine/src/schema/unconverted.txt` do.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

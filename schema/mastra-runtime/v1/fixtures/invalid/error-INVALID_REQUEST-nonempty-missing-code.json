@@ -1,0 +1,8 @@
+{
+  "details": {
+    "field": "params",
+    "method": "model.generate"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

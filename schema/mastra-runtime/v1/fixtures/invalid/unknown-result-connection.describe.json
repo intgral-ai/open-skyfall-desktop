@@ -1,0 +1,16 @@
+{
+  "authMethods": [],
+  "capabilities": {
+    "agentRun": false,
+    "delivery": "buffered",
+    "documents": false,
+    "images": false,
+    "modelGenerate": false,
+    "modelSelection": false,
+    "structuredOutput": false,
+    "tools": false,
+    "usage": false
+  },
+  "state": "available",
+  "undeclared": true
+}

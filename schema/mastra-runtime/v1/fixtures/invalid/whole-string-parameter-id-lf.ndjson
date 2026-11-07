@@ -1,0 +1,1 @@
+{"kind":"request","method":"session.start","params":{"bridge":null,"instructions":"free text","workflowId":"a\n"},"protocolVersion":"1.0","requestId":"h:","scope":{"sessionId":"s","turnId":null,"workflowRunId":null}}

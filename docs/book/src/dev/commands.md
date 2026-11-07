@@ -41,7 +41,7 @@ ending in the same word (`file.open`: did you mean `doc.open`?).
    `describe_command` serves both schemas to agents and scripts. A test
    (`every_command_has_input_and_output_schemas`) warns for a command without them, and will
    fail it once the rule becomes required; the commands
-   that predate the rule are listed in `schema/unconverted.txt`, which only shrinks.
+   that predate the rule are listed in `crates/engine/src/schema/unconverted.txt`, which only shrinks.
    [Command schemas](schemas.md) walks through it, with the shared types and a checklist.
 3. Write engine tests that measure the result: volume, area, and face/edge/vertex counts
    against values you can derive by hand.

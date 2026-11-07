@@ -1,0 +1,15 @@
+{
+  "capabilities": {
+    "guardedBatch": false,
+    "guardedExecute": false,
+    "hostAgentTasks": false,
+    "hostModelCalls": false,
+    "snapshotValidation": false,
+    "workflowIds": [
+      "w"
+    ]
+  },
+  "runtimeInstanceId": "i",
+  "runtimeVersion": "1",
+  "selectedVersion": "1.0"
+}

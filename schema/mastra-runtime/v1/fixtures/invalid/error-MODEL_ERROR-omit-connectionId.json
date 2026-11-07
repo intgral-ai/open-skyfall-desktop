@@ -1,0 +1,8 @@
+{
+  "code": "MODEL_ERROR",
+  "details": {
+    "httpStatus": 429
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

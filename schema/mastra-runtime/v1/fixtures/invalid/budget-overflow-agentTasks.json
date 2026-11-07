@@ -1,0 +1,8 @@
+{
+  "agentTasks": 5,
+  "cadCommands": 64,
+  "modelCalls": 20,
+  "repairs": 2,
+  "validationRuns": 3,
+  "wallTimeSeconds": 1200
+}

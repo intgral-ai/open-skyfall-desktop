@@ -1,0 +1,8 @@
+{
+  "code": "INTERNAL_ERROR",
+  "details": {
+    "operation": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

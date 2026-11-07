@@ -1,0 +1,1 @@
+{"ok":false,"error":"expectedDocument requires only documentId and revision","errorDetails":{"code":"INVALID_REQUEST","message":"expectedDocument requires only documentId and revision","retry":"never","details":{"field":"expectedDocument"}}}

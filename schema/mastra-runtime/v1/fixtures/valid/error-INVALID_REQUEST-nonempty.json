@@ -1,0 +1,9 @@
+{
+  "code": "INVALID_REQUEST",
+  "details": {
+    "field": "params",
+    "method": "model.generate"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

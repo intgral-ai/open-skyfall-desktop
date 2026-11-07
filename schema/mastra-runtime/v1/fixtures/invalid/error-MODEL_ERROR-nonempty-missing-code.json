@@ -1,0 +1,8 @@
+{
+  "details": {
+    "connectionId": "c",
+    "httpStatus": 429
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

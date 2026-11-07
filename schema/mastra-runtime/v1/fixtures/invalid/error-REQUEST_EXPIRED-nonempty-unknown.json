@@ -1,0 +1,9 @@
+{
+  "code": "REQUEST_EXPIRED",
+  "details": {
+    "submissionRequestId": "submission",
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

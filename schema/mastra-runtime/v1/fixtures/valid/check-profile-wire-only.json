@@ -1,0 +1,13 @@
+{
+  "checks": [
+    {
+      "checkId": "input.integrity",
+      "kind": "input.integrity",
+      "parameters": {},
+      "required": true
+    }
+  ],
+  "profileId": "profile",
+  "schemaVersion": "1.0",
+  "version": "1"
+}

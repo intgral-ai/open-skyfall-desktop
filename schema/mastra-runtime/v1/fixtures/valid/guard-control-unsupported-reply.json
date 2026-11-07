@@ -1,0 +1,1 @@
+{"id":5,"ok":false,"error":"This execution path does not support guarded requests.","errorDetails":{"code":"UNSUPPORTED_CAPABILITY","message":"This execution path does not support guarded requests.","retry":"never","details":{"capability":"file.new"}}}

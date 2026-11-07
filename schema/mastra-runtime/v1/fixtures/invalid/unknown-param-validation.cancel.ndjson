@@ -1,0 +1,1 @@
+{"kind":"request","method":"validation.cancel","params":{"runId":"v","undeclared":true},"protocolVersion":"1.0","requestId":"r:","scope":{"sessionId":"s","turnId":"t","workflowRunId":"w"}}

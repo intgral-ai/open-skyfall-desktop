@@ -1,6 +1,6421 @@
 use super::*;
 use std::sync::mpsc::channel;
 
+/// Original, std-only pipe peer. Each caller compiles once for its scenario set;
+/// the owned directory must outlive every process using the executable.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) struct PeerProgram {
+    pub directory: std::path::PathBuf,
+    pub executable: std::path::PathBuf,
+    processes: std::cell::RefCell<Vec<super::process::ProcessHandle>>,
+    runtime_pools: std::cell::RefCell<Vec<std::sync::Arc<super::runtime_client::RuntimeAdmission>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PeerProgram {
+    pub(super) fn track(&self, handle: super::process::ProcessHandle) {
+        let mut processes = self.processes.borrow_mut();
+        processes.retain(|p| p.try_cleanup_result() != Some(Ok(())));
+        processes.push(handle);
+    }
+    fn track_runtime(&self, pool: std::sync::Arc<super::runtime_client::RuntimeAdmission>) {
+        let mut pools = self.runtime_pools.borrow_mut();
+        if !pools.iter().any(|p| std::sync::Arc::ptr_eq(p, &pool)) {
+            pools.push(pool);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PeerProgram {
+    fn drop(&mut self) {
+        // Also preserve teardown-before-unlink during a failed assertion/unwind.
+        // A failed cleanup retains the owned directory instead of deleting files
+        // still in use or pretending teardown was established.
+        let mut cleaned = true;
+        for process in self.processes.get_mut() {
+            process.shutdown(true);
+            cleaned &= process.try_cleanup_result() == Some(Ok(()));
+        }
+        // RuntimeClient Drop is nonblocking. Fixture teardown is off-frame and
+        // waits on the REAL admission permit's cleanup fact before unlinking.
+        for pool in self.runtime_pools.get_mut() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if pool.lower_limit(1).is_ok() {
+                    let launch = super::runtime_client::RuntimeLaunch {
+                        executable: self.directory.join("not-an-executable"),
+                        args: vec![],
+                        cwd: self.directory.clone(),
+                        host_version: "1".into(),
+                        limits: super::mastra_protocol::Limits::default(),
+                    };
+                    let services = mastra_worker_support::services(pool.clone(), |_, _| {});
+                    if super::runtime_client::RuntimeClient::start(launch, services, std::sync::Arc::new(|| {}))
+                        .err()
+                        .is_some_and(|e| e.code == super::mastra_protocol::ErrorCode::TransportError)
+                    {
+                        break;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    cleaned = false;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        if cleaned {
+            if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+                eprintln!("peer directory cleanup failed: {error}");
+            }
+        } else {
+            eprintln!("peer directory retained: owned process cleanup was not established");
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn mastra_peer_program() -> Result<PeerProgram, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir();
+    let mut directory = None;
+    for _ in 0..128 {
+        let candidate = root.join(format!("solidcraft-mastra-peer-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                directory = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create peer directory: {e}")),
+        }
+    }
+    let directory = directory.ok_or("could not allocate owned peer directory")?.canonicalize().map_err(|e| e.to_string())?;
+    let executable = directory.join(format!("exact runtime peer{}", std::env::consts::EXE_SUFFIX));
+    let program =
+        PeerProgram { directory, executable, processes: std::cell::RefCell::new(Vec::new()), runtime_pools: std::cell::RefCell::new(Vec::new()) };
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/mastra_runtime_peer.rs");
+    let output = std::process::Command::new(compiler)
+        .arg("--edition=2024")
+        .arg(source)
+        .arg("-o")
+        .arg(&program.executable)
+        .output()
+        .map_err(|e| format!("the Rust peer compiler is required: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Rust peer compilation failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(program)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod mastra_worker_support {
+    pub use super::mastra_state_support::*;
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{Receiver, sync_channel};
+    pub use std::sync::{Arc, Mutex};
+
+    pub struct TestClock;
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+    pub struct WorkerGate {
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        entered: Receiver<()>,
+        release: std::sync::mpsc::SyncSender<()>,
+    }
+    impl WorkerGate {
+        pub fn install(services: &mut RuntimeServices) -> Self {
+            struct GateClock {
+                armed: Arc<std::sync::atomic::AtomicBool>,
+                entered: std::sync::mpsc::SyncSender<()>,
+                release: Mutex<Receiver<()>>,
+            }
+            impl Clock for GateClock {
+                fn now(&self) -> Instant {
+                    if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        let _ = self.entered.send(());
+                        let _ = self.release.lock().unwrap().recv();
+                    }
+                    Instant::now()
+                }
+            }
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entered, receive) = sync_channel(1);
+            let (release, barrier) = sync_channel(1);
+            services.clock = Arc::new(GateClock { armed: armed.clone(), entered, release: Mutex::new(barrier) });
+            Self { armed, entered: receive, release }
+        }
+        pub fn block(&self, r: &mut Running) {
+            self.armed.store(true, std::sync::atomic::Ordering::Release);
+            r.client.drain(0, 0);
+            self.entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        pub fn release(&self) {
+            let _ = self.release.try_send(());
+        }
+    }
+    impl Drop for WorkerGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+    pub struct TestIds(AtomicU64);
+    impl IdSource for TestIds {
+        fn next_id(&self) -> Result<Id, WireError> {
+            Ok(id(&format!("id{}", self.0.fetch_add(1, Ordering::Relaxed) + 1)))
+        }
+    }
+    pub struct Lifecycle;
+    impl ScopeLifecycle for Lifecycle {
+        fn close_turn(&self, _: &TurnScope, _: CloseReason) {}
+        fn retire_session(&self, _: &Id) {}
+    }
+    pub struct Dispatch(pub Box<dyn Fn(CallbackCall, ReplyPort) + Send + Sync>);
+    impl HostDispatch for Dispatch {
+        fn dispatch(&self, call: CallbackCall, reply: ReplyPort) {
+            (self.0)(call, reply);
+        }
+    }
+    pub fn services(pool: Arc<RuntimeAdmission>, dispatch: impl Fn(CallbackCall, ReplyPort) + Send + Sync + 'static) -> RuntimeServices {
+        RuntimeServices {
+            clock: Arc::new(TestClock),
+            ids: Arc::new(TestIds(AtomicU64::new(0))),
+            admission: pool,
+            lifecycle: Arc::new(Lifecycle),
+            dispatch: Arc::new(Dispatch(Box::new(dispatch))),
+        }
+    }
+    pub fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    pub fn step(op: &str, value: Value) -> String {
+        format!("{op} {}\n", hex(format!("{value}\n").as_bytes()))
+    }
+    pub fn request(method: &str, name: &str, scope: Scope, params: Value) -> Value {
+        json!({"protocolVersion":"1.0","kind":"request","requestId":name,"scope":scope,"method":method,"params":params})
+    }
+    pub fn bootstrap(limits: &Limits) -> String {
+        let hello = request("runtime.hello", "h:id2", Scope::Runtime, json!({"supportedVersions":["1.0"],"hostVersion":"1","limits":limits}));
+        let mut result = fixture("runtime.hello").1;
+        result["limits"] = json!(limits);
+        result["capabilities"]["hostModelCalls"] = json!(true);
+        result["capabilities"]["hostAgentTasks"] = json!(true);
+        step("EXPECT_HEX", hello)
+            + &step("WRITE_HEX", response("h:id2", Scope::Runtime, result))
+            + &step("WRITE_HEX", event(1, "runtime.ready", Some("h:id2"), Scope::Runtime, json!({"runtimeInstanceId":"i"})))
+    }
+    pub fn session_script() -> String {
+        step("EXPECT_HEX", request("session.start", "h:id3", Scope::Session(id("s")), fixture("session.start").0))
+            + &step("WRITE_HEX", response("h:id3", Scope::Session(id("s")), fixture("session.start").1))
+    }
+    pub fn host_request(method: &str) -> HostRequest {
+        let frame = request(
+            method,
+            "h:fixture",
+            if method == "session.start" || method == "session.reset" { Scope::Session(id("s")) } else { scope() },
+            fixture(method).0,
+        );
+        let DecodeResult::Frame(Frame::Request { body: RequestBody::Host(request), .. }) =
+            decode_frame(format!("{frame}\n").as_bytes(), DecodePhase::Negotiated, Sender::Host, &Limits::default()).unwrap()
+        else {
+            panic!("host fixture")
+        };
+        request
+    }
+    pub struct Running {
+        pub client: RuntimeClient,
+        pub wake: Receiver<()>,
+    }
+    pub fn start(program: &super::PeerProgram, name: &str, script: &str, limits: Limits, services: RuntimeServices) -> Result<Running, ClientError> {
+        let path = program.directory.join(name);
+        std::fs::write(&path, script).unwrap();
+        let (wake, receive) = sync_channel(1);
+        let pool = services.admission.clone();
+        let client = RuntimeClient::start(
+            RuntimeLaunch {
+                executable: program.executable.clone(),
+                args: vec![path.into_os_string()],
+                cwd: program.directory.clone(),
+                host_version: "1".into(),
+                limits,
+            },
+            services,
+            Arc::new(move || {
+                let _ = wake.try_send(());
+            }),
+        )?;
+        program.track_runtime(pool);
+        Ok(Running { client, wake: receive })
+    }
+    pub fn until(r: &mut Running, mut predicate: impl FnMut(&ClientNotice) -> bool) -> Vec<ClientNotice> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut all = Vec::new();
+        loop {
+            let batch = r.client.drain(usize::MAX, usize::MAX);
+            let done = batch.iter().any(&mut predicate);
+            let closed = batch.iter().any(|n| matches!(n, ClientNotice::TransportClosed { .. }));
+            all.extend(batch);
+            if done {
+                return all;
+            }
+            assert!(!closed, "transport closed before expected notice: {all:?}");
+            r.wake
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|e| panic!("worker channel watchdog: {e:?}; notices={all:?}"));
+        }
+    }
+    pub fn ready(r: &mut Running) {
+        until(r, |n| matches!(n, ClientNotice::RuntimeReady(_)));
+    }
+    pub fn submit(r: &Running, method: &str, s: Scope) -> RequestId {
+        let sender = r.client.sender();
+        let prepared = sender.prepare_request(s, host_request(method), Instant::now() + Duration::from_secs(60)).unwrap();
+        sender.try_submit(prepared).unwrap()
+    }
+    pub fn session(r: &mut Running) {
+        let id = submit(r, "session.start", Scope::Session(id("s")));
+        until(r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&id));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_nested_callback() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let callback = request("model.generate", "r:model", scope(), fixture("model.generate").0);
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", callback)
+        + &step("EXPECT_HEX", response("r:model", scope(), fixture("model.generate").1))
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + "EXPECT_EOF\n";
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    let mut r = start(
+        &program,
+        "nested",
+        &script,
+        l,
+        services(Arc::new(RuntimeAdmission::new(8).unwrap()), move |call, reply| {
+            assert!(matches!(call.call, HostCall::ModelGenerate(_)));
+            assert!(!call.cancellation.is_cancelled());
+            sent.send(call.token.clone()).unwrap();
+            // All managed input is destroyed before the final token/port guard.
+            drop(call);
+            let result: ModelGenerateResult = serde_json::from_value(fixture("model.generate").1).unwrap();
+            reply.finish(Ok(HostReply::ModelGenerate(result))).unwrap();
+        }),
+    )
+    .unwrap();
+    ready(&mut r);
+    session(&mut r);
+    let turn = submit(&r, "turn.start", scope());
+    let notices = until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+    assert!(!notices.iter().any(|n| matches!(n, ClientNotice::TransportClosed { .. })));
+    drop(received.recv_timeout(Duration::from_secs(10)).unwrap());
+    let _ = json!(null);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_host_runtime_instance_cap() {
+    use mastra_worker_support::*;
+    struct Frozen(Instant);
+    impl Clock for Frozen {
+        fn now(&self) -> Instant {
+            self.0
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let pool = Arc::new(RuntimeAdmission::new(8).unwrap());
+    let now = Instant::now();
+    let make_services = || {
+        let mut s = services(pool.clone(), |_, _| {});
+        s.clock = Arc::new(Frozen(now));
+        s
+    };
+    let mut clients = Vec::new();
+    for n in 0..8 {
+        let marker = program.directory.join(format!("cap-started-{n}"));
+        clients.push(
+            start(
+                &program,
+                &format!("cap{n}"),
+                &format!("MARK {}\nHOLD_INPUT {}\nEXPECT_EOF\n", marker.display(), program.directory.join("cap-never-release").display()),
+                Limits::default(),
+                make_services(),
+            )
+            .unwrap(),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !(0..8).all(|n| program.directory.join(format!("cap-started-{n}")).exists()) {
+        assert!(Instant::now() < deadline, "eight real peers must reach their barrier");
+        std::thread::yield_now();
+    }
+    let ninth = program.directory.join("ninth-was-spawned");
+    assert_eq!(
+        start(
+            &program,
+            "ninth",
+            &format!("MARK {}\nHOLD_INPUT {}\n", ninth.display(), program.directory.join("ninth-hold").display()),
+            Limits::default(),
+            make_services()
+        )
+        .err()
+        .unwrap()
+        .code,
+        ErrorCode::ResourceExhausted
+    );
+    assert!(!ninth.exists(), "ninth reservation is refused BEFORE OS spawn");
+    assert_eq!(pool.lower_limit(7).unwrap_err().code, ErrorCode::ResourceExhausted);
+    drop(clients);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_lower_instance_cap_rejects_only_new_startup() {
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    let pool = Arc::new(RuntimeAdmission::new(8).unwrap());
+    let hold = format!("HOLD_INPUT {}\n", program.directory.join("lower-never-release").display());
+    let a = start(&program, "lower-existing-a", &hold, Limits::default(), services(pool.clone(), |_, _| {})).unwrap();
+    let b = start(&program, "lower-existing-b", &hold, Limits::default(), services(pool.clone(), |_, _| {})).unwrap();
+    let offered = Limits::default();
+    let returned = Limits { runtime_instances: 1, ..offered.clone() };
+    let mut script = bootstrap(&returned);
+    let expected =
+        request("runtime.hello", "h:id2", Scope::Runtime, serde_json::json!({"supportedVersions":["1.0"],"hostVersion":"1","limits":offered}));
+    let first_line_end = script.find('\n').unwrap() + 1;
+    script.replace_range(..first_line_end, &step("EXPECT_HEX", expected));
+    script.push_str("EXPECT_EOF\n");
+    let mut c = start(&program, "lower-rejected", &script, offered, services(pool.clone(), |_, _| {})).unwrap();
+    let notices = until(&mut c, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+    assert!(!notices.iter().any(|n| matches!(n, ClientNotice::RuntimeReady(_))));
+    assert_eq!(
+        notices.iter().filter(|n| matches!(n,ClientNotice::RequestFinished {request_id,result:Err(_),..} if request_id.as_str()=="h:id2")).count(),
+        1,
+        "rejected startup still consumes its original hello completion exactly once"
+    );
+    assert_eq!(pool.lower_limit(1).unwrap_err().code, ErrorCode::ResourceExhausted, "existing reservations must not be killed to claim a lower cap");
+    drop((a, b));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_equal_instance_cap_is_applied_before_ready() {
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    let pool = Arc::new(RuntimeAdmission::new(8).unwrap());
+    let limits = Limits { runtime_instances: 1, ..Limits::default() };
+    let release = program.directory.join("equal-cap-first-release");
+    let script = bootstrap(&limits)
+        + &format!("HOLD_INPUT {}\n", release.display())
+        + &session_script()
+        + &format!("HOLD_INPUT {}\n", program.directory.join("equal-cap-first-live").display());
+    let mut first = start(&program, "equal-cap-first", &script, limits, services(pool.clone(), |_, _| {})).unwrap();
+    let notices = until(&mut first, |notice| matches!(notice, ClientNotice::RuntimeReady(_)));
+    assert!(notices.iter().any(|notice| matches!(notice, ClientNotice::RuntimeReady(info) if info.limits.runtime_instances == 1)));
+
+    let spawned = program.directory.join("equal-cap-second-spawned");
+    let second_script = format!("MARK {}\nHOLD_INPUT {}\n", spawned.display(), program.directory.join("equal-cap-second-hold").display());
+    match start(&program, "equal-cap-second", &second_script, Limits::default(), services(pool.clone(), |_, _| {})) {
+        Err(error) => assert_eq!(error.code, ErrorCode::ResourceExhausted),
+        Ok(second) => {
+            // Make the old implementation's real OS spawn observable, rather
+            // than treating an untimed missing marker as evidence of refusal.
+            let watchdog = Instant::now() + Duration::from_secs(10);
+            while !spawned.exists() {
+                assert!(Instant::now() < watchdog, "accepted second peer never reached its spawn barrier");
+                std::thread::yield_now();
+            }
+            drop(second);
+            panic!("a Ready runtime with accepted cap=1 allowed a second real OS spawn");
+        }
+    }
+    assert!(!spawned.exists(), "ResourceExhausted must precede OS spawn");
+    std::fs::write(release, b"continue first runtime").unwrap();
+    session(&mut first); // The accepted first runtime remains live and usable.
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_equal_instance_cap_conflict_rejects_only_new_startup() {
+    use mastra_worker_support::*;
+    struct Resume(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let pool = Arc::new(RuntimeAdmission::new(8).unwrap());
+    let release_a = program.directory.join("equal-cap-old-a-release");
+    let release_b = program.directory.join("equal-cap-old-b-release");
+    let old_script = |release: &std::path::Path| {
+        bootstrap(&Limits::default())
+            + &format!("HOLD_INPUT {}\n", release.display())
+            + &session_script()
+            + &format!("HOLD_INPUT {}\n", program.directory.join("equal-cap-old-still-live").display())
+    };
+    let mut a = start(&program, "equal-cap-old-a", &old_script(&release_a), Limits::default(), services(pool.clone(), |_, _| {})).unwrap();
+    let mut b = start(&program, "equal-cap-old-b", &old_script(&release_b), Limits::default(), services(pool.clone(), |_, _| {})).unwrap();
+    ready(&mut a);
+    ready(&mut b); // Two actual, live, already-negotiated host reservations.
+
+    let limits = Limits { runtime_instances: 1, ..Limits::default() };
+    let hello_seen = program.directory.join("equal-cap-conflict-hello-observed");
+    let mut script = bootstrap(&limits);
+    let end = script.find('\n').unwrap() + 1;
+    script.insert_str(end, &format!("MARK {}\n", hello_seen.display()));
+    script.push_str(&format!("HOLD_INPUT {}\n", program.directory.join("equal-cap-new-held-live").display()));
+    let path = program.directory.join("equal-cap-conflict");
+    std::fs::write(&path, script).unwrap();
+    let (wake, receive) = std::sync::mpsc::sync_channel(1);
+    let (entered, observed) = std::sync::mpsc::sync_channel(1);
+    let (resume, barrier) = std::sync::mpsc::sync_channel(1);
+    let resume = Resume(resume);
+    let barrier = Mutex::new(barrier);
+    let first_repaint = std::sync::atomic::AtomicBool::new(true);
+    let client = RuntimeClient::start(
+        RuntimeLaunch {
+            executable: program.executable.clone(),
+            args: vec![path.into_os_string()],
+            cwd: program.directory.clone(),
+            host_version: "1".into(),
+            limits,
+        },
+        services(pool.clone(), |_, _| {}),
+        Arc::new(move || {
+            let _ = wake.try_send(());
+            if first_repaint.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                let _ = barrier.lock().unwrap().recv();
+            }
+        }),
+    )
+    .unwrap();
+    program.track_runtime(pool.clone());
+    let mut rejected = Running { client, wake: receive };
+    observed.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(hello_seen.exists(), "the cap is checked only AFTER a real successful hello, not on the unnegotiated launch offer");
+    let mut notices = rejected.client.drain(usize::MAX, usize::MAX);
+    // The worker is held in its first notice callback, before StopTree. The
+    // child is held by its protocol barrier, so cleanup cannot yet be Ok.
+    assert_eq!(
+        pool.lower_limit(2).unwrap_err().code,
+        ErrorCode::ResourceExhausted,
+        "the new runtime must retain its original permit before owned cleanup"
+    );
+    drop(resume);
+    notices.extend(until(&mut rejected, |notice| matches!(notice, ClientNotice::RuntimeReady(_) | ClientNotice::TransportClosed { .. })));
+    assert!(
+        !notices.iter().any(|notice| matches!(notice, ClientNotice::RuntimeReady(_))),
+        "a conflicting accepted cap must not publish Ready: {notices:?}"
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| matches!(notice, ClientNotice::RequestFinished { request_id, result: Err(_), .. } if request_id.as_str() == "h:id2"))
+            .count(),
+        1
+    );
+    assert_eq!(notices.iter().filter(|notice| matches!(notice, ClientNotice::TransportClosed { .. })).count(), 1);
+    let watchdog = Instant::now() + Duration::from_secs(15);
+    loop {
+        match pool.lower_limit(2) {
+            Ok(()) => break,
+            Err(error) => {
+                assert_eq!(error.code, ErrorCode::ResourceExhausted);
+                assert!(Instant::now() < watchdog, "original owner never established cleanup");
+                std::thread::yield_now();
+            }
+        }
+    }
+    std::fs::write(release_a, b"continue original a").unwrap();
+    std::fs::write(release_b, b"continue original b").unwrap();
+    session(&mut a);
+    session(&mut b); // Rejecting this startup did not kill either old instance.
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_launch_and_drop_cleanup() {
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    let pool = Arc::new(RuntimeAdmission::new(1).unwrap());
+    let bad = RuntimeLaunch {
+        executable: "relative".into(),
+        args: vec![],
+        cwd: program.directory.clone(),
+        host_version: "1".into(),
+        limits: Limits::default(),
+    };
+    assert_eq!(RuntimeClient::start(bad, services(pool.clone(), |_, _| {}), Arc::new(|| {})).err().unwrap().code, ErrorCode::TransportError);
+    let helper = program.directory.join("worker-owned-helper");
+    let marker = program.directory.join("worker-helper-pid");
+    std::fs::write(&helper, format!("HOLD_INPUT {}\n", program.directory.join("helper-never-release").display())).unwrap();
+    let script = format!(
+        "SPAWN_HELPER_TRACKED {} {}\nHOLD_INPUT {}\n",
+        hex(helper.to_string_lossy().as_bytes()),
+        hex(marker.to_string_lossy().as_bytes()),
+        program.directory.join("worker-never-release").display()
+    );
+    let r = start(&program, "drop", &script, Limits::default(), services(pool.clone(), |_, _| {})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let helper_pid: u32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
+    drop(r);
+    // Actual cleanup must release this reservation; lower_limit cannot fake it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let launch = RuntimeLaunch {
+            executable: program.directory.join("never-an-executable"),
+            args: vec![],
+            cwd: program.directory.clone(),
+            host_version: "1".into(),
+            limits: Limits::default(),
+        };
+        match RuntimeClient::start(launch, services(pool.clone(), |_, _| {}), Arc::new(|| {})) {
+            Err(e) if e.code == ErrorCode::TransportError => break,
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::ResourceExhausted);
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            Ok(_) => panic!("invalid launch"),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{helper_pid}/stat")) {
+        assert!(stat.rsplit(')').next().is_some_and(|s| s.trim_start().starts_with('Z')), "worker Drop left a live descendant");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = helper_pid;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_eof_and_replacement() {
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    for (name, ending) in [("eof", "EXIT 0\n"), ("partial", "WRITE_HEX 7b\nEXIT 0\n"), ("malformed", "WRITE_HEX 7b7d0a\nEXIT 0\n")] {
+        let l = Limits::default();
+        let mut r = start(&program, name, &(bootstrap(&l) + ending), l, services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {})).unwrap();
+        let notices = until(&mut r, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+        assert_eq!(notices.iter().filter(|n| matches!(n, ClientNotice::TransportClosed { .. })).count(), 1);
+        assert!(r.client.drain(usize::MAX, usize::MAX).is_empty());
+        assert_eq!(
+            r.client.sender().prepare_request(Scope::Session(id("s")), host_request("session.start"), Instant::now()).unwrap_err().code,
+            ErrorCode::TransportError
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_backpressure_preserves_control() {
+    use mastra_worker_support::*;
+    struct CheckedClock {
+        ui: std::thread::ThreadId,
+        deny: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Clock for CheckedClock {
+        fn now(&self) -> Instant {
+            assert!(!(self.deny.load(std::sync::atomic::Ordering::Acquire) && std::thread::current().id() == self.ui), "UI called Clock");
+            Instant::now()
+        }
+    }
+    struct CheckedIds {
+        ui: std::thread::ThreadId,
+        deny: Arc<std::sync::atomic::AtomicBool>,
+        next: std::sync::atomic::AtomicU64,
+    }
+    impl IdSource for CheckedIds {
+        fn next_id(&self) -> Result<Id, WireError> {
+            assert!(!(self.deny.load(std::sync::atomic::Ordering::Acquire) && std::thread::current().id() == self.ui), "UI called IdSource");
+            Ok(id(&format!("id{}", self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1)))
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", request("model.generate", "r:block", scope(), fixture("model.generate").0))
+        + "EXPECT_EOF\n";
+    let (entered, observed) = std::sync::mpsc::sync_channel(1);
+    let (release, barrier) = std::sync::mpsc::sync_channel(1);
+    let barrier = Mutex::new(barrier);
+    let held = Arc::new(Mutex::new(None));
+    let store = held.clone();
+    let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+        *store.lock().unwrap() = Some((call, port));
+        entered.send(()).unwrap();
+        barrier.lock().unwrap().recv().unwrap();
+    });
+    let deny = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ui = std::thread::current().id();
+    services.clock = Arc::new(CheckedClock { ui, deny: deny.clone() });
+    services.ids = Arc::new(CheckedIds { ui, deny: deny.clone(), next: std::sync::atomic::AtomicU64::new(0) });
+    let mut r = start(&program, "backpressure", &script, l, services).unwrap();
+    ready(&mut r);
+    session(&mut r);
+    submit(&r, "turn.start", scope());
+    observed.recv_timeout(Duration::from_secs(10)).unwrap();
+    let sender = r.client.sender();
+    let event =
+        || HostEvent::ConnectionState(ConnectionStateEvent { connection_id: id("c"), state: ConnectionState::Available, auth_methods: vec![] });
+    let mut prepared = Vec::new();
+    for _ in 0..33 {
+        prepared.push(sender.prepare_event(scope(), event(), None).unwrap());
+    }
+    let refused = sender.prepare_event(scope(), event(), None).unwrap();
+    deny.store(true, std::sync::atomic::Ordering::Release);
+    // A live callback's ready drop-fallback and any unconsumed Written metadata
+    // retain their ORIGINAL data slots; they are not a free second queue.
+    let mut admitted = 0;
+    for p in prepared {
+        match sender.try_emit(p) {
+            Ok(()) => admitted += 1,
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::ResourceExhausted);
+                break;
+            }
+        }
+    }
+    assert!((1..=32).contains(&admitted));
+    assert_eq!(sender.try_emit(refused).unwrap_err().code, ErrorCode::ResourceExhausted);
+    let Scope::Turn(s) = scope() else { panic!() };
+    sender.cancel_turn(&s, CancelReason::User).unwrap();
+    assert!(sender.cancel_turn(&s, CancelReason::Deadline).is_ok(), "repeated cancellation coalesces without replacing the original User cause");
+    assert!(held.lock().unwrap().as_ref().unwrap().0.cancellation.is_cancelled(), "local Stop does not wait for dispatcher or pipe");
+    assert_eq!(
+        sender.shutdown(ShutdownReason::AppExit).unwrap_err().code,
+        ErrorCode::ResourceExhausted,
+        "full control cell forces cleanup without reopening cancellation"
+    );
+    assert!(r.client.drain(usize::MAX, 1).is_empty());
+    release.send(()).unwrap();
+    drop(held.lock().unwrap().take());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_inbound_credit_tracks_async_owners() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    struct Owner {
+        payload: HostCall,
+        scope: Scope,
+        cancellation: Cancellation,
+        // Last guard, AFTER all managed input/header fields. No Drop obstructs moves.
+        guard: CallbackToken,
+    }
+    let program = mastra_peer_program().unwrap();
+    for mode in ["normal", "refusal", "fallback", "diagnostic_eof"] {
+        for retain in [false, true] {
+            let name = format!("owner-{mode}-{retain}");
+            let marker = program.directory.join(format!("{name}-replied"));
+            let release = program.directory.join(format!("{name}-release"));
+            let l = Limits { frame_bytes: 8192, queue_bytes: 16384, control_lane_bytes: 4096, text_bytes: 8192, ..Limits::default() };
+            let mut params = fixture("model.generate").0;
+            params["messages"][0]["content"][0]["text"] = json!("x".repeat(7000));
+            params["options"]["timeoutSeconds"] = json!(60);
+            let explicit = WireError {
+                code: ErrorCode::AuthRequired,
+                message: "拒绝".repeat(300),
+                retry: Retry::Never,
+                details: ErrorDetails::Empty(EmptyDetails {}),
+            };
+            let first_reply = if matches!(mode, "normal" | "diagnostic_eof") {
+                response("r:first", scope(), fixture("model.generate").1)
+            } else {
+                let error = if mode == "refusal" {
+                    explicit.clone()
+                } else {
+                    WireError {
+                        code: ErrorCode::InternalError,
+                        message: "Runtime transport closed.".into(),
+                        retry: Retry::Never,
+                        details: ErrorDetails::Empty(EmptyDetails {}),
+                    }
+                };
+                json!({"protocolVersion":"1.0","kind":"response","requestId":"r:first","scope":scope(),"outcome":"error","error":error})
+            };
+            let mut script = bootstrap(&l)
+                + &session_script()
+                + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+                + &step("WRITE_HEX", request("model.generate", "r:first", scope(), params.clone()))
+                + &step("EXPECT_HEX", first_reply)
+                + &format!("MARK {}\nHOLD_INPUT {}\n", marker.display(), release.display())
+                + &step("WRITE_HEX", request("model.generate", "r:second", scope(), params))
+                + &step("EXPECT_HEX", response("r:second", scope(), fixture("model.generate").1))
+                + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+                + "EXPECT_EOF\n";
+            if mode == "diagnostic_eof" {
+                let hold = format!("HOLD_INPUT {}\n", release.display());
+                let end = script.find(&hold).unwrap() + hold.len();
+                script.truncate(end);
+                script.push_str(&"STDERR_HEX 78 400\nSTDERR_HEX 0a\n".repeat(40));
+                script.push_str("EXIT 0\n");
+            }
+            let (owned, received) = std::sync::mpsc::sync_channel(1);
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = count.clone();
+            let mut r = start(
+                &program,
+                &name,
+                &script,
+                l,
+                services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if n == 0 {
+                        // Actual trait adapter moves the ORIGINAL payload and guard,
+                        // then RETURNS. Port completion does not consume this owner.
+                        let CallbackCall { call: payload, scope, cancellation, token: guard, .. } = call;
+                        owned.send(Owner { payload, scope, cancellation, guard }).unwrap();
+                        match mode {
+                            "normal" | "diagnostic_eof" => {
+                                port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(fixture("model.generate").1).unwrap()))).unwrap()
+                            }
+                            "refusal" => port.finish(Err(explicit.clone())).unwrap(),
+                            _ => drop(port),
+                        }
+                    } else {
+                        drop(call);
+                        port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(fixture("model.generate").1).unwrap()))).unwrap();
+                    }
+                }),
+            )
+            .unwrap();
+            ready(&mut r);
+            session(&mut r);
+            submit(&r, "turn.start", scope());
+            let owner = received.recv_timeout(Duration::from_secs(10)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(Instant::now() < deadline, "peer reply barrier");
+                std::thread::yield_now();
+            }
+            assert_eq!(owner.scope, scope());
+            assert!(matches!(&owner.payload,HostCall::ModelGenerate(p) if p.messages.len()==1));
+            assert!(!owner.cancellation.is_cancelled());
+            let _ = &owner.guard;
+            let mut held = Some(owner);
+            if !retain {
+                drop(held.take());
+            }
+            std::fs::write(release, b"go").unwrap();
+            if retain || mode == "diagnostic_eof" {
+                let notices = until(&mut r, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+                assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 1, "retained async input prevents an independent Q refill");
+                if let Some(held) = &held {
+                    assert!(held.cancellation.is_cancelled());
+                }
+                if mode == "diagnostic_eof" {
+                    let tail = notices
+                        .iter()
+                        .find_map(|n| if let ClientNotice::TransportClosed { stderr_tail, .. } = n { Some(stderr_tail) } else { None })
+                        .unwrap();
+                    assert!(!tail.is_empty());
+                    assert!(tail.iter().map(String::len).sum::<usize>() < 16000, "diagnostics respect already-owned input/info, not a second Q");
+                }
+                assert_eq!(notices.iter().filter(|n| matches!(n, ClientNotice::TransportClosed { .. })).count(), 1);
+                drop(held.take());
+                assert!(r.client.drain(usize::MAX, usize::MAX).is_empty());
+            } else {
+                let notices =
+                    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id.as_str()=="h:id4"));
+                assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 2, "actual input+guard destruction permits the next large call");
+                assert!(!notices.iter().any(|n| matches!(n, ClientNotice::TransportClosed { .. })));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_written_is_not_execution() {
+    use super::process::{AgentProcess, PipeLane, ProcessEvent, ProcessIoLimits, ProcessLaunch};
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    let release = program.directory.join("execution-release");
+    let executed = program.directory.join("execution-marker");
+    let path = program.directory.join("written-not-executed");
+    std::fs::write(
+        &path,
+        format!("HOLD_INPUT {}\nEXPECT_HEX 7b7d0a\nMARK {}\nWRITE_HEX 6f6b0a\nEXPECT_EOF\n", release.display(), executed.display()),
+    )
+    .unwrap();
+    let (wake, events) = std::sync::mpsc::sync_channel(8);
+    let mut p = AgentProcess::spawn_strict(
+        &ProcessLaunch { executable: program.executable.clone(), args: vec![path.into_os_string()], cwd: program.directory.clone() },
+        ProcessIoLimits {
+            frame_bytes: 8192,
+            queue_bytes: 16384,
+            control_lane_bytes: 4096,
+            stderr_lines: 40,
+            stderr_line_scalars: 400,
+            stderr_bytes: 65536,
+        },
+        move || {
+            let _ = wake.try_send(());
+        },
+    )
+    .unwrap();
+    program.track(p.handle());
+    p.try_send_tracked(77, b"{}\n".to_vec(), PipeLane::Data).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match p.try_recv() {
+            Ok(Some(ProcessEvent::Written(ticket))) => {
+                assert_eq!(ticket, 77);
+                break;
+            }
+            Ok(None) => {
+                events.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(!executed.exists(), "local Written while peer has not read/parsed/executed");
+    std::fs::write(release, b"go").unwrap();
+    loop {
+        match p.try_recv() {
+            Ok(Some(ProcessEvent::Frame(frame))) => {
+                assert_eq!(&*frame, b"ok\n");
+                break;
+            }
+            Ok(None) => {
+                events.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(executed.exists());
+    p.shutdown(true);
+    assert_eq!(p.handle().try_cleanup_result(), Some(Ok(())));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_prepared_is_bound_to_native_client() {
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let script = bootstrap(&l) + &session_script() + "EXPECT_EOF\n";
+    let mut old = start(&program, "prep-old", &script, l.clone(), services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {})).unwrap();
+    ready(&mut old);
+    session(&mut old);
+    let prepared = old.client.sender().prepare_request(scope(), host_request("turn.start"), Instant::now() + Duration::from_secs(60)).unwrap();
+    let mut new = start(&program, "prep-new", &script, l, services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {})).unwrap();
+    ready(&mut new);
+    session(&mut new);
+    // Injected visible IDs intentionally repeat. The native client capability
+    // must nevertheless differ; no old frame may reach the replacement pipe.
+    assert_eq!(new.client.sender().try_submit(prepared).unwrap_err().code, ErrorCode::InvalidRequest);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_inbound_credit_cancel_retire_and_generation() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    let program = mastra_peer_program().unwrap();
+    for reset in [false, true] {
+        let l = Limits { frame_bytes: 8192, queue_bytes: 16384, control_lane_bytes: 4096, text_bytes: 8192, ..Limits::default() };
+        let mut params = fixture("model.generate").0;
+        params["messages"][0]["content"][0]["text"] = json!("x".repeat(7000));
+        params["options"]["timeoutSeconds"] = json!(60);
+        let first = program.directory.join(format!("control-first-{reset}"));
+        let release = program.directory.join(format!("control-release-{reset}"));
+        let method = if reset { "session.reset" } else { "turn.cancel" };
+        let control_scope = if reset { Scope::Session(id("s")) } else { scope() };
+        let script = bootstrap(&l)
+            + &session_script()
+            + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+            + &step("WRITE_HEX", request("model.generate", "r:first", scope(), params.clone()))
+            + &step("EXPECT_HEX", response("r:first", scope(), fixture("model.generate").1))
+            + &format!("MARK {}\n", first.display())
+            + &step("EXPECT_HEX", request(method, "h:id5", control_scope.clone(), fixture(method).0))
+            + &step("WRITE_HEX", response("h:id5", control_scope, fixture(method).1))
+            + &format!("HOLD_INPUT {}\n", release.display())
+            + &step("WRITE_HEX", request("model.generate", "r:retired", scope(), params.clone()))
+            + "EXPECT_EOF\n";
+        let (send, received) = std::sync::mpsc::sync_channel(1);
+        let mut old = start(
+            &program,
+            &format!("control-old-{reset}"),
+            &script,
+            l.clone(),
+            services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+                send.send(call).unwrap();
+                port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(fixture("model.generate").1).unwrap()))).unwrap();
+            }),
+        )
+        .unwrap();
+        ready(&mut old);
+        session(&mut old);
+        submit(&old, "turn.start", scope());
+        let held = received.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !first.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let sender = old.client.sender();
+        let stale = sender
+            .prepare_event(
+                scope(),
+                HostEvent::ConnectionState(ConnectionStateEvent { connection_id: id("c"), state: ConnectionState::Available, auth_methods: vec![] }),
+                None,
+            )
+            .unwrap();
+        if reset {
+            let p = sender.prepare_request(Scope::Session(id("s")), host_request(method), Instant::now() + Duration::from_secs(60)).unwrap();
+            sender.reset(p).unwrap();
+        } else {
+            let Scope::Turn(s) = scope() else { panic!() };
+            sender.cancel_turn(&s, CancelReason::User).unwrap();
+        }
+        assert!(held.cancellation.is_cancelled(), "actual Cancellation closes BEFORE worker/control admission");
+        let notices = until(&mut old, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id.as_str()=="h:id5"));
+        assert_eq!(notices.iter().filter(|n| matches!(n, ClientNotice::TurnClosed { .. })).count(), 1);
+        assert_eq!(sender.try_emit(stale).unwrap_err().code, ErrorCode::InvalidRequest);
+        std::fs::write(release, b"go").unwrap();
+        until(&mut old, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+        // A replacement has a NEW budget even with repeated visible IDs. Old
+        // input remains held while the replacement admits its first large call.
+        let next_release = program.directory.join(format!("next-release-{reset}"));
+        let script = bootstrap(&l)
+            + &session_script()
+            + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+            + &step("WRITE_HEX", request("model.generate", "r:first", scope(), params.clone()))
+            + &format!("HOLD_INPUT {}\n", next_release.display())
+            + &step("WRITE_HEX", request("model.generate", "r:second", scope(), params))
+            + "EXPECT_EOF\n";
+        let (send, next) = std::sync::mpsc::sync_channel(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut new = start(
+            &program,
+            &format!("control-new-{reset}"),
+            &script,
+            l,
+            services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+                count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                send.send((call, port)).unwrap();
+            }),
+        )
+        .unwrap();
+        ready(&mut new);
+        session(&mut new);
+        submit(&new, "turn.start", scope());
+        let (new_call, new_port) = next.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(held);
+        std::fs::write(next_release, b"go").unwrap();
+        until(&mut new, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1, "old refund must not fund the new generation's second frame");
+        assert!(new_call.cancellation.is_cancelled());
+        assert_eq!(
+            new_port
+                .finish(Err(WireError {
+                    code: ErrorCode::Cancelled,
+                    message: "late".into(),
+                    retry: Retry::Never,
+                    details: ErrorDetails::Empty(EmptyDetails {})
+                }))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        drop(new_call);
+        assert!(new.client.drain(usize::MAX, usize::MAX).is_empty());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_shutdown_writes_before_closing_input() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("runtime.shutdown", "h:id4", Scope::Runtime, json!({"reason":"app_exit"})))
+        + "EXPECT_EOF\n"
+        + &step("WRITE_HEX", response("h:id4", Scope::Runtime, fixture("runtime.shutdown").1))
+        + "EXIT 0\n";
+    let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {});
+    let gate = WorkerGate::install(&mut services);
+    let mut r = start(&program, "graceful", &script, l, services).unwrap();
+    ready(&mut r);
+    session(&mut r);
+    gate.block(&mut r);
+    r.client.sender().shutdown(ShutdownReason::AppExit).unwrap();
+    gate.release();
+    let notices = until(&mut r, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+    assert!(notices.iter().any(
+        |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(RuntimeReply::RuntimeShutdown(_)),..} if request_id.as_str()=="h:id4")
+    ));
+    assert!(notices.iter().any(|n| matches!(n, ClientNotice::TransportClosed { cause: TransportCause::ExpectedEof, .. })));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_stop_before_worker_admission_never_writes_turn() {
+    use mastra_worker_support::*;
+    struct ClockBarrier {
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Clock for ClockBarrier {
+        fn now(&self) -> Instant {
+            if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            Instant::now()
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    for cancel_request in [false, true] {
+        let l = Limits::default();
+        let script = bootstrap(&l) + &session_script() + "EXPECT_EOF\n";
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, barrier) = std::sync::mpsc::sync_channel(1);
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {});
+        services.clock = Arc::new(ClockBarrier { armed: armed.clone(), entered, release: Mutex::new(barrier) });
+        let mut r = start(&program, &format!("stop-before-admission-{cancel_request}"), &script, l, services).unwrap();
+        ready(&mut r);
+        session(&mut r);
+        let sender = r.client.sender();
+        let turn = sender.prepare_request(scope(), host_request("turn.start"), Instant::now() + Duration::from_secs(60)).unwrap();
+        armed.store(true, std::sync::atomic::Ordering::Release);
+        let request_id = sender.try_submit(turn).unwrap();
+        observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let Scope::Turn(s) = scope() else { panic!() };
+        if cancel_request {
+            sender.cancel_request(&request_id).unwrap();
+        } else {
+            sender.cancel_turn(&s, CancelReason::User).unwrap();
+        }
+        release.send(()).unwrap();
+        let notices = until(&mut r, |n| matches!(n, ClientNotice::TurnClosed { .. }));
+        assert!(
+            notices.iter().any(|n| matches!(n, ClientNotice::TurnClosed { cause: CloseReason::User, .. })),
+            "Stop wins before any pipe admission: {notices:?}"
+        );
+        let mut all = notices;
+        if !all
+            .iter()
+            .any(|n| matches!(n,ClientNotice::RequestFinished {request_id:id,result:Err(e),..} if id==&request_id&&e.code==ErrorCode::Cancelled))
+        {
+            all.extend(until(
+                &mut r,
+                |n| matches!(n,ClientNotice::RequestFinished {request_id:id,result:Err(e),..} if id==&request_id&&e.code==ErrorCode::Cancelled),
+            ));
+        }
+        assert!(!all.iter().any(|n| matches!(n, ClientNotice::TransportClosed { .. })));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match sender.complete_turn(&s, TurnTerminal::Cancelled) {
+                Ok(()) => break,
+                Err(e) => {
+                    assert_eq!(e.code, ErrorCode::ResourceExhausted);
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_os_ids_use_native_entropy() {
+    use mastra_worker_support::*;
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..32 {
+        let id = OsIds.next_id().unwrap();
+        assert_eq!(id.as_str().len(), 32);
+        assert!(id.as_str().bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(ids.insert(id.as_str().to_owned()));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_large_frame_fits_without_a_double_frame_floor() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits { frame_bytes: 8192, queue_bytes: 12288, control_lane_bytes: 4096, text_bytes: 8192, ..Limits::default() };
+    let mut params = fixture("turn.start").0;
+    params["parts"][0]["text"] = json!("x".repeat(7000));
+    let wire = request("turn.start", "h:id4", scope(), params.clone());
+    assert!(format!("{wire}\n").len() <= 8192);
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", wire)
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + "EXPECT_EOF\n";
+    let mut r = start(&program, "large-frame", &script, l, services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {})).unwrap();
+    ready(&mut r);
+    session(&mut r);
+    let sender = r.client.sender();
+    let p = sender
+        .prepare_request(scope(), HostRequest::TurnStart(Box::new(serde_json::from_value(params).unwrap())), Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    let id = sender.try_submit(p).unwrap();
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&id));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_id_failure_is_visible_without_counter_fallback() {
+    use mastra_worker_support::*;
+    struct FailingIds(std::sync::atomic::AtomicUsize);
+    impl IdSource for FailingIds {
+        fn next_id(&self) -> Result<Id, WireError> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                Ok(id("generation"))
+            } else {
+                Err(WireError {
+                    code: ErrorCode::InternalError,
+                    message: "redacted".into(),
+                    retry: Retry::Never,
+                    details: ErrorDetails::Empty(EmptyDetails {}),
+                })
+            }
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {});
+    services.ids = Arc::new(FailingIds(std::sync::atomic::AtomicUsize::new(0)));
+    let mut r = start(&program, "id-failed", "EXPECT_EOF\n", Limits::default(), services).unwrap();
+    let notices = until(&mut r, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+    assert!(
+        notices.iter().any(|n| matches!(n,ClientNotice::TransportClosed {cause:TransportCause::Error(e),..} if e.code==ErrorCode::InternalError)),
+        "ID-source failure remains visible, with no substitute hello ID: {notices:?}"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_lifecycle_retirement_precedes_notices() {
+    use mastra_worker_support::*;
+    struct Hooks {
+        sender: Mutex<Option<RuntimeSender>>,
+        close: std::sync::atomic::AtomicBool,
+        retired: std::sync::atomic::AtomicBool,
+    }
+    impl Hooks {
+        fn unlocked(&self) {
+            let sender = self.sender.lock().unwrap().clone().unwrap();
+            assert_ne!(
+                sender.cancel_request(&rid("h:never-admitted")).unwrap_err().code,
+                ErrorCode::ResourceExhausted,
+                "lifecycle hook must run without mailbox lock"
+            );
+        }
+    }
+    impl ScopeLifecycle for Hooks {
+        fn close_turn(&self, _: &TurnScope, reason: CloseReason) {
+            assert_eq!(reason, CloseReason::Reset);
+            self.unlocked();
+            self.close.store(true, std::sync::atomic::Ordering::Release);
+        }
+        fn retire_session(&self, _: &Id) {
+            self.unlocked();
+            self.retired.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + &step("EXPECT_HEX", request("session.reset", "h:id5", Scope::Session(id("s")), fixture("session.reset").0))
+        + &step("WRITE_HEX", response("h:id5", Scope::Session(id("s")), fixture("session.reset").1))
+        + "EXPECT_EOF\n";
+    let pool = Arc::new(RuntimeAdmission::new(1).unwrap());
+    let hooks = Arc::new(Hooks {
+        sender: Mutex::new(None),
+        close: std::sync::atomic::AtomicBool::new(false),
+        retired: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut services = services(pool.clone(), |_, _| {});
+    services.lifecycle = hooks.clone();
+    let gate = WorkerGate::install(&mut services);
+    let path = program.directory.join("lifecycle-order");
+    std::fs::write(&path, script).unwrap();
+    let (wake, receive) = std::sync::mpsc::sync_channel(1);
+    let observed = hooks.clone();
+    let violation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed = violation.clone();
+    let client = RuntimeClient::start(
+        RuntimeLaunch {
+            executable: program.executable.clone(),
+            args: vec![path.into_os_string()],
+            cwd: program.directory.clone(),
+            host_version: "1".into(),
+            limits: l,
+        },
+        services,
+        Arc::new(move || {
+            if observed.close.load(std::sync::atomic::Ordering::Acquire) && !observed.retired.load(std::sync::atomic::Ordering::Acquire) {
+                failed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let _ = wake.try_send(());
+        }),
+    )
+    .unwrap();
+    program.track_runtime(pool);
+    let mut r = Running { client, wake: receive };
+    *hooks.sender.lock().unwrap() = Some(r.client.sender());
+    ready(&mut r);
+    session(&mut r);
+    let turn = submit(&r, "turn.start", scope());
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+    let sender = r.client.sender();
+    let p = sender.prepare_request(Scope::Session(id("s")), host_request("session.reset"), Instant::now() + Duration::from_secs(60)).unwrap();
+    gate.block(&mut r);
+    let reset = sender.reset(p).unwrap();
+    gate.release();
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&reset));
+    assert!(hooks.retired.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!violation.load(std::sync::atomic::Ordering::Acquire), "retirement must finish before the first following notice/repaint");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_cancel_deadline_stops_tree_without_an_extra_shutdown_window() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    struct VirtualClock {
+        base: Instant,
+        seconds: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Clock for VirtualClock {
+        fn now(&self) -> Instant {
+            self.base + Duration::from_secs(self.seconds.load(std::sync::atomic::Ordering::Acquire))
+        }
+    }
+    struct IdBarrier {
+        next: std::sync::atomic::AtomicU64,
+        cancel: std::sync::mpsc::SyncSender<()>,
+    }
+    impl IdSource for IdBarrier {
+        fn next_id(&self) -> Result<Id, WireError> {
+            let n = self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            if n == 5 {
+                self.cancel.send(()).unwrap();
+            }
+            Ok(id(&format!("id{n}")))
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let marker = program.directory.join("large-writer-started");
+    let auth: Vec<_> = (0..4).map(|n| json!({"id":format!("auth{n}"),"name":"test","description":"x".repeat(200000)})).collect();
+    let data = json!({"connectionId":"c","state":"available","authMethods":auth});
+    let wire = event(1, "connection.state", None, scope(), data.clone());
+    let raw = format!("{wire}\n").into_bytes();
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + &format!(
+            "EXPECT_HEX {}\nMARK {}\nHOLD_INPUT {}\n",
+            hex(&raw[..128]),
+            marker.display(),
+            program.directory.join("never-read-large-remainder").display()
+        );
+    let seconds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (issued, cancel) = std::sync::mpsc::sync_channel(1);
+    let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {});
+    services.clock = Arc::new(VirtualClock { base: Instant::now(), seconds: seconds.clone() });
+    services.ids = Arc::new(IdBarrier { next: std::sync::atomic::AtomicU64::new(0), cancel: issued });
+    let mut r = start(&program, "cancel-deadline", &script, l, services).unwrap();
+    ready(&mut r);
+    session(&mut r);
+    let turn = submit(&r, "turn.start", scope());
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+    let sender = r.client.sender();
+    let event = HostEvent::ConnectionState(serde_json::from_value(data).unwrap());
+    let p = sender.prepare_event(scope(), event, None).unwrap();
+    sender.try_emit(p).unwrap();
+    let watchdog = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < watchdog);
+        std::thread::yield_now();
+    }
+    let Scope::Turn(s) = scope() else { panic!() };
+    sender.cancel_turn(&s, CancelReason::User).unwrap();
+    cancel.recv_timeout(Duration::from_secs(10)).unwrap();
+    seconds.store(5, std::sync::atomic::Ordering::Release);
+    r.client.drain(0, 0);
+    // Virtual time deliberately NEVER reaches eight. The ORIGINAL owner must
+    // stop the tree at the five-second ack boundary, not start another RPC wait.
+    let notices = until(&mut r, |n| matches!(n, ClientNotice::TransportClosed { .. }));
+    assert!(notices.iter().any(|n| matches!(n, ClientNotice::TurnClosed { cause: CloseReason::User, .. })));
+    assert!(notices.iter().any(
+        |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Err(e),..} if request_id.as_str()=="h:id5"&&e.code==ErrorCode::Timeout)
+    ));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_stderr_pressure_preserves_ready_callbacks() {
+    use mastra_worker_support::*;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let mut script = bootstrap(&l) + &session_script() + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0));
+    for n in 0..8 {
+        let id = format!("r:pressure{n}");
+        script.push_str("STDERR_HEX 780a 1048576\n");
+        script.push_str(&step("WRITE_HEX", request("model.generate", &id, scope(), fixture("model.generate").0)));
+        script.push_str(&step("EXPECT_HEX", response(&id, scope(), fixture("model.generate").1)));
+    }
+    script.push_str(&step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1)));
+    script.push_str("EXPECT_EOF\n");
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = count.clone();
+    let mut r = start(
+        &program,
+        "stderr-pressure",
+        &script,
+        l,
+        services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+            drop(call);
+            calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(fixture("model.generate").1).unwrap()))).unwrap();
+        }),
+    )
+    .unwrap();
+    ready(&mut r);
+    session(&mut r);
+    let turn = submit(&r, "turn.start", scope());
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+    assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 8);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_coalesced_cancel_reuses_original_identity() {
+    use mastra_worker_support::*;
+    struct ClockGate {
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Clock for ClockGate {
+        fn now(&self) -> Instant {
+            if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            Instant::now()
+        }
+    }
+    struct FiveIds(Arc<std::sync::atomic::AtomicUsize>);
+    impl IdSource for FiveIds {
+        fn next_id(&self) -> Result<Id, WireError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            if n > 5 {
+                return Err(WireError {
+                    code: ErrorCode::InternalError,
+                    message: "no more entropy".into(),
+                    retry: Retry::Never,
+                    details: ErrorDetails::Empty(EmptyDetails {}),
+                });
+            }
+            Ok(id(&format!("id{n}")))
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    let l = Limits::default();
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + &step("EXPECT_HEX", request("turn.cancel", "h:id5", scope(), fixture("turn.cancel").0))
+        + &step("WRITE_HEX", response("h:id5", scope(), fixture("turn.cancel").1))
+        + &format!("HOLD_INPUT {}\n", program.directory.join("coalesce-hold").display());
+    let (entered, observed) = std::sync::mpsc::sync_channel(1);
+    let (release, barrier) = std::sync::mpsc::sync_channel(1);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {});
+    services.clock = Arc::new(ClockGate { armed: armed.clone(), entered, release: Mutex::new(barrier) });
+    services.ids = Arc::new(FiveIds(count.clone()));
+    let mut r = start(&program, "coalesce", &script, l, services).unwrap();
+    ready(&mut r);
+    session(&mut r);
+    let turn = submit(&r, "turn.start", scope());
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+    let sender = r.client.sender();
+    let Scope::Turn(s) = scope() else { panic!() };
+    armed.store(true, std::sync::atomic::Ordering::Release);
+    r.client.drain(0, 0);
+    observed.recv_timeout(Duration::from_secs(10)).unwrap();
+    let first = sender.cancel_turn(&s, CancelReason::User);
+    release.send(()).unwrap();
+    first.unwrap();
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id.as_str()=="h:id5"));
+    armed.store(true, std::sync::atomic::Ordering::Release);
+    r.client.drain(0, 0);
+    observed.recv_timeout(Duration::from_secs(10)).unwrap();
+    let repeated = sender.cancel_turn(&s, CancelReason::Deadline);
+    release.send(()).unwrap();
+    assert_eq!(repeated.unwrap(), Some(rid("h:id5")));
+    assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 5, "coalescing does not ask the ID source for a new identity");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_callback_cancel_reuses_reserved_completion_cell() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits { pending_requests: 1, ..Limits::default() };
+    let marker = program.directory.join("callback-cancel-read");
+    let release = program.directory.join("callback-cancel-release");
+    let mut params = fixture("model.generate").0;
+    params["options"]["timeoutSeconds"] = json!(60);
+    let cancelled = json!({"protocolVersion":"1.0","kind":"response","requestId":"r:first","scope":scope(),"outcome":"error","error":{"code":"CANCELLED","message":"Runtime request was cancelled.","retry":"never","details":{}}});
+    let ack = response("r:cancel", scope(), fixture("request.cancel").1);
+    let barrier_event = json!({"connectionId":"c","state":"available","authMethods":[]});
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", request("model.generate", "r:first", scope(), params.clone()))
+        + &step("WRITE_HEX", request("request.cancel", "r:cancel", scope(), json!({"targetRequestId":"r:first"})))
+        + &format!(
+            "EXPECT_PAIR_HEX {} {}\nMARK {}\nHOLD_INPUT {}\n",
+            hex(format!("{cancelled}\n").as_bytes()),
+            hex(format!("{ack}\n").as_bytes()),
+            marker.display(),
+            release.display()
+        )
+        + &step("EXPECT_HEX", event(1, "connection.state", None, scope(), barrier_event.clone()))
+        + &step("WRITE_HEX", request("model.generate", "r:second", scope(), params))
+        + &step("EXPECT_HEX", response("r:second", scope(), fixture("model.generate").1))
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + "EXPECT_EOF\n";
+    let (send, received) = std::sync::mpsc::sync_channel(1);
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = count.clone();
+    let mut r = start(
+        &program,
+        "callback-cancel",
+        &script,
+        l,
+        services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                send.send((call, port)).unwrap();
+            } else {
+                drop(call);
+                port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(fixture("model.generate").1).unwrap()))).unwrap();
+            }
+        }),
+    )
+    .unwrap();
+    ready(&mut r);
+    session(&mut r);
+    submit(&r, "turn.start", scope());
+    let (call, port) = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    let watchdog = Instant::now() + Duration::from_secs(10);
+    while !call.cancellation.is_cancelled() {
+        assert!(Instant::now() < watchdog);
+        std::thread::yield_now();
+    }
+    drop(call);
+    assert_eq!(
+        port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(fixture("model.generate").1).unwrap()))).unwrap_err().code,
+        ErrorCode::InvalidRequest
+    );
+    while !marker.exists() {
+        assert!(Instant::now() < watchdog);
+        std::thread::yield_now();
+    }
+    let sender = r.client.sender();
+    loop {
+        let p = sender.prepare_event(scope(), HostEvent::ConnectionState(serde_json::from_value(barrier_event.clone()).unwrap()), None).unwrap();
+        match sender.try_emit(p) {
+            Ok(()) => break,
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::ResourceExhausted);
+                assert!(Instant::now() < watchdog);
+                std::thread::yield_now();
+            }
+        }
+    }
+    std::fs::write(release, b"go").unwrap();
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id.as_str()=="h:id4"));
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "real service completion releases the old action slot without a second wire result"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_streaming_works_with_one_negotiated_data_slot() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    let program = mastra_peer_program().unwrap();
+    let l = Limits { pending_requests: 1, ..Limits::default() };
+    let mut params = fixture("model.generate").0;
+    params["options"]["delivery"] = json!("streaming");
+    params["options"]["timeoutSeconds"] = json!(60);
+    let mut result = fixture("model.generate").1;
+    result["delivery"] = json!("streaming");
+    let script = bootstrap(&l)
+        + &session_script()
+        + &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), fixture("turn.start").0))
+        + &step("WRITE_HEX", request("model.generate", "r:stream", scope(), params))
+        + &step("EXPECT_HEX", event(1, "model.delta", Some("r:stream"), scope(), json!({"index":0,"text":"hi"})))
+        + &step("EXPECT_HEX", response("r:stream", scope(), result.clone()))
+        + &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1))
+        + "EXPECT_EOF\n";
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    let mut r = start(
+        &program,
+        "one-slot-stream",
+        &script,
+        l,
+        services(Arc::new(RuntimeAdmission::new(1).unwrap()), move |call, port| {
+            let emitted = port.emit(CallProgress::ModelDelta(ModelDelta { index: 0, text: "hi".into() }));
+            let ok = emitted.is_ok();
+            sent.send(emitted).unwrap();
+            drop(call);
+            if ok {
+                port.finish(Ok(HostReply::ModelGenerate(serde_json::from_value(result.clone()).unwrap()))).unwrap();
+            }
+        }),
+    )
+    .unwrap();
+    ready(&mut r);
+    session(&mut r);
+    let turn = submit(&r, "turn.start", scope());
+    assert!(
+        received.recv_timeout(Duration::from_secs(10)).unwrap().is_ok(),
+        "a dormant callback completion cell must not invent a two-data-slot streaming floor"
+    );
+    until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_peer_wall_deadline_controls_and_zero_budget() {
+    use mastra_worker_support::*;
+    use serde_json::json;
+    struct Virtual {
+        base: Instant,
+        seconds: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Clock for Virtual {
+        fn now(&self) -> Instant {
+            self.base + Duration::from_secs(self.seconds.load(std::sync::atomic::Ordering::Acquire))
+        }
+    }
+    let program = mastra_peer_program().unwrap();
+    for wall in [0, 5] {
+        let l = Limits::default();
+        let mut params = fixture("turn.start").0;
+        params["budgets"]["wallTimeSeconds"] = json!(wall);
+        let mut script = bootstrap(&l) + &session_script();
+        if wall != 0 {
+            script += &step("EXPECT_HEX", request("turn.start", "h:id4", scope(), params.clone()));
+            script += &step("WRITE_HEX", response("h:id4", scope(), fixture("turn.start").1));
+            script += &step("EXPECT_HEX", request("turn.cancel", "h:id5", scope(), json!({"reason":"deadline"})));
+            script += &step("WRITE_HEX", response("h:id5", scope(), json!({"state":"terminal"})));
+        }
+        script.push_str("EXPECT_EOF\n");
+        let seconds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut services = services(Arc::new(RuntimeAdmission::new(1).unwrap()), |_, _| {});
+        services.clock = Arc::new(Virtual { base: Instant::now(), seconds: seconds.clone() });
+        let mut r = start(&program, &format!("wall-{wall}"), &script, l, services).unwrap();
+        ready(&mut r);
+        session(&mut r);
+        let sender = r.client.sender();
+        let p = sender
+            .prepare_request(
+                scope(),
+                HostRequest::TurnStart(Box::new(serde_json::from_value(params).unwrap())),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        let turn = sender.try_submit(p).unwrap();
+        if wall == 0 {
+            let notices = until(
+                &mut r,
+                |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Err(e),..} if request_id==&turn&&e.code==ErrorCode::Timeout),
+            );
+            assert!(notices.iter().any(|n| matches!(n, ClientNotice::TurnClosed { cause: CloseReason::Deadline, .. })));
+            assert!(!notices.iter().any(|n| matches!(n, ClientNotice::TransportClosed { .. })));
+        } else {
+            until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id==&turn));
+            seconds.store(5, std::sync::atomic::Ordering::Release);
+            r.client.drain(0, 0);
+            let notices = until(&mut r, |n| matches!(n,ClientNotice::RequestFinished {request_id,result:Ok(_),..} if request_id.as_str()=="h:id5"));
+            assert_eq!(notices.iter().filter(|n| matches!(n, ClientNotice::TurnClosed { cause: CloseReason::Deadline, .. })).count(), 1);
+        }
+    }
+}
+
+// These fixtures are literal protocol examples, not values made by the codec under test.
+// State-machine tests use actual decoded wire frames and virtual monotonic time.
+#[cfg(not(target_arch = "wasm32"))]
+mod mastra_state_support {
+    pub use super::super::mastra_protocol::*;
+    pub use super::super::runtime_client::*;
+    use serde_json::{Value, json};
+    pub use std::time::{Duration, Instant};
+
+    pub fn id(text: &str) -> Id {
+        Id::parse(text).unwrap()
+    }
+    pub fn rid(text: &str) -> RequestId {
+        RequestId::parse(text, if text.starts_with("h:") { Sender::Host } else { Sender::Runtime }).unwrap()
+    }
+    pub fn scope() -> Scope {
+        Scope::Turn(TurnScope { session_id: id("s"), turn_id: id("t"), workflow_run_id: id("w") })
+    }
+    pub fn fixture(method: &str) -> (Value, Value) {
+        super::mastra_codec_catalog().0.into_iter().find(|x| x.0 == method).map(|x| (x.1, x.2)).unwrap()
+    }
+    pub fn machine(limits: Limits, now: Instant) -> RuntimeMachine {
+        let mut m = RuntimeMachine::new(id("g"), limits, now).unwrap();
+        m.apply(
+            MachineInput::Services {
+                generation: id("g"),
+                services: ServiceCapabilities {
+                    connection_describe: true,
+                    model_generate: true,
+                    agent_run: true,
+                    validation: false,
+                    streaming: false,
+                },
+            },
+            now,
+        );
+        m
+    }
+    pub fn submit(m: &mut RuntimeMachine, method: &str, name: &str, scope: Scope, now: Instant) -> Vec<MachineAction> {
+        let params = fixture(method).0;
+        submit_params(m, method, name, scope, params, now)
+    }
+    pub fn submit_params(m: &mut RuntimeMachine, method: &str, name: &str, scope: Scope, params: Value, now: Instant) -> Vec<MachineAction> {
+        let mut wire = super::mastra_codec_request(method, params, true);
+        wire["scope"] = serde_json::to_value(&scope).unwrap();
+        wire["requestId"] = json!(name);
+        let phase = if method == "runtime.hello" { DecodePhase::Bootstrap } else { DecodePhase::Negotiated };
+        let decoded = decode_frame(format!("{wire}\n").as_bytes(), phase, Sender::Host, &Limits::default()).unwrap();
+        let DecodeResult::Frame(Frame::Request { body: RequestBody::Host(request), .. }) = decoded else { panic!("host request") };
+        m.apply(MachineInput::Submit { generation: id("g"), request_id: rid(name), scope, request, deadline: now + Duration::from_secs(300) }, now)
+    }
+    pub fn peer(m: &mut RuntimeMachine, value: Value, now: Instant) -> Vec<MachineAction> {
+        let phase = if value["kind"] == "response" { DecodePhase::Bootstrap } else { DecodePhase::Negotiated };
+        let decoded = decode_frame(format!("{value}\n").as_bytes(), phase, Sender::Runtime, &Limits::default())
+            .unwrap_or_else(|_| panic!("invalid peer fixture: {value}"));
+        m.apply(MachineInput::Peer { generation: id("g"), sender: Sender::Runtime, decoded }, now)
+    }
+    pub fn response(name: &str, scope: Scope, result: Value) -> Value {
+        json!({"protocolVersion":"1.0","kind":"response","requestId":name,"scope":scope,"outcome":"ok","result":result})
+    }
+    pub fn event(sequence: u32, name: &str, cause: Option<&str>, scope: Scope, data: Value) -> Value {
+        json!({"protocolVersion":"1.0","kind":"event","sequence":sequence,"event":name,"requestId":cause,"scope":scope,"data":data})
+    }
+    pub fn call(m: &mut RuntimeMachine, method: &str, name: &str, now: Instant) -> Vec<MachineAction> {
+        let mut wire = super::mastra_codec_request(method, fixture(method).0, false);
+        wire["requestId"] = json!(name);
+        wire["scope"] = serde_json::to_value(scope()).unwrap();
+        peer(m, wire, now)
+    }
+    pub fn release(m: &mut RuntimeMachine, actions: &[MachineAction], now: Instant) {
+        for action in actions {
+            match action {
+                MachineAction::Send { ticket, .. } => {
+                    m.apply(MachineInput::Written { generation: id("g"), ticket: *ticket }, now);
+                }
+                MachineAction::Notice { ticket, .. } => {
+                    m.apply(MachineInput::NoticeConsumed { generation: id("g"), ticket: *ticket }, now);
+                }
+                _ => {}
+            }
+        }
+    }
+    pub fn notices(actions: &[MachineAction]) -> Vec<&ClientNotice> {
+        actions.iter().filter_map(|a| if let MachineAction::Notice { notice, .. } = a { Some(notice.as_ref()) } else { None }).collect()
+    }
+    pub fn frames(actions: &[MachineAction]) -> Vec<Value> {
+        actions
+            .iter()
+            .filter_map(|a| if let MachineAction::Send { bytes, .. } = a { Some(serde_json::from_slice(bytes).unwrap()) } else { None })
+            .collect()
+    }
+    pub fn token(actions: &[MachineAction]) -> CallbackToken {
+        actions.iter().find_map(|a| if let MachineAction::Dispatch(call) = a { Some(call.token.clone()) } else { None }).expect("dispatch")
+    }
+    pub fn fatal(actions: &[MachineAction]) -> bool {
+        notices(actions).iter().any(|n| matches!(n, ClientNotice::TransportClosed { cause: TransportCause::Error(_), .. }))
+    }
+    pub fn ready(limits: Limits, now: Instant) -> RuntimeMachine {
+        let mut m = machine(limits.clone(), now);
+        let a = submit_params(
+            &mut m,
+            "runtime.hello",
+            "h:hello",
+            Scope::Runtime,
+            json!({"supportedVersions":["2.0","1.0","0.9"],"hostVersion":"1","limits":limits}),
+            now,
+        );
+        release(&mut m, &a, now);
+        let mut hello = fixture("runtime.hello").1;
+        hello["limits"] = serde_json::to_value(limits).unwrap();
+        hello["capabilities"]["hostModelCalls"] = json!(true);
+        hello["capabilities"]["hostAgentTasks"] = json!(true);
+        let a = peer(&mut m, response("h:hello", Scope::Runtime, hello), now);
+        assert!(!fatal(&a));
+        release(&mut m, &a, now);
+        let a = peer(&mut m, event(1, "runtime.ready", Some("h:hello"), Scope::Runtime, json!({"runtimeInstanceId":"i"})), now);
+        assert!(notices(&a).iter().any(|n| matches!(n, ClientNotice::RuntimeReady(_))));
+        release(&mut m, &a, now);
+        let a = submit(&mut m, "session.start", "h:session", Scope::Session(id("s")), now);
+        assert_eq!(frames(&a).len(), 1);
+        release(&mut m, &a, now);
+        let a = peer(&mut m, response("h:session", Scope::Session(id("s")), fixture("session.start").1), now);
+        assert!(!fatal(&a));
+        release(&mut m, &a, now);
+        m
+    }
+    pub fn turn(limits: Limits, now: Instant) -> RuntimeMachine {
+        let mut m = ready(limits, now);
+        let a = submit(&mut m, "turn.start", "h:turn", scope(), now);
+        assert_eq!(frames(&a).len(), 1);
+        release(&mut m, &a, now);
+        m
+    }
+}
+
+// Mutation caught: loose version matching, ready/hello identity drift, or refusal overwritten by EOF.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_exact_hello_and_capabilities() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    for selected in ["1.0.0", "2.0", "0.9"] {
+        let mut m = machine(Limits::default(), now);
+        let a = submit(&mut m, "runtime.hello", "h:hello", Scope::Runtime, now);
+        release(&mut m, &a, now);
+        let mut result = fixture("runtime.hello").1;
+        result["selectedVersion"] = json!(selected);
+        assert!(fatal(&peer(&mut m, response("h:hello", Scope::Runtime, result), now)));
+    }
+    let mut m = machine(Limits::default(), now);
+    let a = submit(&mut m, "runtime.hello", "h:hello", Scope::Runtime, now);
+    release(&mut m, &a, now);
+    let mut hello = fixture("runtime.hello").1;
+    hello["limits"]["textBytes"] = json!(1);
+    let a = peer(&mut m, response("h:hello", Scope::Runtime, hello), now);
+    release(&mut m, &a, now);
+    let a = peer(&mut m, event(1, "runtime.ready", Some("h:hello"), Scope::Runtime, json!({"runtimeInstanceId":"other"})), now);
+    assert!(fatal(&a));
+    let mut m = machine(Limits::default(), now);
+    let a = submit(&mut m, "runtime.hello", "h:hello", Scope::Runtime, now);
+    release(&mut m, &a, now);
+    let refusal = json!({"protocolVersion":"9.0","kind":"response","requestId":"h:hello","scope":Scope::Runtime,"outcome":"error","error":{"code":"INCOMPATIBLE_VERSION","message":"No common version.","retry":"never","details":{}}});
+    let a = peer(&mut m, refusal, now);
+    assert!(notices(&a).iter().any(|n| matches!(n,ClientNotice::RequestFinished {result:Err(e),..} if e.code==ErrorCode::IncompatibleVersion)));
+    release(&mut m, &a, now);
+    let a = submit(&mut m, "session.start", "h:bad", Scope::Session(id("s")), now);
+    assert!(frames(&a).is_empty());
+    let a = m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now);
+    assert!(notices(&a).iter().any(|n| matches!(n, ClientNotice::TransportClosed { cause: TransportCause::ExpectedEof, .. })));
+    assert!(!notices(&a).iter().any(|n| matches!(n,ClientNotice::RequestFinished {request_id,..} if request_id.as_str()=="h:hello")));
+    let mut m = ready(Limits::default(), now);
+    let a = submit(&mut m, "runtime.shutdown", "h:stop", Scope::Runtime, now);
+    release(&mut m, &a, now);
+    let a = peer(&mut m, response("h:stop", Scope::Runtime, fixture("runtime.shutdown").1), now);
+    release(&mut m, &a, now);
+    let a = m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now);
+    assert!(notices(&a).iter().any(|n| matches!(n, ClientNotice::TransportClosed { cause: TransportCause::ExpectedEof, .. })));
+    let mut m = ready(Limits::default(), now);
+    assert!(fatal(&m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now)));
+    let mut m = ready(Limits::default(), now);
+    let a = submit(&mut m, "turn.start", "h:turn", scope(), now);
+    release(&mut m, &a, now);
+    // Availability is injected, never inferred from runtime readiness/authentication.
+    let a = call(&mut m, "validation.status", "r:v", now);
+    assert_eq!(frames(&a)[0]["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+}
+
+// Mutation caught: binding a turn only after acknowledgement deadlocks nested model callbacks.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_nested_callback_before_acceptance() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let a = call(&mut m, "model.generate", "r:model", now);
+    assert!(matches!(a.as_slice(), [MachineAction::Dispatch(_)]));
+    let token = token(&a);
+    let reply = decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap();
+    let a = m.apply(MachineInput::CallbackFinished { token, result: Box::new(Ok(reply)) }, now);
+    assert_eq!(frames(&a)[0]["requestId"], "r:model");
+    assert!(!notices(&a).iter().any(|n| matches!(n,ClientNotice::RequestFinished {request_id,..} if request_id.as_str()=="h:turn")));
+    release(&mut m, &a, now);
+    let a = peer(&mut m, response("h:turn", scope(), fixture("turn.start").1), now);
+    assert!(matches!(notices(&a).as_slice(), [ClientNotice::RequestFinished { result: Ok(RuntimeReply::TurnStart(_)), .. }]));
+}
+
+// Mutation caught: trusting scope/retirement before exact sender, method, sequence and cause.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_correlation_and_sequences() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    for wire in [
+        response("h:unknown", scope(), json!({"state":"accepted"})),
+        response("h:turn", Scope::Session(id("s")), json!({"state":"accepted"})),
+        response("h:turn", scope(), json!({"state":"ready","workflowId":"w"})),
+    ] {
+        let mut m = turn(Limits::default(), now);
+        assert!(fatal(&peer(&mut m, wire, now)));
+    }
+    let mut m = turn(Limits::default(), now);
+    let a = peer(&mut m, response("h:turn", scope(), json!({"state":"accepted"})), now);
+    release(&mut m, &a, now);
+    assert!(fatal(&peer(&mut m, response("h:turn", scope(), json!({"state":"accepted"})), now)));
+    for seq in [1, 2] {
+        let mut m = turn(Limits::default(), now);
+        let e = event(2, "workflow.text", Some("h:turn"), scope(), json!({"text":"a","channel":"progress"}));
+        let a = peer(&mut m, e, now);
+        release(&mut m, &a, now);
+        assert!(fatal(&peer(&mut m, event(seq, "workflow.text", Some("h:turn"), scope(), json!({"text":"a","channel":"progress"})), now)));
+    }
+    let mut m = turn(Limits::default(), now);
+    assert!(fatal(&peer(&mut m, event(2, "workflow.text", Some("r:wrong"), scope(), json!({"text":"a","channel":"progress"})), now)));
+    let mut m = turn(Limits::default(), now);
+    let decoded = decode_frame(
+        format!("{}\n", response("h:turn", scope(), json!({"state":"accepted"}))).as_bytes(),
+        DecodePhase::Negotiated,
+        Sender::Runtime,
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(m.apply(MachineInput::Peer { generation: id("old"), sender: Sender::Runtime, decoded: decoded.clone() }, now).is_empty());
+    let a = m.apply(MachineInput::Peer { generation: id("g"), sender: Sender::Runtime, decoded }, now);
+    assert!(!fatal(&a));
+    release(&mut m, &a, now);
+    let decoded = decode_frame(
+        format!("{}\n", event(2, "workflow.text", Some("h:turn"), scope(), json!({"text":"a","channel":"progress"}))).as_bytes(),
+        DecodePhase::Negotiated,
+        Sender::Runtime,
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(fatal(&m.apply(MachineInput::Peer { generation: id("g"), sender: Sender::Host, decoded }, now)));
+    let mut m = turn(Limits::default(), now);
+    let mut unknown = super::tests::mastra_codec_request("future.method", json!({}), false);
+    unknown["scope"] = serde_json::to_value(scope()).unwrap();
+    unknown["requestId"] = json!("r:unknown");
+    let a = peer(&mut m, unknown, now);
+    assert_eq!(frames(&a)[0]["error"]["code"], "METHOD_NOT_FOUND");
+    release(&mut m, &a, now);
+    assert!(call(&mut m, "model.generate", "r:valid", now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+}
+
+// Mutation caught: unbounded pending/queued actions, control starvation, ID eviction and sequence wrap.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_queue_pending_and_ledger_reserves() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let mut first = None;
+    for n in 0..32 {
+        let a = call(&mut m, "model.generate", &format!("r:m{n}"), now);
+        assert_eq!(a.iter().filter(|a| matches!(a, MachineAction::Dispatch(_))).count(), 1);
+        if n == 0 {
+            first = Some(token(&a));
+        }
+    }
+    let a = call(&mut m, "model.generate", "r:overflow", now);
+    assert_eq!(frames(&a)[0]["error"]["code"], "RESOURCE_EXHAUSTED");
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    release(&mut m, &a, now);
+    let cancel = json!({"protocolVersion":"1.0","kind":"request","scope":scope(),"requestId":"r:cancel","method":"request.cancel","params":{"targetRequestId":"r:m0"}});
+    let a = peer(&mut m, cancel, now);
+    assert!(frames(&a).iter().any(|v| v["requestId"] == "r:cancel" && v["outcome"] == "ok"));
+    release(&mut m, &a, now);
+    let a = call(&mut m, "model.generate", "r:still-held", now);
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))), "cancellation must not release an in-flight owned action");
+    assert_eq!(frames(&a)[0]["error"]["code"], "RESOURCE_EXHAUSTED", "cancelled dispatch keeps its owned payload reservation until completion");
+    release(&mut m, &a, now);
+    let reply = decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap();
+    let a = m.apply(MachineInput::CallbackFinished { token: first.unwrap(), result: Box::new(Ok(reply)) }, now);
+    assert!(frames(&a).is_empty());
+    assert!(call(&mut m, "model.generate", "r:released", now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    let limits = Limits { pending_requests: 1, request_ledger_entries: 20, ..Limits::default() };
+    let mut m = turn(limits, now);
+    for n in 0..5 {
+        let a = call(&mut m, "model.generate", &format!("r:x{n}"), now);
+        let token = token(&a);
+        let reply = decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap();
+        let a = m.apply(MachineInput::CallbackFinished { token, result: Box::new(Ok(reply)) }, now);
+        release(&mut m, &a, now);
+    }
+    let a = call(&mut m, "model.generate", "r:ledger-full", now);
+    assert_eq!(frames(&a)[0]["error"]["code"], "RESOURCE_EXHAUSTED");
+    release(&mut m, &a, now);
+    assert!(fatal(&call(&mut m, "model.generate", "r:x0", now)), "completed IDs never evicted/reused");
+    let limits = Limits { frame_bytes: 4096, queue_bytes: 8192, control_lane_bytes: 4096, ..Limits::default() };
+    let mut m = turn(limits, now);
+    let connection =
+        HostEvent::ConnectionState(ConnectionStateEvent { connection_id: id("c"), state: ConnectionState::Unknown, auth_methods: vec![] });
+    let mut sent = 0;
+    loop {
+        let a = m.apply(MachineInput::Emit { generation: id("g"), scope: scope(), event: connection.clone(), cause: None }, now);
+        if frames(&a).is_empty() {
+            assert!(a.iter().any(|a| matches!(a,MachineAction::Rejected {error,..} if error.code==ErrorCode::ResourceExhausted)));
+            break;
+        }
+        sent += 1;
+        assert!(sent <= 32);
+    }
+    let a = submit(&mut m, "turn.cancel", "h:cancel", scope(), now);
+    assert_eq!(frames(&a).len(), 1, "reserved bytes and slot survive retained writes");
+    let mut m = turn(Limits::default(), now);
+    let a = peer(&mut m, event(2_147_483_647, "workflow.text", Some("h:turn"), scope(), json!({"text":"end","channel":"progress"})), now);
+    assert!(a.iter().any(|a| matches!(a, MachineAction::StopTree)), "sequence exhaustion requests shutdown, never wraps");
+}
+
+// Mutation caught: forged streaming, callback relabeling, or terminal proposals freeing next-turn admission.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_host_events_and_buffered_delta_rejection() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let a = m.apply(
+        MachineInput::Emit {
+            generation: id("g"),
+            scope: scope(),
+            event: HostEvent::ConnectionState(ConnectionStateEvent {
+                connection_id: id("c"),
+                state: ConnectionState::AuthRequired,
+                auth_methods: vec![],
+            }),
+            cause: Some(rid("h:turn")),
+        },
+        now,
+    );
+    assert_eq!(frames(&a)[0]["sequence"], 1);
+    assert_eq!(frames(&a)[0]["scope"], serde_json::to_value(scope()).unwrap());
+    assert_eq!(frames(&a)[0]["requestId"], "h:turn");
+    release(&mut m, &a, now);
+    let a = call(&mut m, "model.generate", "r:model", now);
+    let model = token(&a);
+    let a =
+        m.apply(MachineInput::Progress { token: model, event: CallProgress::ModelDelta(ModelDelta { index: 0, text: "not streaming".into() }) }, now);
+    assert!(frames(&a).is_empty());
+    assert!(a.iter().any(|a| matches!(a,MachineAction::Rejected {error,..} if error.code==ErrorCode::UnsupportedCapability)));
+    let a = call(&mut m, "agent.run", "r:agent", now);
+    let agent = token(&a);
+    let progress = CallProgress::AgentProgress(AgentProgress {
+        agent_session_id: id("as"),
+        content: AgentProgressContent::Text(ProgressText { text: "real progress".into() }),
+    });
+    let a = m.apply(MachineInput::Progress { token: agent.clone(), event: progress.clone() }, now);
+    assert_eq!(frames(&a)[0]["sequence"], 2);
+    assert_eq!(frames(&a)[0]["requestId"], "r:agent");
+    assert_eq!(frames(&a)[0]["scope"], serde_json::to_value(scope()).unwrap());
+    release(&mut m, &a, now);
+    let proposal = fixture("turn.start").0["binding"]["document"].clone();
+    let finished =
+        json!({"state":"validated_success","reason":"proposal only","document":proposal,"changes":"unknown","validationRunId":null,"report":null});
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), finished.clone()), now);
+    assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::TerminalProposal, .. })));
+    assert_eq!(notices(&a).iter().filter(|n| matches!(n, ClientNotice::TurnFinishedProposal { .. })).count(), 1);
+    assert!(notices(&a).iter().any(|n|matches!(n,ClientNotice::TurnFinishedProposal {proposal,..} if proposal.state==TurnTerminal::ValidatedSuccess && proposal.changes==Changes::Unknown)));
+    release(&mut m, &a, now);
+    let mut second = finished.clone();
+    second["state"] = json!("cancelled");
+    let a = peer(&mut m, event(3, "turn.finished", Some("h:turn"), scope(), second), now);
+    assert!(!fatal(&a));
+    assert!(!notices(&a).iter().any(|n| matches!(n, ClientNotice::TurnFinishedProposal { .. })));
+    let a = m.apply(MachineInput::Progress { token: agent.clone(), event: progress.clone() }, now);
+    assert!(frames(&a).is_empty());
+    let a = submit(&mut m, "turn.start", "h:next", scope(), now);
+    assert!(frames(&a).is_empty());
+    let Scope::Turn(turn_scope) = scope() else { panic!() };
+    let mut wrong = turn_scope.clone();
+    wrong.turn_id = id("wrong");
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: wrong, terminal: TurnTerminal::TaskFailed }, now);
+    let a = submit(&mut m, "turn.start", "h:next2", scope(), now);
+    assert!(frames(&a).is_empty());
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: turn_scope, terminal: TurnTerminal::TaskFailed }, now);
+    let mut next = scope();
+    if let Scope::Turn(t) = &mut next {
+        t.turn_id = id("next");
+    }
+    let a = submit(&mut m, "turn.start", "h:next3", next.clone(), now);
+    assert_eq!(frames(&a).len(), 1);
+    release(&mut m, &a, now);
+    let mut wire = mastra_codec_request("agent.run", fixture("agent.run").0, false);
+    wire["scope"] = json!(next);
+    wire["requestId"] = json!("r:new-agent");
+    let a = peer(&mut m, wire, now);
+    let next_token = token(&a);
+    let a = m.apply(MachineInput::Progress { token: agent, event: progress.clone() }, now);
+    assert!(frames(&a).is_empty(), "retired progress never takes the new callback's scope");
+    let a = m.apply(MachineInput::Progress { token: next_token, event: progress }, now);
+    assert_eq!(frames(&a)[0]["scope"], json!(next));
+    assert_eq!(frames(&a)[0]["requestId"], "r:new-agent");
+}
+
+// Mutation caught: generation checks after accounting, ignored overflow, or retired IDs pardoned as unknown.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_generation_retirement_and_overflow() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let old = decode_frame(
+        format!("{}\n", event(2_147_483_647, "workflow.text", Some("h:turn"), scope(), json!({"text":"stale","channel":"progress"}))).as_bytes(),
+        DecodePhase::Negotiated,
+        Sender::Runtime,
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(m.apply(MachineInput::Peer { generation: id("old"), sender: Sender::Runtime, decoded: old }, now).is_empty());
+    let a = peer(&mut m, event(2, "workflow.text", Some("h:turn"), scope(), json!({"text":"current","channel":"progress"})), now);
+    assert!(!fatal(&a));
+    release(&mut m, &a, now);
+    let mut p = fixture("request.cancel").0;
+    p["targetRequestId"] = json!("h:turn");
+    let a = submit_params(&mut m, "request.cancel", "h:cancel", scope(), p, now);
+    assert!(notices(&a).iter().any(|n| matches!(n,ClientNotice::RequestFinished {result:Err(e),..} if e.code==ErrorCode::Cancelled)));
+    release(&mut m, &a, now);
+    let a = peer(&mut m, response("h:turn", scope(), json!({"state":"accepted"})), now);
+    assert!(!fatal(&a));
+    assert!(notices(&a).is_empty());
+    assert!(fatal(&peer(&mut m, response("h:not-cancelled", scope(), json!({"state":"accepted"})), now)));
+    let mut m = turn(Limits::default(), now);
+    let finished = json!({"state":"task_failed","reason":"no result","document":{"documentId":"d","revision":"1"},"changes":"unknown","validationRunId":null,"report":null});
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), finished), now);
+    release(&mut m, &a, now);
+    let a = peer(&mut m, event(3, "workflow.text", Some("h:unknown"), scope(), json!({"text":"not excused","channel":"progress"})), now);
+    assert!(fatal(&a));
+    let limits = Limits { frame_bytes: 4096, queue_bytes: 8192, control_lane_bytes: 4096, ..Limits::default() };
+    let mut m = turn(limits, now);
+    let mut seen_close = false;
+    for seq in 2..80 {
+        let a = peer(&mut m, event(seq, "workflow.text", Some("h:turn"), scope(), json!({"text":"a".repeat(1000),"channel":"progress"})), now);
+        if fatal(&a) {
+            seen_close = true;
+            break;
+        }
+    }
+    assert!(seen_close, "unconsumed notices must close visibly, not be silently dropped");
+}
+
+// Mutation caught: duplicated control consumes the reserve, and replies after their clamped deadline succeed.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_control_coalescing_and_callback_deadline() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let a = submit(&mut m, "turn.cancel", "h:cancel1", scope(), now);
+    release(&mut m, &a, now);
+    let a = submit(&mut m, "turn.cancel", "h:cancel2", scope(), now);
+    assert!(matches!(a.as_slice(),[MachineAction::Coalesced {existing_request_id,..}] if existing_request_id.as_str()=="h:cancel1"));
+    let mut m = turn(Limits::default(), now);
+    let a = call(&mut m, "model.generate", "r:deadline", now);
+    let token = token(&a);
+    let reply = decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap();
+    let a = m.apply(MachineInput::CallbackFinished { token, result: Box::new(Ok(reply)) }, now + Duration::from_secs(1));
+    assert_eq!(frames(&a)[0]["error"]["code"], "TIMEOUT");
+}
+
+// Mutation caught: treating a completed CANCELLED service as an action still in flight.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_finished_cancelled_callback_releases_owned_action() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+    let a = call(&mut m, "model.generate", "r:first", now);
+    let token = token(&a);
+    let cancelled = WireError {
+        code: ErrorCode::Cancelled,
+        message: "Service finished cancelled.".into(),
+        retry: Retry::Never,
+        details: ErrorDetails::Empty(EmptyDetails {}),
+    };
+    let a = m.apply(MachineInput::CallbackFinished { token, result: Box::new(Err(cancelled)) }, now);
+    assert_eq!(frames(&a)[0]["error"]["code"], "CANCELLED");
+    release(&mut m, &a, now);
+    let a = call(&mut m, "model.generate", "r:next", now);
+    assert!(
+        a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))),
+        "a finished service must release its owned action even when its result is CANCELLED"
+    );
+}
+
+// I1: an ended action still owns its callback slot until its reply is physically written.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_reply_slot_requires_action_end_and_written() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    for cancelled in [false, true] {
+        let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+        let a = call(&mut m, "model.generate", "r:first", now);
+        let token = token(&a);
+        let result = if cancelled {
+            Err(WireError {
+                code: ErrorCode::Cancelled,
+                message: "Ended.".into(),
+                retry: Retry::Never,
+                details: ErrorDetails::Empty(EmptyDetails {}),
+            })
+        } else {
+            Ok(decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap())
+        };
+        let reply = m.apply(MachineInput::CallbackFinished { token, result: Box::new(result) }, now);
+        assert_eq!(frames(&reply).len(), 1);
+        let a = call(&mut m, "model.generate", "r:too-early", now);
+        assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))), "reply still owns its physical write slot");
+    }
+    // Both orders of a logical cancellation must retain the other half of ownership.
+    for written_first in [false, true] {
+        let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+        let a = call(&mut m, "model.generate", "r:first", now);
+        let token = token(&a);
+        let replies = peer(
+            &mut m,
+            json!({"protocolVersion":"1.0","kind":"request","requestId":"r:cancel","scope":scope(),"method":"request.cancel","params":{"targetRequestId":"r:first"}}),
+            now,
+        );
+        assert!(!fatal(&replies));
+        if written_first {
+            release(&mut m, &replies, now);
+        } else {
+            let result = decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap();
+            m.apply(MachineInput::CallbackFinished { token: token.clone(), result: Box::new(Ok(result)) }, now);
+        }
+        let a = call(&mut m, "model.generate", "r:too-early", now);
+        assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))), "both action end and Written are required");
+    }
+    let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+    let a = call(&mut m, "model.generate", "r:first", now);
+    let result = decode_host_reply("model.generate", fixture("model.generate").1, &Limits::default()).unwrap();
+    let a = m.apply(MachineInput::CallbackFinished { token: token(&a), result: Box::new(Ok(result)) }, now);
+    release(&mut m, &a, now);
+    assert!(call(&mut m, "model.generate", "r:after-write", now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+}
+
+// I2: valid lower limits do not acquire an undeclared 4096-byte startup floor.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_lower_legal_limits_allow_bootstrap() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let limits = Limits { frame_bytes: 3000, queue_bytes: 6000, control_lane_bytes: 3000, ..Limits::default() };
+    assert!(validate_limits(&limits).is_ok());
+    let mut m = machine(limits.clone(), now);
+    let a = submit_params(
+        &mut m,
+        "runtime.hello",
+        "h:hello",
+        Scope::Runtime,
+        json!({"supportedVersions":["1.0"],"hostVersion":"1","limits":limits}),
+        now,
+    );
+    assert_eq!(frames(&a).len(), 1, "small hello fits the negotiated data capacity");
+    let mut m = ready(limits, now);
+    assert_eq!(frames(&submit(&mut m, "turn.start", "h:turn", scope(), now)).len(), 1);
+}
+
+// Mutation caught: silently losing the original call on notice overflow, or unbounded event slots.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_completion_cells_and_event_slots() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    for seq in 2..34 {
+        let a = peer(&mut m, event(seq, "workflow.text", Some("h:turn"), scope(), json!({"text":"x","channel":"progress"})), now);
+        assert!(!fatal(&a));
+    }
+    let a = peer(&mut m, event(34, "workflow.text", Some("h:turn"), scope(), json!({"text":"overflow","channel":"progress"})), now);
+    assert!(fatal(&a));
+    assert!(notices(&a).iter().any(|n|matches!(n,ClientNotice::RequestFinished {request_id,result:Err(e),..} if request_id.as_str()=="h:turn" && e.code==ErrorCode::TransportError)));
+    let mut m = turn(Limits::default(), now);
+    let a = submit(&mut m, "turn.cancel", "h:control", scope(), now);
+    release(&mut m, &a, now);
+    let a = peer(
+        &mut m,
+        json!({"protocolVersion":"1.0","kind":"response","requestId":"h:control","scope":scope(),"outcome":"error","error":{"code":"INTERNAL_ERROR","message":"x".repeat(2048),"retry":"never","details":{}}}),
+        now,
+    );
+    assert!(!fatal(&a));
+    assert!(notices(&a).iter().any(|n|matches!(n,ClientNotice::RequestFinished {request_id,result:Err(e),..} if request_id.as_str()=="h:control" && e.code==ErrorCode::InternalError && e.message=="x".repeat(2048))));
+    let mut m = ready(Limits::default(), now);
+    let a = submit(&mut m, "runtime.shutdown", "h:shutdown", Scope::Runtime, now);
+    release(&mut m, &a, now);
+    let a = submit(&mut m, "runtime.shutdown", "h:again", Scope::Runtime, now);
+    assert!(matches!(a.as_slice(),[MachineAction::Coalesced {existing_request_id,..}] if existing_request_id.as_str()=="h:shutdown"));
+    let mut m = turn(Limits::default(), now);
+    let mut unknown = mastra_codec_request("future.method", json!({}), false);
+    unknown["scope"] = json!(Scope::Runtime);
+    unknown["requestId"] = json!("r:future");
+    let a = peer(&mut m, unknown, now);
+    assert!(!fatal(&a));
+    assert_eq!(frames(&a)[0]["error"]["code"], "METHOD_NOT_FOUND");
+}
+
+// I3: control completions use available negotiated storage, not a private 1KiB wire limit.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_control_completion_preserves_original_error() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    for limits in [Limits::default(), Limits { frame_bytes: 3000, queue_bytes: 6000, control_lane_bytes: 3000, ..Limits::default() }] {
+        let mut m = turn(limits, now);
+        let a = submit(&mut m, "turn.cancel", "h:control", scope(), now);
+        release(&mut m, &a, now);
+        let a = peer(
+            &mut m,
+            json!({"protocolVersion":"1.0","kind":"response","requestId":"h:control","scope":scope(),"outcome":"error","error":{"code":"INTERNAL_ERROR","message":"x".repeat(2048),"retry":"never","details":{"operation":"o".repeat(500)}}}),
+            now,
+        );
+        assert!(!fatal(&a), "a legal original error fits available data/control storage");
+        assert!(notices(&a).iter().any(|n|matches!(n,ClientNotice::RequestFinished {request_id,result:Err(e),..} if request_id.as_str()=="h:control" && e.code==ErrorCode::InternalError && e.message=="x".repeat(2048))));
+        let params = json!({"targetRequestId":"h:turn"});
+        let early = submit_params(&mut m, "request.cancel", "h:early", scope(), params.clone(), now);
+        assert!(frames(&early).is_empty(), "unconsumed completion retains the semantic control slot even in data storage");
+        release(&mut m, &a, now);
+        assert_eq!(frames(&submit_params(&mut m, "request.cancel", "h:after-consume", scope(), params, now)).len(), 1);
+    }
+}
+
+// I4: valid cancel envelopes with unknown targets return a recoverable method error.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_cancel_errors_preserve_session_and_control_reserve() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let a = peer(
+        &mut m,
+        json!({"protocolVersion":"1.0","kind":"request","requestId":"r:bad-cancel","scope":scope(),"method":"request.cancel","params":{"targetRequestId":"r:missing"}}),
+        now,
+    );
+    assert!(!fatal(&a));
+    assert_eq!(frames(&a)[0]["error"]["code"], "INVALID_REQUEST");
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    release(&mut m, &a, now);
+    assert!(call(&mut m, "model.generate", "r:valid-after-error", now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    for name in ["r:cancel1", "r:cancel2"] {
+        let a = peer(
+            &mut m,
+            json!({"protocolVersion":"1.0","kind":"request","requestId":name,"scope":scope(),"method":"request.cancel","params":{"targetRequestId":"r:valid-after-error"}}),
+            now,
+        );
+        assert!(!fatal(&a), "idempotent cancel does not replace or release the first physical reply");
+        assert!(frames(&a).iter().any(|f| f["requestId"] == name && f["outcome"] == "ok"));
+    }
+}
+
+// I5: session run queries reach injected authorization without requiring a turn.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_session_validation_queries_do_not_require_turn() {
+    use mastra_state_support::*;
+    fn session(now: Instant, native: bool, advertised: bool) -> RuntimeMachine {
+        let mut m = RuntimeMachine::new(id("g"), Limits::default(), now).unwrap();
+        m.apply(
+            MachineInput::Services { generation: id("g"), services: ServiceCapabilities { validation: native, ..ServiceCapabilities::default() } },
+            now,
+        );
+        let a = submit(&mut m, "runtime.hello", "h:hello", Scope::Runtime, now);
+        release(&mut m, &a, now);
+        let mut hello = fixture("runtime.hello").1;
+        hello["capabilities"]["snapshotValidation"] = json!(advertised);
+        let a = peer(&mut m, response("h:hello", Scope::Runtime, hello), now);
+        release(&mut m, &a, now);
+        let a = peer(&mut m, event(1, "runtime.ready", Some("h:hello"), Scope::Runtime, json!({"runtimeInstanceId":"i"})), now);
+        release(&mut m, &a, now);
+        let a = submit(&mut m, "session.start", "h:session", Scope::Session(id("s")), now);
+        release(&mut m, &a, now);
+        let a = peer(&mut m, response("h:session", Scope::Session(id("s")), fixture("session.start").1), now);
+        assert!(!fatal(&a));
+        release(&mut m, &a, now);
+        m
+    }
+    let now = Instant::now();
+    for finishing in [false, true] {
+        let mut m = session(now, true, true);
+        if finishing {
+            let mut params = fixture("turn.start").0;
+            params["budgets"]["wallTimeSeconds"] = json!(0);
+            let a = submit_params(&mut m, "turn.start", "h:turn", scope(), params, now);
+            release(&mut m, &a, now);
+            let a = peer(
+                &mut m,
+                event(
+                    2,
+                    "turn.finished",
+                    Some("h:turn"),
+                    scope(),
+                    json!({"state":"task_failed","reason":"no result","document":{"documentId":"d","revision":"1"},"changes":"unknown","validationRunId":null,"report":null}),
+                ),
+                now,
+            );
+            release(&mut m, &a, now);
+        }
+        for method in ["validation.status", "validation.report", "validation.cancel"] {
+            let name = format!("r:{method}");
+            let mut wire = mastra_codec_request(method, fixture(method).0, false);
+            wire["requestId"] = json!(name);
+            wire["scope"] = json!(Scope::Session(id("s")));
+            let a = peer(&mut m, wire, now);
+            assert!(
+                a.iter().any(|a| matches!(a,MachineAction::Dispatch(c) if c.scope==Scope::Session(id("s")) && c.call.method()==method)),
+                "session query must reach service: finishing={finishing}, method={method}, actions={a:?}"
+            );
+            let reply = decode_host_reply(method, fixture(method).1, &Limits::default()).unwrap();
+            let a = m.apply(MachineInput::CallbackFinished { token: token(&a), result: Box::new(Ok(reply)) }, now);
+            assert!(!fatal(&a));
+            release(&mut m, &a, now);
+        }
+    }
+    for (native, advertised) in [(false, true), (true, false)] {
+        let mut m = session(now, native, advertised);
+        let mut wire = mastra_codec_request("validation.status", fixture("validation.status").0, false);
+        wire["scope"] = json!(Scope::Session(id("s")));
+        let a = peer(&mut m, wire, now);
+        assert_eq!(frames(&a)[0]["error"]["code"], "UNSUPPORTED_CAPABILITY");
+        assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    }
+    let mut m = session(now, true, true);
+    let mut wire = mastra_codec_request("validation.status", fixture("validation.status").0, false);
+    wire["scope"] = json!(Scope::Session(id("other")));
+    let a = peer(&mut m, wire, now);
+    assert!(fatal(&a));
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+}
+
+// I6: refusal closes work admission, but only matching trusted completion releases the turn.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_rejected_turn_start_waits_for_trusted_completion() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let refusal = json!({"protocolVersion":"1.0","kind":"response","requestId":"h:turn","scope":scope(),"outcome":"error","error":{"code":"INVALID_REQUEST","message":"Cannot accept this turn.","retry":"never","details":{}}});
+    let mut m = turn(Limits::default(), now);
+    let early = call(&mut m, "model.generate", "r:before-ack", now);
+    assert!(early.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    let a = peer(&mut m, refusal.clone(), now);
+    assert!(!fatal(&a));
+    assert!(matches!(a.first(), Some(MachineAction::CloseTurn { .. })), "refusal must close the scope before delivering its completion");
+    release(&mut m, &a, now);
+    assert!(!call(&mut m, "model.generate", "r:after-refusal", now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+    let mut m = turn(Limits::default(), now);
+    let a = peer(&mut m, refusal.clone(), now);
+    release(&mut m, &a, now);
+    let Scope::Turn(current) = scope() else { panic!() };
+    let next = TurnScope { turn_id: id("next"), ..current.clone() };
+    assert!(frames(&submit(&mut m, "turn.start", "h:too-soon", Scope::Turn(next.clone()), now)).is_empty());
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: next.clone(), terminal: TurnTerminal::TaskFailed }, now);
+    assert!(frames(&submit(&mut m, "turn.start", "h:still-too-soon", Scope::Turn(next.clone()), now)).is_empty());
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: current, terminal: TurnTerminal::TaskFailed }, now);
+    assert_eq!(frames(&submit(&mut m, "turn.start", "h:next", Scope::Turn(next), now)).len(), 1);
+    let mut m = turn(Limits::default(), now);
+    let proposal = json!({"state":"validated_success","reason":"proposal only","document":{"documentId":"d","revision":"1"},"changes":"unknown","validationRunId":null,"report":null});
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal.clone()), now);
+    assert!(
+        notices(&a).iter().any(|n| matches!(n,ClientNotice::TurnFinishedProposal {proposal,..} if proposal.state==TurnTerminal::ValidatedSuccess))
+    );
+    release(&mut m, &a, now);
+    let a = peer(&mut m, refusal, now);
+    assert!(!fatal(&a));
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::CloseTurn { .. })));
+    release(&mut m, &a, now);
+    let mut second = proposal;
+    second["state"] = json!("cancelled");
+    let a = peer(&mut m, event(3, "turn.finished", Some("h:turn"), scope(), second), now);
+    assert!(!fatal(&a));
+    assert!(!notices(&a).iter().any(|n| matches!(n, ClientNotice::TurnFinishedProposal { .. })));
+}
+
+// Mutation caught: charging the tiny runtime.ready frame, not the owned RuntimeInfo notice.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_ready_notice_owns_its_byte_reservation() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let limits = Limits { frame_bytes: 8000, queue_bytes: 12096, control_lane_bytes: 4096, ..Limits::default() };
+    let mut m = machine(limits.clone(), now);
+    let a = submit_params(
+        &mut m,
+        "runtime.hello",
+        "h:hello",
+        Scope::Runtime,
+        json!({"supportedVersions":["1.0"],"hostVersion":"1","limits":limits}),
+        now,
+    );
+    release(&mut m, &a, now);
+    let mut hello = fixture("runtime.hello").1;
+    hello["limits"] = json!(limits);
+    hello["runtimeVersion"] = json!("");
+    let fixed_bytes = format!("{}\n", response("h:hello", Scope::Runtime, hello.clone())).len();
+    // Leave only 64 data bytes, genuinely too little for a session completion;
+    // a 4096-byte private reservation is not part of the protocol.
+    hello["runtimeVersion"] = json!("v".repeat(7936 - fixed_bytes));
+    let a = peer(&mut m, response("h:hello", Scope::Runtime, hello), now);
+    assert!(!fatal(&a));
+    release(&mut m, &a, now);
+    let ready = peer(&mut m, event(1, "runtime.ready", Some("h:hello"), Scope::Runtime, json!({"runtimeInstanceId":"i"})), now);
+    assert!(!fatal(&ready));
+    let a = submit(&mut m, "session.start", "h:before-consume", Scope::Session(id("s")), now);
+    assert!(frames(&a).is_empty());
+    assert!(a.iter().any(|a| matches!(a,MachineAction::Rejected {error,..} if error.code==ErrorCode::ResourceExhausted)));
+    release(&mut m, &ready, now);
+    let a = submit(&mut m, "session.start", "h:after-consume", Scope::Session(id("s")), now);
+    assert_eq!(frames(&a).len(), 1);
+}
+
+// Full duplex permits terminal proposals before their start acknowledgement. Use
+// successive trusted host completions to fill all 32 *host* pending calls without
+// inventing concurrent turns or exposing the machine's private admission state.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_state_host_pending_has_an_independent_control_reserve() {
+    use mastra_state_support::*;
+    let now = Instant::now();
+    let mut m = ready(Limits::default(), now);
+    for n in 0..32 {
+        let s = TurnScope { session_id: id("s"), turn_id: id(&format!("t{n}")), workflow_run_id: id(&format!("w{n}")) };
+        let request = format!("h:turn{n}");
+        let a = submit(&mut m, "turn.start", &request, Scope::Turn(s.clone()), now);
+        assert_eq!(frames(&a).len(), 1);
+        release(&mut m, &a, now);
+        let proposal = json!({"state":"task_failed","reason":"no modeling result","document":{"documentId":"d","revision":"1"},"changes":"unknown","validationRunId":null,"report":null});
+        let a = peer(&mut m, event(n + 2, "turn.finished", Some(&request), Scope::Turn(s.clone()), proposal), now);
+        assert!(!fatal(&a));
+        release(&mut m, &a, now);
+        m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: s, terminal: TurnTerminal::TaskFailed }, now);
+    }
+    let a = submit(&mut m, "turn.start", "h:33", scope(), now);
+    assert!(frames(&a).is_empty());
+    assert!(a.iter().any(|a| matches!(a,MachineAction::Rejected {error,..} if error.code==ErrorCode::ResourceExhausted)));
+    let a = submit(&mut m, "runtime.shutdown", "h:control-reserve", Scope::Runtime, now);
+    assert_eq!(frames(&a).len(), 1);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod mastra_retirement_support {
+    pub use super::mastra_state_support::*;
+    use serde_json::{Value, json};
+
+    pub fn submit_at(
+        m: &mut RuntimeMachine,
+        generation: &str,
+        name: &str,
+        scope: Scope,
+        request: HostRequest,
+        deadline: Instant,
+        now: Instant,
+    ) -> Vec<MachineAction> {
+        m.apply(MachineInput::Submit { generation: id(generation), request_id: rid(name), scope, request, deadline }, now)
+    }
+    pub fn host_request(method: &str, params: Value) -> HostRequest {
+        let wire = super::mastra_codec_request(method, params, true);
+        let decoded = decode_frame(format!("{wire}\n").as_bytes(), DecodePhase::Negotiated, Sender::Host, &Limits::default()).unwrap();
+        let DecodeResult::Frame(Frame::Request { body: RequestBody::Host(request), .. }) = decoded else { panic!("host fixture") };
+        request
+    }
+    pub fn callback(m: &mut RuntimeMachine, method: &str, name: &str, scope: Scope, params: Value, now: Instant) -> Vec<MachineAction> {
+        peer(m, json!({"protocolVersion":"1.0","kind":"request","requestId":name,"scope":scope,"method":method,"params":params}), now)
+    }
+    pub fn cancellation(actions: &[MachineAction]) -> Cancellation {
+        actions.iter().find_map(|a| if let MachineAction::Dispatch(c) = a { Some(c.cancellation.clone()) } else { None }).unwrap()
+    }
+    pub fn finish(m: &mut RuntimeMachine, token: CallbackToken, method: &str, now: Instant) -> Vec<MachineAction> {
+        let result = decode_host_reply(method, fixture(method).1, &Limits::default()).unwrap();
+        m.apply(MachineInput::CallbackFinished { token, result: Box::new(Ok(result)) }, now)
+    }
+    pub fn proposal() -> Value {
+        json!({"state":"validated_success","reason":"unverified proposal","document":{"documentId":"d","revision":"1"},"changes":"unknown","validationRunId":null,"report":null})
+    }
+    pub fn closed(actions: &[MachineAction], reason: CloseReason) -> usize {
+        notices(actions).iter().filter(|n| matches!(n, ClientNotice::TurnClosed { cause, .. } if *cause == reason)).count()
+    }
+    pub fn turn_with_owned_callback(wall_seconds: u32, now: Instant) -> (RuntimeMachine, Vec<MachineAction>) {
+        let mut m = ready(Limits::default(), now);
+        let mut params = fixture("turn.start").0;
+        params["budgets"]["wallTimeSeconds"] = json!(wall_seconds);
+        let a = submit_params(&mut m, "turn.start", "h:turn", scope(), params, now);
+        release(&mut m, &a, now);
+        let a = peer(&mut m, response("h:turn", scope(), json!({"state":"accepted"})), now);
+        release(&mut m, &a, now);
+        let mut params = fixture("agent.run").0;
+        params["timeoutSeconds"] = json!(300);
+        let work = callback(&mut m, "agent.run", "r:owned", scope(), params, now);
+        assert!(work.iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+        (m, work)
+    }
+    pub fn permission() -> CallProgress {
+        CallProgress::AgentProgress(AgentProgress {
+            agent_session_id: id("agent"),
+            content: AgentProgressContent::Permission(PermissionProgress {
+                permission_id: id("permission"),
+                title: "Late permission".into(),
+                state: PermissionState::Waiting,
+            }),
+        })
+    }
+    pub fn peer_generation(m: &mut RuntimeMachine, generation: &str, value: Value, now: Instant) -> Vec<MachineAction> {
+        let decoded = decode_frame(format!("{value}\n").as_bytes(), DecodePhase::Negotiated, Sender::Runtime, &Limits::default()).unwrap();
+        m.apply(MachineInput::Peer { generation: id(generation), sender: Sender::Runtime, decoded }, now)
+    }
+    pub fn bootstrap(generation: &str, instance: &str, limits: Limits, now: Instant) -> RuntimeMachine {
+        let mut m = RuntimeMachine::new(id(generation), limits.clone(), now).unwrap();
+        m.apply(
+            MachineInput::Services {
+                generation: id(generation),
+                services: ServiceCapabilities { agent_run: true, ..ServiceCapabilities::default() },
+            },
+            now,
+        );
+        let request = HostRequest::RuntimeHello(RuntimeHelloParams {
+            supported_versions: vec!["1.0".into()],
+            host_version: "1".into(),
+            limits: limits.clone(),
+        });
+        let a = submit_at(&mut m, generation, "h:hello", Scope::Runtime, request, now + Duration::from_secs(10), now);
+        for action in a {
+            if let MachineAction::Send { ticket, .. } = action {
+                m.apply(MachineInput::Written { generation: id(generation), ticket }, now);
+            }
+        }
+        let mut result = fixture("runtime.hello").1;
+        result["runtimeInstanceId"] = json!(instance);
+        result["capabilities"]["hostAgentTasks"] = json!(true);
+        result["limits"] = json!(limits);
+        let a = peer_generation(&mut m, generation, response("h:hello", Scope::Runtime, result), now);
+        for action in a {
+            if let MachineAction::Notice { ticket, .. } = action {
+                m.apply(MachineInput::NoticeConsumed { generation: id(generation), ticket }, now);
+            }
+        }
+        let a = peer_generation(
+            &mut m,
+            generation,
+            event(1, "runtime.ready", Some("h:hello"), Scope::Runtime, json!({"runtimeInstanceId":instance})),
+            now,
+        );
+        for action in a {
+            if let MachineAction::Notice { ticket, .. } = action {
+                m.apply(MachineInput::NoticeConsumed { generation: id(generation), ticket }, now);
+            }
+        }
+        m
+    }
+    pub fn replacement(now: Instant) -> RuntimeMachine {
+        let mut m = bootstrap("g2", "i2", Limits { pending_requests: 1, ..Limits::default() }, now);
+        let request =
+            HostRequest::SessionStart(SessionStartParams { workflow_id: id("w"), instructions: "new".into(), bridge: RequiredNullable(None) });
+        let a = submit_at(&mut m, "g2", "h:session", Scope::Session(id("s2")), request, now + Duration::from_secs(30), now);
+        for action in a {
+            if let MachineAction::Send { ticket, .. } = action {
+                m.apply(MachineInput::Written { generation: id("g2"), ticket }, now);
+            }
+        }
+        let a = peer_generation(&mut m, "g2", response("h:session", Scope::Session(id("s2")), fixture("session.start").1), now);
+        for action in a {
+            if let MachineAction::Notice { ticket, .. } = action {
+                m.apply(MachineInput::NoticeConsumed { generation: id("g2"), ticket }, now);
+            }
+        }
+        m
+    }
+}
+
+// Break caught: reset publishes before trusted retirement, or an old token/identity
+// can revive history, complete a replacement turn, or consume its leases/timers.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_old_generation_cannot_finish_new_turn() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits::default(), now);
+    let connection =
+        HostEvent::ConnectionState(ConnectionStateEvent { connection_id: id("c"), state: ConnectionState::Available, auth_methods: vec![] });
+    let a = m.apply(MachineInput::Emit { generation: id("g"), scope: Scope::Session(id("s")), event: connection.clone(), cause: None }, now);
+    assert_eq!(frames(&a)[0]["sequence"], 1);
+    release(&mut m, &a, now);
+    let work = call(&mut m, "agent.run", "r:old", now);
+    let old_token = token(&work);
+    let cancelled = cancellation(&work);
+    let a = submit_params(
+        &mut m,
+        "session.reset",
+        "h:reset",
+        Scope::Session(id("s")),
+        json!({"nextSessionId":"new","instructions":"fresh history"}),
+        now,
+    );
+    assert!(cancelled.is_cancelled(), "the actual shared Cancellation must be signalled synchronously");
+    assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::Reset, .. })));
+    assert!(matches!(a.get(1), Some(MachineAction::RetireSession(s)) if s.as_str() == "s"), "retire history before output");
+    release(&mut m, &a, now);
+    let next = TurnScope { session_id: id("new"), turn_id: id("t"), workflow_run_id: id("w") };
+    assert!(frames(&submit(&mut m, "turn.start", "h:before-reset-ack", Scope::Turn(next.clone()), now)).is_empty());
+    assert!(frames(&submit(&mut m, "turn.start", "h:old-session", scope(), now)).is_empty());
+    assert!(
+        frames(&submit(&mut m, "session.start", "h:session-before-reset-ack", Scope::Session(id("other")), now)).is_empty(),
+        "a pending reset cannot be bypassed by session.start"
+    );
+    assert!(finish(&mut m, old_token.clone(), "agent.run", now).is_empty(), "physical completion cannot publish after retirement");
+    let a = peer(&mut m, response("h:reset", Scope::Session(id("s")), json!({"state":"ready","sessionId":"new"})), now);
+    assert!(!fatal(&a));
+    assert!(notices(&a).iter().any(|n| matches!(n, ClientNotice::RequestFinished {scope: Scope::Session(s), result: Ok(RuntimeReply::SessionReset(p)), ..} if s.as_str()=="s" && p.session_id.as_str()=="new")));
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::RetireSession(_))), "retirement happens at reset admission, not its reply");
+    release(&mut m, &a, now);
+    let a = m.apply(MachineInput::Emit { generation: id("g"), scope: Scope::Session(id("new")), event: connection, cause: None }, now);
+    assert_eq!(frames(&a)[0]["sequence"], 2, "host sequence is transport lifetime, not reset lifetime");
+    release(&mut m, &a, now);
+    let a = submit(&mut m, "turn.start", "h:new", Scope::Turn(next.clone()), now);
+    assert_eq!(frames(&a).len(), 1);
+    release(&mut m, &a, now);
+    assert!(frames(&submit(&mut m, "turn.start", "h:turn", Scope::Turn(next.clone()), now)).is_empty(), "transport ledger never resets");
+    for sequence in [2, 3] {
+        let a = peer(&mut m, event(sequence, "turn.finished", Some("h:turn"), scope(), proposal()), now);
+        assert!(a.is_empty(), "old terminal is discarded, not accepted for the new visible turn IDs");
+    }
+    assert!(frames(&m.apply(MachineInput::Progress { token: old_token.clone(), event: permission() }, now)).is_empty());
+    assert!(finish(&mut m, old_token, "agent.run", now).is_empty());
+    let a =
+        peer(&mut m, event(4, "workflow.text", Some("h:new"), Scope::Turn(next.clone()), json!({"text":"new session","channel":"progress"})), now);
+    assert!(!fatal(&a));
+    release(&mut m, &a, now);
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(1200));
+    assert_eq!(closed(&a, CloseReason::Deadline), 1, "old activity must not clear the replacement turn timer");
+
+    // A different transport can reuse visible request/turn names, but never its
+    // native generation, runtime instance or session identity. No replay occurs.
+    let mut fresh = replacement(now);
+    let next = TurnScope { session_id: id("s2"), turn_id: id("t"), workflow_run_id: id("w") };
+    let request = host_request("turn.start", fixture("turn.start").0);
+    let a = submit_at(&mut fresh, "g2", "h:turn", Scope::Turn(next.clone()), request, now + Duration::from_secs(300), now);
+    assert_eq!(frames(&a).len(), 1);
+    for a in a {
+        if let MachineAction::Send { ticket, .. } = a {
+            fresh.apply(MachineInput::Written { generation: id("g2"), ticket }, now);
+        }
+    }
+    let mut wire = mastra_codec_request("agent.run", fixture("agent.run").0, false);
+    wire["requestId"] = json!("r:old");
+    wire["scope"] = json!(next);
+    let work2 = peer_generation(&mut fresh, "g2", wire, now);
+    let fresh_token = token(&work2);
+    let old_work = call(&mut turn(Limits::default(), now), "agent.run", "r:old", now);
+    let old = token(&old_work);
+    assert!(finish(&mut fresh, old.clone(), "agent.run", now).is_empty());
+    assert!(fresh.apply(MachineInput::Progress { token: old, event: permission() }, now).is_empty());
+    for input in [
+        MachineInput::Eof { generation: id("g"), stderr_tail: vec![] },
+        MachineInput::InputFailed { generation: id("g") },
+        MachineInput::CompleteTurn { generation: id("g"), scope: next.clone(), terminal: TurnTerminal::ValidatedSuccess },
+    ] {
+        assert!(fresh.apply(input, now + Duration::from_secs(600)).is_empty(), "stale native input cannot even tick replacement timers");
+    }
+    let reply = finish(&mut fresh, fresh_token, "agent.run", now);
+    assert_eq!(frames(&reply).len(), 1, "only the real replacement token can publish");
+    for a in &reply {
+        if let MachineAction::Send { ticket, .. } = a {
+            fresh.apply(MachineInput::Written { generation: id("g"), ticket: *ticket }, now);
+        }
+    }
+    let mut wire = mastra_codec_request("agent.run", fixture("agent.run").0, false);
+    wire["requestId"] = json!("r:new");
+    wire["scope"] = json!(next);
+    assert!(
+        !peer_generation(&mut fresh, "g2", wire, now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))),
+        "old generation cannot clear the new reply ticket"
+    );
+}
+
+// Break caught: publishing a proposal as acceptance, replacing the first closure,
+// or signalling user cancellation on otherwise active host verification.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_success_proposal_is_not_host_acceptance() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    let Scope::Turn(current) = scope() else { panic!() };
+    let next = TurnScope { turn_id: id("next"), ..current.clone() };
+    let mut m = turn(Limits::default(), now);
+    let work = call(&mut m, "agent.run", "r:verify", now);
+    let verification = cancellation(&work);
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal()), now);
+    assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::TerminalProposal, .. })));
+    assert!(!verification.is_cancelled(), "proposal is not user cancellation of host verification");
+    assert_eq!(closed(&a, CloseReason::User), 0);
+    assert_eq!(notices(&a).iter().filter(|n| matches!(n, ClientNotice::TurnFinishedProposal { .. })).count(), 1);
+    release(&mut m, &a, now);
+    assert!(frames(&submit(&mut m, "turn.start", "h:too-early", Scope::Turn(next.clone()), now)).is_empty());
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: next.clone(), terminal: TurnTerminal::ValidatedSuccess }, now);
+    assert!(frames(&submit(&mut m, "turn.start", "h:still-early", Scope::Turn(next.clone()), now)).is_empty());
+    assert!(peer(&mut m, event(3, "turn.finished", Some("h:turn"), scope(), proposal()), now).is_empty());
+    assert!(finish(&mut m, token(&work), "agent.run", now).is_empty());
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: current, terminal: TurnTerminal::TaskFailed }, now);
+    assert_eq!(frames(&submit(&mut m, "turn.start", "h:next", Scope::Turn(next), now)).len(), 1);
+
+    let mut m = turn(Limits::default(), now);
+    let work = call(&mut m, "agent.run", "r:cancelled", now);
+    let cancel = cancellation(&work);
+    let a = submit(&mut m, "turn.cancel", "h:cancel", scope(), now);
+    assert!(cancel.is_cancelled());
+    assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::User, .. })), "closure must precede wire output");
+    assert_eq!(closed(&a, CloseReason::User), 1);
+    assert_eq!(frames(&a).iter().filter(|v| v["requestId"] == "r:cancelled" && v["error"]["code"] == "CANCELLED").count(), 1);
+    release(&mut m, &a, now);
+    for sequence in [2, 3] {
+        assert!(peer(&mut m, event(sequence, "turn.finished", Some("h:turn"), scope(), proposal()), now).is_empty());
+    }
+    assert!(finish(&mut m, token(&work), "agent.run", now).is_empty());
+    assert!(
+        m.apply(MachineInput::Tick, now + Duration::from_secs(1200)).iter().all(|a| !matches!(a, MachineAction::CloseTurn { .. })),
+        "first closure is immutable"
+    );
+}
+
+// Break caught: off-by-one expiry, only checking deadlines on completion, treating
+// TIMEOUT as explicit cancellation, or extending timers on repeated Stop/ack.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_deadlines_and_cancel_ack() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    let epsilon = Duration::from_nanos(1);
+    let mut m = machine(Limits::default(), now);
+    let a = submit(&mut m, "runtime.hello", "h:hello", Scope::Runtime, now);
+    release(&mut m, &a, now);
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(10) - epsilon).is_empty());
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(10));
+    assert!(fatal(&a));
+    assert!(
+        notices(&a).iter().any(|n| matches!(n, ClientNotice::RequestFinished { result: Err(e), .. } if e.code == ErrorCode::Timeout)),
+        "handshake expiry is TIMEOUT before startup failure"
+    );
+
+    for (requested, seconds) in [(7, 7), (300, 30)] {
+        let mut m = bootstrap("g", "i", Limits::default(), now);
+        let request = host_request("session.start", fixture("session.start").0);
+        let a = submit_at(&mut m, "g", "h:session", Scope::Session(id("s")), request, now + Duration::from_secs(requested), now);
+        release(&mut m, &a, now);
+        assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(seconds) - epsilon).is_empty());
+        let a = peer(&mut m, response("h:session", Scope::Session(id("s")), fixture("session.start").1), now + Duration::from_secs(seconds));
+        assert!(fatal(&a), "session start failure ends attempted startup, including exact-deadline replies");
+        assert_eq!(
+            notices(&a).iter().filter(|n| matches!(n, ClientNotice::RequestFinished { result: Err(e), .. } if e.code == ErrorCode::Timeout)).count(),
+            1
+        );
+    }
+
+    let mut m = turn(Limits::default(), now);
+    let work = call(&mut m, "model.generate", "r:timeout", now);
+    let cancel = cancellation(&work);
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(1) - epsilon).is_empty());
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(1));
+    assert_eq!(frames(&a)[0]["error"]["code"], "TIMEOUT");
+    assert!(cancel.is_cancelled());
+    assert!(finish(&mut m, token(&work), "model.generate", now + Duration::from_secs(1)).is_empty());
+
+    for (limits, timeout, start, expected) in [
+        (Limits::default(), 1000, 0, 600),
+        (Limits { call_default_seconds: 2, call_max_seconds: 2, ..Limits::default() }, 1000, 0, 2),
+        (Limits::default(), 300, 1199, 1200),
+    ] {
+        for method in ["model.generate", "agent.run"] {
+            let mut m = turn(limits.clone(), now);
+            let a = peer(&mut m, response("h:turn", scope(), json!({"state":"accepted"})), now);
+            release(&mut m, &a, now);
+            let mut params = fixture(method).0;
+            if method == "model.generate" {
+                params["options"]["timeoutSeconds"] = json!(timeout);
+            } else {
+                params["timeoutSeconds"] = json!(timeout);
+            }
+            let work = callback(&mut m, method, "r:clamped", scope(), params, now + Duration::from_secs(start));
+            assert!(work.iter().any(|a| matches!(a, MachineAction::Dispatch(c) if c.deadline == now + Duration::from_secs(expected))));
+            assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(expected) - epsilon).is_empty());
+            let a = m.apply(MachineInput::Tick, now + Duration::from_secs(expected));
+            if start == 1199 {
+                assert!(
+                    matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::Deadline, .. })),
+                    "wall retirement precedes the clamped call timeout reply"
+                );
+            }
+            assert_eq!(frames(&a).iter().filter(|v| v["requestId"] == "r:clamped" && v["error"]["code"] == "TIMEOUT").count(), 1);
+            assert!(cancellation(&work).is_cancelled());
+        }
+    }
+
+    let mut m = turn(Limits::default(), now);
+    let a = submit(&mut m, "turn.cancel", "h:cancel", scope(), now);
+    release(&mut m, &a, now);
+    let a = submit(&mut m, "turn.cancel", "h:again", scope(), now + Duration::from_secs(4));
+    assert!(matches!(a.as_slice(), [MachineAction::Coalesced { .. }]));
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(5) - epsilon).is_empty());
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(5));
+    assert_eq!(
+        a.iter().filter(|a| matches!(a, MachineAction::StopTree)).count(),
+        1,
+        "unacknowledged Stop invokes the existing tree stop exactly at 5s"
+    );
+    assert!(!fatal(&m.apply(MachineInput::Tick, now + Duration::from_secs(8) - epsilon)));
+    assert!(fatal(&m.apply(MachineInput::Tick, now + Duration::from_secs(8))), "teardown has only a further 3s");
+
+    let mut m = turn(Limits::default(), now);
+    let a = submit(&mut m, "turn.cancel", "h:cancel", scope(), now);
+    release(&mut m, &a, now);
+    let a = peer(&mut m, response("h:cancel", scope(), json!({"state":"cancelling"})), now + Duration::from_secs(5) - epsilon);
+    release(&mut m, &a, now);
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(5)).is_empty(), "ack clears only its acknowledgement timer");
+    assert!(peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(5)).is_empty());
+    assert!(matches!(
+        submit(&mut m, "turn.cancel", "h:after-ack", scope(), now + Duration::from_secs(6)).as_slice(),
+        [MachineAction::Coalesced { .. }]
+    ));
+
+    let mut m = turn(Limits::default(), now);
+    let a = submit(&mut m, "turn.cancel", "h:cancel", scope(), now);
+    release(&mut m, &a, now);
+    let a = peer(&mut m, response("h:cancel", scope(), json!({"state":"terminal"})), now + Duration::from_secs(5));
+    assert!(a.iter().any(|a| matches!(a, MachineAction::StopTree)), "ack at the exact deadline is too late");
+
+    let mut m = turn(Limits::default(), now);
+    let a = peer(&mut m, response("h:turn", scope(), json!({"state":"accepted"})), now);
+    release(&mut m, &a, now);
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(1200) - epsilon).is_empty());
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(1200));
+    assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::Deadline, .. })));
+    assert_eq!(closed(&a, CloseReason::Deadline), 1, "eventual host terminal maps wall closure to budget_exhausted, not user cancelled");
+
+    let mut m = turn(Limits::default(), now);
+    let a = m.apply(MachineInput::Shutdown { generation: id("g") }, now);
+    assert_eq!(a.iter().filter(|a| matches!(a, MachineAction::StopTree)).count(), 1);
+    assert!(
+        m.apply(MachineInput::Shutdown { generation: id("g") }, now + Duration::from_secs(2)).is_empty(),
+        "repeated shutdown neither repeats cleanup nor extends teardown"
+    );
+    assert!(!fatal(&m.apply(MachineInput::Tick, now + Duration::from_secs(3) - epsilon)));
+    assert!(fatal(&m.apply(MachineInput::Tick, now + Duration::from_secs(3))));
+}
+
+// Break caught: EOF/read/write/protocol failure loses or duplicates a pending
+// completion, retires history after notification, or accepts an unterminated frame.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_eof_resolves_every_call_once() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    for mode in 0..4 {
+        let mut m = turn(Limits::default(), now);
+        let work = call(&mut m, "agent.run", "r:running", now);
+        let cancel = cancellation(&work);
+        let input = match mode {
+            0 => MachineInput::Eof { generation: id("g"), stderr_tail: vec!["bounded diagnostic".into()] },
+            1 => MachineInput::InputFailed { generation: id("g") },
+            2 => MachineInput::WriteFailed { generation: id("g") },
+            _ => {
+                let partial = response("h:turn", scope(), json!({"state":"accepted"})).to_string();
+                assert!(decode_frame(partial.as_bytes(), DecodePhase::Negotiated, Sender::Runtime, &Limits::default()).is_err());
+                MachineInput::InputFailed { generation: id("g") }
+            }
+        };
+        let a = m.apply(input, now);
+        assert!(cancel.is_cancelled());
+        assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: CloseReason::TransportLoss, .. })));
+        assert!(matches!(a.get(1), Some(MachineAction::RetireSession(_))), "trusted retirement precedes every completion/cleanup notice");
+        assert_eq!(notices(&a).iter().filter(|n| matches!(n, ClientNotice::RequestFinished {request_id,result:Err(e),..} if request_id.as_str()=="h:turn" && e.code==ErrorCode::TransportError)).count(), 1);
+        assert_eq!(closed(&a, CloseReason::TransportLoss), 1);
+        assert!(fatal(&a));
+        assert!(m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now).is_empty());
+        assert!(m.apply(MachineInput::WriteFailed { generation: id("g") }, now).is_empty());
+        assert!(finish(&mut m, token(&work), "agent.run", now).is_empty());
+        assert!(frames(&submit(&mut m, "session.start", "h:no-replay", Scope::Session(id("fresh")), now)).is_empty());
+    }
+    let mut m = ready(Limits::default(), now);
+    for n in 0..3 {
+        let s = TurnScope { session_id: id("s"), turn_id: id(&format!("t{n}")), workflow_run_id: id(&format!("w{n}")) };
+        let a = submit(&mut m, "turn.start", &format!("h:pending{n}"), Scope::Turn(s.clone()), now);
+        release(&mut m, &a, now);
+        let a = peer(&mut m, event(n + 2, "turn.finished", Some(&format!("h:pending{n}")), Scope::Turn(s.clone()), proposal()), now);
+        release(&mut m, &a, now);
+        m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: s, terminal: TurnTerminal::TaskFailed }, now);
+    }
+    let a = m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now);
+    assert_eq!(
+        notices(&a).iter().filter(|n| matches!(n, ClientNotice::RequestFinished {result: Err(e), ..} if e.code == ErrorCode::TransportError)).count(),
+        3,
+        "all outstanding identities, not just the current turn, resolve once"
+    );
+    assert!(m.apply(MachineInput::InputFailed { generation: id("g") }, now).is_empty());
+    // A closure reply can itself discover a failed/full physical pipe. Neither
+    // shutdown entry point may overwrite that failure with Stopping or emit its
+    // previously reserved shutdown request after transport termination.
+    for local in [false, true] {
+        let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+        let work = call(&mut m, "agent.run", "r:owned", now);
+        let event =
+            HostEvent::ConnectionState(ConnectionStateEvent { connection_id: id("c"), state: ConnectionState::Available, auth_methods: vec![] });
+        let a = m.apply(MachineInput::Emit { generation: id("g"), scope: scope(), event, cause: None }, now);
+        assert_eq!(frames(&a).len(), 1); // Deliberately not Written.
+        let a = if local {
+            m.apply(MachineInput::Shutdown { generation: id("g") }, now)
+        } else {
+            submit(&mut m, "runtime.shutdown", "h:shutdown", Scope::Runtime, now)
+        };
+        assert!(fatal(&a));
+        assert!(cancellation(&work).is_cancelled());
+        assert!(!frames(&a).iter().any(|v| v["requestId"] == "h:shutdown"), "no reserved request can be published after failure");
+        assert!(m.apply(MachineInput::InputFailed { generation: id("g") }, now).is_empty(), "shutdown cannot reopen a failed transport");
+    }
+    let mut m = ready(Limits::default(), now);
+    let a = submit(&mut m, "runtime.shutdown", "h:shutdown", Scope::Runtime, now);
+    release(&mut m, &a, now);
+    let a = peer(&mut m, response("h:shutdown", Scope::Runtime, json!({"state":"stopping"})), now);
+    release(&mut m, &a, now);
+    let a = m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now);
+    assert!(!fatal(&a));
+    assert!(notices(&a).iter().any(|n| matches!(n, ClientNotice::TransportClosed { cause: TransportCause::ExpectedEof, .. })));
+}
+
+// Break caught: one sender cancels the opposite sender's request, or timeout/
+// logical cancellation frees the actual running callback before finish + Written.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_request_cancel_is_sender_scoped() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+    let work = call(&mut m, "model.generate", "r:work", now);
+    let cancel = cancellation(&work);
+    let a = submit_at(
+        &mut m,
+        "g",
+        "h:wrong-sender",
+        scope(),
+        HostRequest::RequestCancel(RequestCancelParams { target_request_id: rid("r:work") }),
+        now + Duration::from_secs(300),
+        now,
+    );
+    assert!(matches!(a.as_slice(), [MachineAction::Rejected { error, .. }] if error.code == ErrorCode::InvalidRequest));
+    assert!(!cancel.is_cancelled());
+    let a = callback(&mut m, "request.cancel", "r:wrong-sender", scope(), json!({"targetRequestId":"h:turn"}), now);
+    assert_eq!(frames(&a)[0]["error"]["code"], "INVALID_REQUEST");
+    assert!(!fatal(&a));
+    release(&mut m, &a, now);
+    let a = callback(&mut m, "request.cancel", "r:cancel", scope(), json!({"targetRequestId":"r:work"}), now);
+    assert!(cancel.is_cancelled(), "real Cancellation clone observes irrevocable logical cancellation");
+    assert_eq!(frames(&a).iter().filter(|v| v["requestId"] == "r:work" && v["error"]["code"] == "CANCELLED").count(), 1);
+    release(&mut m, &a, now);
+    let a = call(&mut m, "model.generate", "r:still-full", now);
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))), "logical cancel cannot release a running service's slot");
+    release(&mut m, &a, now);
+    assert!(finish(&mut m, token(&work), "model.generate", now).is_empty());
+    assert!(cancel.is_cancelled());
+    assert!(call(&mut m, "model.generate", "r:after-physical-exit", now).iter().any(|a| matches!(a, MachineAction::Dispatch(_))));
+
+    for written_first in [false, true] {
+        let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+        let work = call(&mut m, "model.generate", "r:timed-out", now);
+        let timeout = m.apply(MachineInput::Tick, now + Duration::from_secs(1));
+        assert_eq!(frames(&timeout)[0]["error"]["code"], "TIMEOUT");
+        if written_first {
+            release(&mut m, &timeout, now + Duration::from_secs(1));
+        } else {
+            assert!(finish(&mut m, token(&work), "model.generate", now + Duration::from_secs(1)).is_empty());
+        }
+        let a = call(&mut m, "model.generate", "r:still-owned", now + Duration::from_secs(1));
+        assert!(!a.iter().any(|a| matches!(a, MachineAction::Dispatch(_))), "timeout also retains both physical ownership halves");
+        if !written_first {
+            assert!(fatal(&a), "a second reply cannot bypass the one physically occupied data frame slot");
+        }
+        // A full physical lane fails closed, so prove the successful both-halves
+        // path in an independent machine, without first poisoning its transport.
+        let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+        let work = call(&mut m, "model.generate", "r:timed-out", now);
+        let timeout = m.apply(MachineInput::Tick, now + Duration::from_secs(1));
+        if written_first {
+            release(&mut m, &timeout, now + Duration::from_secs(1));
+        } else {
+            assert!(finish(&mut m, token(&work), "model.generate", now + Duration::from_secs(1)).is_empty());
+        }
+        if written_first {
+            assert!(finish(&mut m, token(&work), "model.generate", now + Duration::from_secs(1)).is_empty());
+        } else {
+            release(&mut m, &timeout, now + Duration::from_secs(1));
+        }
+        let released = call(&mut m, "model.generate", "r:released", now + Duration::from_secs(1));
+        assert!(released.iter().any(|a| matches!(a, MachineAction::Dispatch(_))), "written_first={written_first}: {released:?}");
+    }
+}
+
+// I1: closing work admission for an unaccepted proposal must not suppress a
+// subsequent real Stop, replace the first interruption, or extend its timers.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_proposal_then_stop_cancels_once() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    let (mut m, work) = turn_with_owned_callback(5, now);
+    let cancel = cancellation(&work);
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(1));
+    assert!(matches!(a.as_slice(), [MachineAction::CloseTurn { reason: CloseReason::TerminalProposal, .. }, MachineAction::Notice { .. }]));
+    assert!(!cancel.is_cancelled());
+    release(&mut m, &a, now + Duration::from_secs(1));
+    let stopped = submit(&mut m, "turn.cancel", "h:stop", scope(), now + Duration::from_secs(2));
+    assert!(cancel.is_cancelled(), "proposal is not accepted host terminal: later Stop must signal the actual Dispatch Cancellation");
+    assert!(
+        matches!(
+            stopped.as_slice(),
+            [MachineAction::CloseTurn { reason: CloseReason::User, .. }, MachineAction::Notice { .. }, MachineAction::Send { .. }]
+        ),
+        "trusted user closure must precede the one notice and wire cancel: {stopped:?}"
+    );
+    assert_eq!(closed(&stopped, CloseReason::User), 1);
+    release(&mut m, &stopped, now + Duration::from_secs(2));
+    let repeated = submit(&mut m, "turn.cancel", "h:repeat", scope(), now + Duration::from_secs(3));
+    assert!(matches!(repeated.as_slice(), [MachineAction::Coalesced { existing_request_id, .. }] if existing_request_id.as_str()=="h:stop"));
+    assert!(peer(&mut m, event(3, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(3)).is_empty());
+    assert!(finish(&mut m, token(&work), "agent.run", now + Duration::from_secs(3)).is_empty());
+    let Scope::Turn(current) = scope() else { panic!() };
+    let next = TurnScope { turn_id: id("next"), ..current.clone() };
+    m.apply(
+        MachineInput::CompleteTurn { generation: id("g"), scope: next.clone(), terminal: TurnTerminal::ValidatedSuccess },
+        now + Duration::from_secs(3),
+    );
+    assert!(frames(&submit(&mut m, "turn.start", "h:too-soon", Scope::Turn(next.clone()), now + Duration::from_secs(3))).is_empty());
+    m.apply(MachineInput::CompleteTurn { generation: id("g"), scope: current, terminal: TurnTerminal::Cancelled }, now + Duration::from_secs(3));
+    let a = submit(&mut m, "turn.start", "h:next", Scope::Turn(next), now + Duration::from_secs(3));
+    assert_eq!(frames(&a).len(), 1, "only matching local host completion unlocks");
+    release(&mut m, &a, now + Duration::from_secs(3));
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(5)).is_empty(), "the retired turn's original deadline cannot close the new turn");
+    assert!(cancel.is_cancelled());
+
+    let (mut m, work) = turn_with_owned_callback(10, now);
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(1));
+    release(&mut m, &a, now + Duration::from_secs(1));
+    let a = submit(&mut m, "turn.cancel", "h:stop", scope(), now + Duration::from_secs(2));
+    release(&mut m, &a, now + Duration::from_secs(2));
+    assert!(cancellation(&work).is_cancelled());
+    assert!(matches!(submit(&mut m, "turn.cancel", "h:repeat", scope(), now + Duration::from_secs(6)).as_slice(), [MachineAction::Coalesced { .. }]));
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(7) - Duration::from_nanos(1)).is_empty());
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(7));
+    assert_eq!(a.iter().filter(|a| matches!(a, MachineAction::StopTree)).count(), 1, "the original 2+5s acknowledgement deadline is unchanged");
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::CloseTurn { .. })), "shutdown fallback cannot replace first actual User interruption");
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(10));
+    assert!(fatal(&a));
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::CloseTurn { .. })), "wall and transport loss cannot overwrite User");
+}
+
+// I1: Finishing while awaiting host acceptance is still inside the original wall
+// budget. Reset/shutdown/transport loss also remain real interruptions after a proposal.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_proposal_keeps_original_deadline_and_interruptions() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    let (mut m, work) = turn_with_owned_callback(5, now);
+    let cancel = cancellation(&work);
+    let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(4));
+    release(&mut m, &a, now + Duration::from_secs(4));
+    assert!(!cancel.is_cancelled());
+    assert!(m.apply(MachineInput::Tick, now + Duration::from_secs(5) - Duration::from_nanos(1)).is_empty());
+    assert!(!cancel.is_cancelled());
+    let a = m.apply(MachineInput::Tick, now + Duration::from_secs(5));
+    assert!(
+        matches!(a.as_slice(), [MachineAction::CloseTurn { reason: CloseReason::Deadline, .. }, MachineAction::Notice { .. }]),
+        "proposal does not suspend/restart the original wall budget: {a:?}"
+    );
+    assert!(cancel.is_cancelled());
+    assert_eq!(closed(&a, CloseReason::Deadline), 1);
+    release(&mut m, &a, now + Duration::from_secs(5));
+    assert!(peer(&mut m, event(3, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(5)).is_empty());
+    let a = submit(&mut m, "turn.cancel", "h:late-stop", scope(), now + Duration::from_secs(5));
+    assert!(matches!(a.as_slice(), [MachineAction::Send { .. }]), "a later user Stop cannot replace the actual Deadline closure");
+    let a = m.apply(MachineInput::Shutdown { generation: id("g") }, now + Duration::from_secs(5));
+    assert!(!a.iter().any(|a| matches!(a, MachineAction::CloseTurn { .. })));
+
+    for reason in [CloseReason::Reset, CloseReason::Shutdown, CloseReason::TransportLoss] {
+        let (mut m, work) = turn_with_owned_callback(10, now);
+        let cancel = cancellation(&work);
+        let a = peer(&mut m, event(2, "turn.finished", Some("h:turn"), scope(), proposal()), now + Duration::from_secs(1));
+        release(&mut m, &a, now + Duration::from_secs(1));
+        assert!(!cancel.is_cancelled());
+        let at = now + Duration::from_secs(2);
+        let a = match reason {
+            CloseReason::Reset => {
+                submit_params(&mut m, "session.reset", "h:reset", Scope::Session(id("s")), json!({"nextSessionId":"new","instructions":"reset"}), at)
+            }
+            CloseReason::Shutdown => submit(&mut m, "runtime.shutdown", "h:shutdown", Scope::Runtime, at),
+            _ => m.apply(MachineInput::InputFailed { generation: id("g") }, at),
+        };
+        assert!(cancel.is_cancelled());
+        assert!(matches!(a.first(), Some(MachineAction::CloseTurn { reason: actual, .. }) if *actual==reason));
+        assert!(matches!(a.get(1), Some(MachineAction::RetireSession(s)) if s.as_str()=="s"));
+        assert_eq!(closed(&a, reason), 1);
+        let repeated = m.apply(MachineInput::InputFailed { generation: id("g") }, at);
+        assert!(!repeated.iter().any(|a| matches!(a, MachineAction::CloseTurn { .. })));
+        assert!(finish(&mut m, token(&work), "agent.run", at).is_empty());
+    }
+}
+
+// I2: target cancellation may discover a full physical data lane. That fatal
+// transition must end control processing before an ack/ticket can be produced.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_retirement_failed_cancel_reply_cannot_ack_after_transport_closed() {
+    use mastra_retirement_support::*;
+    let now = Instant::now();
+    for written_first in [false, true] {
+        let mut m = turn(Limits { pending_requests: 1, ..Limits::default() }, now);
+        let work = call(&mut m, "agent.run", "r:owned", now);
+        let cancel = cancellation(&work);
+        let event =
+            HostEvent::ConnectionState(ConnectionStateEvent { connection_id: id("c"), state: ConnectionState::Available, auth_methods: vec![] });
+        let occupied = m.apply(MachineInput::Emit { generation: id("g"), scope: scope(), event, cause: None }, now);
+        assert!(matches!(occupied.as_slice(), [MachineAction::Send { ticket: 7, .. }])); // Not Written.
+        let failed = callback(&mut m, "request.cancel", "r:control", scope(), json!({"targetRequestId":"r:owned"}), now);
+        assert!(cancel.is_cancelled(), "the actual running action is signalled before the fatal actions are returned");
+        assert!(
+            matches!(
+                failed.as_slice(),
+                [
+                    MachineAction::CloseTurn { reason: CloseReason::TransportLoss, .. },
+                    MachineAction::RetireSession(_),
+                    MachineAction::Notice { ticket: 8, .. },
+                    MachineAction::Notice { ticket: 9, .. },
+                    MachineAction::Notice { ticket: 10, .. },
+                    MachineAction::StopTree,
+                ]
+            ),
+            "retire first, complete once, stop last: no late Send/new reply ticket: {failed:?}"
+        );
+        assert!(matches!(notices(&failed).as_slice(), [
+            ClientNotice::TurnClosed { cause: CloseReason::TransportLoss, .. },
+            ClientNotice::RequestFinished { request_id, result: Err(e), .. },
+            ClientNotice::TransportClosed { cause: TransportCause::Error(_), .. },
+        ] if request_id.as_str()=="h:turn" && e.code==ErrorCode::TransportError));
+        assert!(frames(&failed).is_empty(), "neither the failed target response nor a successful control ack can be enqueued");
+        assert!(m.apply(MachineInput::InputFailed { generation: id("g") }, now).is_empty());
+        assert!(m.apply(MachineInput::WriteFailed { generation: id("g") }, now).is_empty());
+        // Logical retirement did not physically finish either owner. The old
+        // frame's accurate Written and real CallbackFinished may arrive in
+        // either order, without publishing or reopening anything.
+        if written_first {
+            assert!(m.apply(MachineInput::Written { generation: id("g"), ticket: 7 }, now).is_empty());
+            assert!(finish(&mut m, token(&work), "agent.run", now).is_empty());
+        } else {
+            assert!(finish(&mut m, token(&work), "agent.run", now).is_empty());
+            assert!(m.apply(MachineInput::Written { generation: id("g"), ticket: 7 }, now).is_empty());
+        }
+        assert!(finish(&mut m, token(&work), "agent.run", now).is_empty());
+        assert!(m.apply(MachineInput::Written { generation: id("g"), ticket: 7 }, now).is_empty());
+        assert!(m.apply(MachineInput::Eof { generation: id("g"), stderr_tail: vec![] }, now).is_empty());
+        let progress = m.apply(MachineInput::Progress { token: token(&work), event: permission() }, now);
+        assert!(matches!(progress.as_slice(), [MachineAction::Rejected { error, .. }] if error.code==ErrorCode::InvalidRequest));
+        assert!(frames(&submit(&mut m, "session.start", "h:no-restart", Scope::Session(id("new")), now)).is_empty());
+        assert!(cancel.is_cancelled());
+    }
+}
+
+type MastraMethodCase = (String, Value, Value, bool);
+
+// Task7 contract consumers must fail on a missing artifact; ordinary tests never record it.
+#[cfg(not(target_arch = "wasm32"))]
+fn mastra_bundle_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/mastra-runtime/v1")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_schema_matches_rust() {
+    mastra_bundle::schema_agreement().unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_fixture_agreement() {
+    mastra_bundle::fixture_agreement(&mastra_bundle_path()).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_transcript_agreement() {
+    mastra_bundle::transcript_agreement(&mastra_bundle_path()).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_manifest_is_exact() {
+    mastra_bundle::manifest_agreement(&mastra_bundle_path()).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_coverage_is_complete() {
+    mastra_bundle::coverage_agreement(&mastra_bundle_path()).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mastra_schema_accepts(schema_ref: &str, value: &Value) -> Result<bool, String> {
+    mastra_bundle::Evaluator::new(&mastra_bundle_path())?.accepts(schema_ref, value)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mastra_canonical_bytes(value: &Value) -> Result<Vec<u8>, String> {
+    serde_json_canonicalizer::to_vec(value).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "explicit contract recording only; requires SOLIDCRAFT_MASTRA_RECORD=1"]
+fn mastra_bundle_record() {
+    assert_eq!(std::env::var("SOLIDCRAFT_MASTRA_RECORD").as_deref(), Ok("1"));
+    mastra_bundle::record().unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_generated_contract_is_sound() {
+    mastra_bundle::contract_review().unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_jcs_uses_rfc8785() {
+    let numbers: Value = serde_json::from_str("[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001,-0.0]").unwrap();
+    assert_eq!(mastra_canonical_bytes(&numbers).unwrap(), b"[333333333.3333333,1e+30,4.5,0.002,1e-27,0]");
+    let keys: Value =
+        serde_json::from_str(r#"{"\u20ac":"Euro","\r":"CR","\ufb33":"Hebrew","1":"One","\ud83d\ude00":"Emoji","\u0080":"Control","\u00f6":"Latin"}"#)
+            .unwrap();
+    assert_eq!(
+        String::from_utf8(mastra_canonical_bytes(&keys).unwrap()).unwrap(),
+        "{\"\\r\":\"CR\",\"1\":\"One\",\"\u{80}\":\"Control\",\"ö\":\"Latin\",\"€\":\"Euro\",\"😀\":\"Emoji\",\"דּ\":\"Hebrew\"}"
+    );
+    let identities = json!({"revision":"18446744073709551615","digest":format!("sha256:{}","a".repeat(64))});
+    let canonical = mastra_canonical_bytes(&identities).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&canonical).unwrap(), identities);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn mastra_bundle_mutations_fail_closed() {
+    mastra_bundle::mutations().unwrap();
+}
+
+// Test-only implementations describe the ACTUAL wire types, not a second DTO set.
+#[cfg(not(target_arch = "wasm32"))]
+mod mastra_bundle {
+    use super::super::mastra_protocol::*;
+    use super::super::runtime_client::*;
+    use super::{mastra_bundle_path, mastra_canonical_bytes, mastra_codec_catalog, mastra_codec_request, mastra_codec_scope};
+    use schemars::{JsonSchema, Schema, SchemaGenerator};
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
+    use std::borrow::Cow;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    type Check<T = ()> = Result<T, String>;
+    fn require(ok: bool, why: impl Into<String>) -> Check {
+        if ok { Ok(()) } else { Err(why.into()) }
+    }
+    fn bytes(value: &Value) -> Vec<u8> {
+        let mut b = serde_json::to_vec_pretty(value).unwrap();
+        b.push(b'\n');
+        b
+    }
+    fn line(value: &Value) -> Vec<u8> {
+        let mut b = serde_json::to_vec(value).unwrap();
+        b.push(b'\n');
+        b
+    }
+    fn read(root: &Path, path: &str) -> Check<Vec<u8>> {
+        safe_path(path)?;
+        std::fs::read(root.join(path)).map_err(|e| format!("{path}: {e}"))
+    }
+    fn value(root: &Path, path: &str) -> Check<Value> {
+        serde_json::from_slice(&read(root, path)?).map_err(|e| format!("{path}: {e}"))
+    }
+    fn digest(b: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(b))
+    }
+    fn reference(name: &str) -> Value {
+        json!({"$ref":format!("#/$defs/{name}")})
+    }
+    fn object(properties: Value, required: &[&str]) -> Value {
+        json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+    }
+    fn string_pattern(pattern: &str) -> Schema {
+        json!({"type":"string","pattern":format!("^(?:{pattern})$(?![\\s\\S])")}).try_into().unwrap()
+    }
+    // Canonical decimal <= max, expressed lexically; no JSON floating point bound.
+    fn decimal_pattern(max: u64) -> String {
+        let m = max.to_string();
+        let mut alternatives = vec!["0".to_owned(), format!("[1-9][0-9]{{0,{}}}", m.len() - 2), m.clone()];
+        for (i, digit) in m.bytes().enumerate() {
+            let low = if i == 0 { b'1' } else { b'0' };
+            if digit > low {
+                alternatives.push(format!("{}[{}-{}][0-9]{{{}}}", &m[..i], low as char, (digit - 1) as char, m.len() - i - 1));
+            }
+        }
+        alternatives.join("|")
+    }
+    macro_rules! primitive {
+        ($ty:ty, $body:expr) => {
+            impl JsonSchema for $ty {
+                fn schema_name() -> Cow<'static, str> {
+                    stringify!($ty).into()
+                }
+                fn json_schema(_: &mut SchemaGenerator) -> Schema {
+                    $body
+                }
+            }
+        };
+    }
+    primitive!(Id, string_pattern("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"));
+    primitive!(Digest, string_pattern("sha256:[0-9a-f]{64}"));
+    primitive!(Revision, string_pattern(&decimal_pattern(u64::MAX)));
+    primitive!(RequestId, string_pattern("[hr]:[A-Za-z0-9._:-]{0,126}"));
+    primitive!(Timestamp, {
+        let mut s = string_pattern("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z");
+        s.insert("format".into(), json!("date-time"));
+        s
+    });
+    primitive!(SubmissionKey, string_pattern("[0-9]+:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"));
+    impl<T: JsonSchema> JsonSchema for RequiredNullable<T> {
+        fn schema_name() -> Cow<'static, str> {
+            format!("RequiredNullable_{}", T::schema_name()).into()
+        }
+        fn json_schema(g: &mut SchemaGenerator) -> Schema {
+            g.subschema_for::<Option<T>>()
+        }
+        // Deliberately NOT schemars' optional-field marker: the field is required.
+    }
+    impl JsonSchema for Scope {
+        fn schema_name() -> Cow<'static, str> {
+            "Scope".into()
+        }
+        fn json_schema(g: &mut SchemaGenerator) -> Schema {
+            let id = serde_json::to_value(g.subschema_for::<Id>()).unwrap();
+            let scopes = [(json!(null), json!(null), json!(null)), (id.clone(), json!(null), json!(null)), (id.clone(), id.clone(), id)];
+            json!({"anyOf":scopes.into_iter().map(|(s,t,w)| object(json!({"sessionId":if s.is_null(){json!({"type":"null"})}else{s},"turnId":if t.is_null(){json!({"type":"null"})}else{t},"workflowRunId":if w.is_null(){json!({"type":"null"})}else{w}}), &["sessionId","turnId","workflowRunId"])).collect::<Vec<_>>()}).try_into().unwrap()
+        }
+    }
+    impl JsonSchema for WireError {
+        fn schema_name() -> Cow<'static, str> {
+            "WireError".into()
+        }
+        fn json_schema(g: &mut SchemaGenerator) -> Schema {
+            let mut s = object(
+                json!({"code":g.subschema_for::<ErrorCode>(),"message":{"type":"string","maxLength":2048},"retry":g.subschema_for::<Retry>(),"details":{"type":"object"}}),
+                &["code", "message", "retry", "details"],
+            );
+            let mut conditions = Vec::new();
+            macro_rules! branch { ($ty:ty, $($code:literal),+ ) => {
+                conditions.push(json!({"if":{"properties":{"code":{"enum":[$($code),+]}}},"then":{"properties":{"details":{"anyOf":[g.subschema_for::<EmptyDetails>(),g.subschema_for::<$ty>()]}}}}));
+            }; }
+            branch!(SupportedDetails, "INCOMPATIBLE_VERSION");
+            branch!(FieldMethodDetails, "INVALID_REQUEST", "METHOD_NOT_FOUND");
+            branch!(CapabilityDetails, "UNSUPPORTED_CAPABILITY");
+            branch!(ConnectionDetails, "AUTH_REQUIRED", "CONNECTION_CHANGED", "TASK_FAILED", "INVALID_PROPOSAL");
+            branch!(PermissionDetails, "PERMISSION_DENIED");
+            branch!(ModelErrorDetails, "MODEL_ERROR", "MALFORMED_RESPONSE");
+            branch!(StaleDetails, "STALE_DOCUMENT");
+            branch!(CandidateDetails, "DEPENDENCY_CHANGED", "INVALID_CANDIDATE");
+            branch!(ProfileDetails, "PROFILE_UNSUPPORTED", "REPORT_MISMATCH");
+            branch!(ReferenceDetails, "NOT_READY", "NOT_FOUND");
+            branch!(SubmissionDetails, "IDEMPOTENCY_CONFLICT", "REQUEST_EXPIRED");
+            branch!(ResourceDetails, "RESOURCE_EXHAUSTED");
+            branch!(OperationDetails, "TIMEOUT", "CANCELLED", "TRANSPORT_ERROR", "OUTCOME_UNKNOWN", "INTERNAL_ERROR");
+            s["allOf"] = json!(conditions);
+            s.try_into().unwrap()
+        }
+    }
+    impl JsonSchema for AgentProgress {
+        fn schema_name() -> Cow<'static, str> {
+            "AgentProgress".into()
+        }
+        fn json_schema(g: &mut SchemaGenerator) -> Schema {
+            let mut variants = Vec::new();
+            macro_rules! progress { ($ty:ty,$kind:literal) => {
+                variants.push(object(json!({"agentSessionId":g.subschema_for::<Id>(),"kind":{"const":$kind},"content":g.subschema_for::<$ty>()}), &["agentSessionId","kind","content"]));
+            }; }
+            progress!(ProgressText, "text");
+            progress!(ToolProgress, "tool");
+            progress!(WorkflowPlan, "plan");
+            progress!(PermissionProgress, "permission");
+            json!({"oneOf":variants}).try_into().unwrap()
+        }
+    }
+    fn nullable_without_null(s: &mut Value) {
+        if let Some(list) = s.get_mut("type").and_then(Value::as_array_mut) {
+            list.retain(|v| v != "null");
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(list) = s.get_mut(key).and_then(Value::as_array_mut) {
+                list.retain(|v| v.get("type") != Some(&json!("null")));
+            }
+        }
+    }
+    // Refinements supplement serde derivation, never change the wire acceptance implementation.
+    fn refinements(defs: &mut Value) {
+        fn integer_caps(s: &mut Value) {
+            if s.get("type") == Some(&json!("integer")) || s.get("type").and_then(Value::as_array).is_some_and(|a| a.contains(&json!("integer"))) {
+                let cap = s.get("maximum").and_then(Value::as_u64).unwrap_or(u64::MAX).min(2_147_483_647);
+                s["maximum"] = json!(cap);
+            }
+            match s {
+                Value::Object(m) => {
+                    for child in m.values_mut() {
+                        integer_caps(child);
+                    }
+                }
+                Value::Array(a) => {
+                    for child in a {
+                        integer_caps(child);
+                    }
+                }
+                _ => (),
+            }
+        }
+        integer_caps(defs);
+        for name in ["FieldMethodDetails", "CandidateDetails", "ProfileDetails", "ReferenceDetails", "OperationDetails", "ModelErrorDetails"] {
+            for prop in defs[name]["properties"].as_object_mut().unwrap().values_mut() {
+                nullable_without_null(prop);
+            }
+        }
+        defs["Limits"]["properties"]["storeBytes"] = serde_json::to_value(string_pattern(&decimal_pattern(8_589_934_592))).unwrap();
+        defs["Limits"]["properties"]["storeBytes"]["not"] = json!({"const":"0"});
+        for (key, cap) in
+            [("modelCalls", 20), ("agentTasks", 4), ("cadCommands", 64), ("repairs", 2), ("validationRuns", 3), ("wallTimeSeconds", 1200)]
+        {
+            defs["Budgets"]["properties"][key]["maximum"] = json!(cap);
+        }
+        defs["RuntimeHelloResult"]["properties"]["selectedVersion"] = json!({"const":"1.0"});
+        for name in ["ModelOptions", "AgentRunParams"] {
+            defs[name]["properties"]["timeoutSeconds"]["minimum"] = json!(1);
+        }
+        for (field, constraint) in [
+            ("maxOutputTokens", json!({"type":"integer","minimum":1,"maximum":131072})),
+            ("temperature", json!({"type":"number","minimum":0,"maximum":2})),
+            ("reasoningEffort", json!({"type":"string","maxLength":64})),
+        ] {
+            defs["ModelOptions"]["properties"][field] = json!({"anyOf":[constraint,{"type":"null"}]});
+        }
+        for (name, field, cap) in [
+            ("ModelGenerateParams", "messages", 128),
+            ("ModelGenerateParams", "tools", 64),
+            ("ModelMessage", "toolCalls", 32),
+            ("ModelGenerateResult", "toolCalls", 32),
+            ("WorkflowPlan", "steps", 64),
+            ("SnapshotManifest", "inputs", 256),
+            ("CheckProfile", "checks", 128),
+            ("ValidationReport", "checks", 128),
+            ("CheckResult", "evidence", 64),
+            ("ParameterRequirements", "requirements", 64),
+            ("GeometryMeasurements", "measurements", 64),
+        ] {
+            defs[name]["properties"][field]["maxItems"] = json!(cap);
+        }
+        for (name, field) in [("CheckProfile", "checks"), ("ParameterRequirements", "requirements"), ("GeometryMeasurements", "measurements")] {
+            defs[name]["properties"][field]["minItems"] = json!(1);
+        }
+        // JSON Schema counts characters, not UTF-8 bytes. Byte caps remain a separate decoder layer.
+        defs["ProgressText"]["properties"]["text"]["maxLength"] = json!(262144);
+        for name in ["WorkflowText", "ModelDelta"] {
+            defs[name]["properties"]["text"]["maxLength"] = json!(262144);
+        }
+        for variant in defs["ContentBlock"]["oneOf"].as_array_mut().unwrap() {
+            if variant["properties"]["type"]["const"] == "text" {
+                variant["properties"]["text"]["maxLength"] = json!(262144);
+            } else {
+                let media =
+                    if variant["properties"]["type"]["const"] == "image" { json!(["image/png", "image/jpeg"]) } else { json!(["application/pdf"]) };
+                variant["properties"]["artifact"] =
+                    json!({"allOf":[reference("ArtifactRef"),{"properties":{"mediaType":{"enum":media},"sizeBytes":{"maximum":4194304}}}]});
+            }
+        }
+        // Individual message roles have shape conditions; cross-message identity is semantic.
+        defs["ModelMessage"]["allOf"] = json!([
+            {"if":{"properties":{"role":{"const":"tool"}}},"then":{"properties":{"toolCallId":reference("Id"),"toolCalls":{"maxItems":0}}},"else":{"properties":{"toolCallId":{"type":"null"}}}},
+            {"if":{"properties":{"role":{"not":{"const":"assistant"}}}},"then":{"properties":{"toolCalls":{"maxItems":0}}}}
+        ]);
+        for name in ["ModelGenerateResult", "AgentRunResult"] {
+            defs[name]["properties"]["content"]["items"] = json!({"allOf":[reference("ContentBlock"),{"properties":{"type":{"const":"text"}}}]});
+        }
+    }
+
+    pub fn schema() -> Value {
+        let mut g = schemars::generate::SchemaSettings::draft2020_12().into_generator();
+        macro_rules! types { ($($t:ty),+ $(,)?) => { $(let _ = g.subschema_for::<$t>();)+ }; }
+        types!(
+            Scope,
+            DocumentStamp,
+            Limits,
+            Budgets,
+            WireError,
+            RuntimeHelloParams,
+            RuntimeHelloResult,
+            SessionStartParams,
+            SessionStartResult,
+            TurnStartParams,
+            TurnStartResult,
+            TurnCancelParams,
+            TurnCancelResult,
+            RequestCancelParams,
+            RequestCancelResult,
+            SessionResetParams,
+            SessionResetResult,
+            RuntimeShutdownParams,
+            RuntimeShutdownResult,
+            ConnectionDescribeParams,
+            ConnectionDescribeResult,
+            ModelGenerateParams,
+            ModelGenerateResult,
+            AgentRunParams,
+            AgentRunResult,
+            ValidationSubmitParams,
+            ValidationSubmitResult,
+            ValidationStatusParams,
+            ValidationStatusResult,
+            ValidationReportParams,
+            ValidationReportResult,
+            ValidationCancelParams,
+            ValidationCancelResult,
+            RuntimeReady,
+            ConnectionStateEvent,
+            WorkflowStage,
+            WorkflowText,
+            WorkflowPlan,
+            WorkflowTool,
+            AgentProgress,
+            ModelDelta,
+            TurnFinished,
+            SnapshotManifest,
+            CheckProfile,
+            WriteOutcome,
+            ParameterRequirements,
+            GeometryMeasurements
+        );
+        let mut defs = Value::Object(g.definitions().clone());
+        refinements(&mut defs);
+        let mut requests = Vec::new();
+        let mut results = Vec::new();
+        let mut event_variants = Vec::new();
+        for (method, params, result) in method_types() {
+            let mut p = json!({"protocolVersion":{"const":"1.0"},"kind":{"const":"request"},"scope":scope_schema(method),"requestId":reference("RequestId"),"extensions":{"type":"object"},"method":{"const":method},"params":reference(params)});
+            requests.push(object(p.take(), &["protocolVersion", "kind", "scope", "requestId", "method", "params"]));
+            results.push(reference(result));
+        }
+        for (event, data) in event_types() {
+            event_variants.push(object(json!({"protocolVersion":{"const":"1.0"},"kind":{"const":"event"},"scope":scope_schema(event),"extensions":{"type":"object"},"requestId":{"anyOf":[reference("Id"),{"type":"null"}]},"sequence":{"type":"integer","minimum":1,"maximum":2147483647},"event":{"const":event},"data":reference(data)}), &["protocolVersion","kind","scope","sequence","event","requestId","data"]));
+        }
+        let ok = object(
+            json!({"protocolVersion":{"const":"1.0"},"kind":{"const":"response"},"scope":reference("Scope"),"extensions":{"type":"object"},"requestId":reference("RequestId"),"outcome":{"const":"ok"},"result":{"anyOf":results}}),
+            &["protocolVersion", "kind", "scope", "requestId", "outcome", "result"],
+        );
+        let error = object(
+            json!({"protocolVersion":{"const":"1.0"},"kind":{"const":"response"},"scope":reference("Scope"),"extensions":{"type":"object"},"requestId":reference("RequestId"),"outcome":{"const":"error"},"error":reference("WireError")}),
+            &["protocolVersion", "kind", "scope", "requestId", "outcome", "error"],
+        );
+        defs["Request"] = json!({"anyOf":requests});
+        defs["Response"] = json!({"anyOf":[ok,error]}); // Cancellation successes overlap: NOT oneOf.
+        defs["Event"] = json!({"oneOf":event_variants});
+        defs["Frame"] = json!({"oneOf":[reference("Request"),reference("Response"),reference("Event")]});
+        let mut bootstrap = defs["Request"]["anyOf"][0].clone();
+        bootstrap["properties"]["protocolVersion"] = json!({"type":"string"});
+        let mut refusal = defs["Response"]["anyOf"][1].clone();
+        refusal["properties"]["protocolVersion"] = json!({"type":"string"});
+        refusal["properties"]["scope"] = scope_schema("runtime.hello");
+        refusal["properties"]["error"] = json!({"allOf":[reference("WireError"),{"properties":{"code":{"const":"INCOMPATIBLE_VERSION"}}}]});
+        defs["BootstrapFrame"] = json!({"anyOf":[bootstrap,defs["Response"]["anyOf"][0],refusal]});
+        json!({"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"urn:solidcraft:mastra-runtime:1.0","title":"SolidCraft Mastra protocol 1.0","$ref":"#/$defs/Frame","$defs":defs})
+    }
+    fn scope_schema(method: &str) -> Value {
+        let branch = match method {
+            "runtime.hello" | "runtime.shutdown" | "runtime.ready" => Some(0),
+            "session.start" | "session.reset" => Some(1),
+            "request.cancel" => None,
+            "connection.describe" | "validation.status" | "validation.report" | "validation.cancel" | "connection.state" => {
+                return json!({"anyOf":[{"$ref":"#/$defs/Scope/anyOf/1"},{"$ref":"#/$defs/Scope/anyOf/2"}]});
+            }
+            _ => Some(2),
+        };
+        branch.map_or_else(|| reference("Scope"), |i| json!({"$ref":format!("#/$defs/Scope/anyOf/{i}")}))
+    }
+    fn method_types() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            ("runtime.hello", "RuntimeHelloParams", "RuntimeHelloResult"),
+            ("session.start", "SessionStartParams", "SessionStartResult"),
+            ("turn.start", "TurnStartParams", "TurnStartResult"),
+            ("turn.cancel", "TurnCancelParams", "TurnCancelResult"),
+            ("request.cancel", "RequestCancelParams", "RequestCancelResult"),
+            ("session.reset", "SessionResetParams", "SessionResetResult"),
+            ("runtime.shutdown", "RuntimeShutdownParams", "RuntimeShutdownResult"),
+            ("connection.describe", "ConnectionDescribeParams", "ConnectionDescribeResult"),
+            ("model.generate", "ModelGenerateParams", "ModelGenerateResult"),
+            ("agent.run", "AgentRunParams", "AgentRunResult"),
+            ("validation.submit", "ValidationSubmitParams", "ValidationSubmitResult"),
+            ("validation.status", "ValidationStatusParams", "ValidationStatusResult"),
+            ("validation.report", "ValidationReportParams", "ValidationReportResult"),
+            ("validation.cancel", "ValidationCancelParams", "ValidationCancelResult"),
+        ]
+    }
+    fn event_types() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("runtime.ready", "RuntimeReady"),
+            ("connection.state", "ConnectionStateEvent"),
+            ("workflow.stage", "WorkflowStage"),
+            ("workflow.text", "WorkflowText"),
+            ("workflow.plan", "WorkflowPlan"),
+            ("workflow.tool", "WorkflowTool"),
+            ("agent.progress", "AgentProgress"),
+            ("model.delta", "ModelDelta"),
+            ("turn.finished", "TurnFinished"),
+        ]
+    }
+    fn local_refs(s: &Value, root: &Value) -> Check {
+        match s {
+            Value::Object(map) => {
+                if let Some(r) = map.get("$ref") {
+                    let r = r.as_str().ok_or("non-string ref")?;
+                    require(r.starts_with("#/") && root.pointer(&r[1..]).is_some(), format!("non-local/unresolved ref {r}"))?;
+                }
+                for child in map.values() {
+                    local_refs(child, root)?;
+                }
+            }
+            Value::Array(a) => {
+                for child in a {
+                    local_refs(child, root)?;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    pub struct Evaluator {
+        root: Value,
+        validators: HashMap<String, jsonschema::Validator>,
+    }
+    impl Evaluator {
+        pub fn new(path: &Path) -> Check<Self> {
+            let root = value(path, "protocol.schema.json")?;
+            local_refs(&root, &root)?;
+            require(root["$schema"] == "https://json-schema.org/draft/2020-12/schema", "not Draft2020-12")?;
+            Ok(Self { root, validators: HashMap::new() })
+        }
+        pub fn accepts(&mut self, schema_ref: &str, value: &Value) -> Check<bool> {
+            require(schema_ref.starts_with("#/$defs/") && self.root.pointer(&schema_ref[1..]).is_some(), "unknown/nonlocal schemaRef")?;
+            if !self.validators.contains_key(schema_ref) {
+                let mut schema = self.root.clone();
+                schema["$ref"] = json!(schema_ref);
+                let v = jsonschema::options()
+                    .with_draft(jsonschema::Draft::Draft202012)
+                    .should_validate_formats(true)
+                    .offline()
+                    .build(&schema)
+                    .map_err(|e| e.to_string())?;
+                self.validators.insert(schema_ref.to_owned(), v);
+            }
+            Ok(self.validators[schema_ref].is_valid(value))
+        }
+    }
+    pub fn schema_agreement() -> Check {
+        let generated = schema();
+        require(read(&mastra_bundle_path(), "protocol.schema.json")? == bytes(&generated), "stale schema vs actual Rust DTO metadata")?;
+        local_refs(&generated, &generated)?;
+        let cancel = json!({"protocolVersion":"1.0","kind":"response","scope":mastra_codec_scope("turn.cancel"),"requestId":"h:cancel","outcome":"ok","result":{"state":"cancelling"}});
+        require(super::mastra_schema_accepts("#/$defs/Frame", &cancel)?, "overlapping cancellation rejected")?;
+        require(decode_runtime_reply("turn.cancel", cancel["result"].clone(), &Limits::default()).is_ok(), "turn cancellation shape")?;
+        require(decode_runtime_reply("request.cancel", cancel["result"].clone(), &Limits::default()).is_ok(), "request cancellation shape")?;
+        require(
+            decode_runtime_reply("session.start", cancel["result"].clone(), &Limits::default()).is_err(),
+            "method-neutral shape bypassed method-specific decoder",
+        )?;
+        Ok(())
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Case {
+        id: String,
+        path: String,
+        kind: String,
+        schema_ref: Option<String>,
+        phase: String,
+        sender: String,
+        shape_expected: String,
+        handling_expected: String,
+        error_code: Option<String>,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Catalog {
+        schema_version: String,
+        cases: Vec<Case>,
+    }
+    #[derive(Default)]
+    struct Plan {
+        files: BTreeMap<String, Vec<u8>>,
+        cases: BTreeMap<String, Case>,
+    }
+    impl Plan {
+        fn raw(
+            &mut self,
+            id: &str,
+            path: &str,
+            raw: Vec<u8>,
+            kind: &str,
+            schema: Option<&str>,
+            shape: &str,
+            handling: &str,
+            code: Option<&str>,
+            host: bool,
+        ) {
+            assert!(self.files.insert(path.to_owned(), raw).is_none(), "duplicate fixture {path}");
+            assert!(
+                self.cases
+                    .insert(
+                        id.to_owned(),
+                        Case {
+                            id: id.to_owned(),
+                            path: path.to_owned(),
+                            kind: kind.to_owned(),
+                            schema_ref: schema.map(|s| format!("#/$defs/{s}")),
+                            phase: if kind == "frame" || kind == "bytes" { "negotiated" } else { "not_applicable" }.to_owned(),
+                            sender: if host { "host" } else { "runtime" }.to_owned(),
+                            shape_expected: shape.to_owned(),
+                            handling_expected: handling.to_owned(),
+                            error_code: code.map(str::to_owned)
+                        }
+                    )
+                    .is_none()
+            );
+        }
+        fn frame(&mut self, id: &str, value: Value, shape: bool, handling: &str, host: bool) {
+            let path = format!("fixtures/{}/{id}.ndjson", if handling == "accept" { "valid" } else { "invalid" });
+            let code = match handling {
+                "invalid_request" => Some("INVALID_REQUEST"),
+                "method_not_found" => Some("METHOD_NOT_FOUND"),
+                "transport_error" => Some("TRANSPORT_ERROR"),
+                _ => None,
+            };
+            self.raw(id, &path, line(&value), "frame", Some("Frame"), if shape { "valid" } else { "invalid" }, handling, code, host);
+        }
+        fn data(&mut self, id: &str, value: Value, schema: &str, shape: bool, valid: bool) {
+            let path = format!("fixtures/{}/{id}.json", if valid { "valid" } else { "invalid" });
+            self.raw(
+                id,
+                &path,
+                bytes(&value),
+                "data",
+                Some(schema),
+                if shape { "valid" } else { "invalid" },
+                if valid { "accept" } else { "invalid_request" },
+                if valid { None } else { Some("INVALID_REQUEST") },
+                true,
+            );
+        }
+        fn catalog(&self) -> Value {
+            serde_json::to_value(Catalog { schema_version: "1.0".to_owned(), cases: self.cases.values().cloned().collect() }).unwrap()
+        }
+    }
+    fn missing_nulls(value: &Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if child.is_null() {
+                        let mut v = value.clone();
+                        v.as_object_mut().unwrap().remove(key);
+                        out.push(v);
+                    }
+                    for replacement in missing_nulls(child) {
+                        let mut v = value.clone();
+                        v[key] = replacement;
+                        out.push(v);
+                    }
+                }
+            }
+            Value::Array(a) => {
+                for (i, child) in a.iter().enumerate() {
+                    for replacement in missing_nulls(child) {
+                        let mut v = value.clone();
+                        v[i] = replacement;
+                        out.push(v);
+                    }
+                }
+            }
+            _ => (),
+        }
+        out
+    }
+    fn error_details(code: &str) -> Value {
+        match code {
+            "INCOMPATIBLE_VERSION" => json!({"supported":["1.0"]}),
+            "INVALID_REQUEST" | "METHOD_NOT_FOUND" => json!({"field":"params","method":"model.generate"}),
+            "UNSUPPORTED_CAPABILITY" => json!({"capability":"tools"}),
+            "AUTH_REQUIRED" | "CONNECTION_CHANGED" | "TASK_FAILED" | "INVALID_PROPOSAL" => json!({"connectionId":"c"}),
+            "MODEL_ERROR" | "MALFORMED_RESPONSE" => json!({"connectionId":"c","httpStatus":429}),
+            "PERMISSION_DENIED" => json!({"permissionId":"permission"}),
+            "STALE_DOCUMENT" => json!({"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}),
+            "DEPENDENCY_CHANGED" | "INVALID_CANDIDATE" => json!({"candidateId":"candidate","dependencyId":"dependency"}),
+            "PROFILE_UNSUPPORTED" | "REPORT_MISMATCH" => json!({"runId":"run","profileId":"profile"}),
+            "NOT_READY" | "NOT_FOUND" => json!({"runId":"run","artifactId":"artifact"}),
+            "IDEMPOTENCY_CONFLICT" | "REQUEST_EXPIRED" => json!({"submissionRequestId":"submission"}),
+            "RESOURCE_EXHAUSTED" => json!({"resource":"pendingRequests","limit":32}),
+            _ => json!({"operation":"request.cancel"}),
+        }
+    }
+    fn error_value(code: &str, details: Value) -> Value {
+        json!({"code":code,"message":"Redacted diagnostic.","retry":"never","details":details})
+    }
+    fn error_codes() -> [&'static str; 26] {
+        [
+            "INCOMPATIBLE_VERSION",
+            "INVALID_REQUEST",
+            "METHOD_NOT_FOUND",
+            "UNSUPPORTED_CAPABILITY",
+            "AUTH_REQUIRED",
+            "CONNECTION_CHANGED",
+            "PERMISSION_DENIED",
+            "MODEL_ERROR",
+            "MALFORMED_RESPONSE",
+            "TASK_FAILED",
+            "INVALID_PROPOSAL",
+            "STALE_DOCUMENT",
+            "DEPENDENCY_CHANGED",
+            "INVALID_CANDIDATE",
+            "PROFILE_UNSUPPORTED",
+            "REPORT_MISMATCH",
+            "NOT_READY",
+            "NOT_FOUND",
+            "IDEMPOTENCY_CONFLICT",
+            "REQUEST_EXPIRED",
+            "RESOURCE_EXHAUSTED",
+            "TIMEOUT",
+            "CANCELLED",
+            "TRANSPORT_ERROR",
+            "OUTCOME_UNKNOWN",
+            "INTERNAL_ERROR",
+        ]
+    }
+    fn plan() -> Plan {
+        let mut p = Plan::default();
+        let (methods, events) = mastra_codec_catalog();
+        for (method, params, result, host) in &methods {
+            let base = mastra_codec_request(method, params.clone(), *host);
+            p.frame(&format!("request-{method}"), base.clone(), true, "accept", *host);
+            let reply =
+                json!({"protocolVersion":"1.0","kind":"response","scope":base["scope"],"requestId":base["requestId"],"outcome":"ok","result":result});
+            p.frame(&format!("response-{method}"), reply.clone(), true, "accept", !*host);
+            p.data(&format!("result-{method}"), result.clone(), method_types().iter().find(|x| x.0 == method).unwrap().2, true, true);
+            let err = json!({"protocolVersion":"1.0","kind":"response","scope":base["scope"],"requestId":base["requestId"],"outcome":"error","error":error_value("INVALID_REQUEST",json!({}))});
+            p.frame(&format!("response-error-{method}"), err, true, "accept", !*host);
+            let mut unknown = base.clone();
+            unknown["params"]["undeclared"] = json!(true);
+            p.frame(&format!("unknown-param-{method}"), unknown, false, "invalid_request", *host);
+            for field in params.as_object().unwrap().keys() {
+                let mut v = base.clone();
+                v["params"].as_object_mut().unwrap().remove(field);
+                p.frame(&format!("missing-param-{method}-{field}"), v, false, "invalid_request", *host);
+            }
+            for (i, v) in missing_nulls(&base).into_iter().enumerate() {
+                // Missing scope identity is an envelope violation, not a method error.
+                let scope_ok = serde_json::from_value::<Scope>(v["scope"].clone()).is_ok();
+                p.frame(
+                    &format!("missing-null-request-{method}-{i:02}"),
+                    v,
+                    false,
+                    if scope_ok { "invalid_request" } else { "transport_error" },
+                    *host,
+                );
+            }
+            let result_schema = method_types().iter().find(|x| x.0 == method).unwrap().2;
+            for field in result.as_object().unwrap().keys() {
+                let mut v = result.clone();
+                v.as_object_mut().unwrap().remove(field);
+                p.data(&format!("missing-result-{method}-{field}"), v, result_schema, false, false);
+            }
+            let mut v = result.clone();
+            v["undeclared"] = json!(true);
+            p.data(&format!("unknown-result-{method}"), v, result_schema, false, false);
+            for (i, v) in missing_nulls(result).into_iter().enumerate() {
+                p.data(&format!("missing-null-result-{method}-{i:02}"), v, result_schema, false, false);
+            }
+            let mut unknown = base.clone();
+            unknown["method"] = json!("future.method");
+            p.frame(&format!("unknown-method-{method}"), unknown, false, "method_not_found", *host);
+            if method != "request.cancel" {
+                p.frame(&format!("wrong-direction-{method}"), base, true, "transport_error", !*host);
+            }
+        }
+        for (event, data, host) in events {
+            let base = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope(&event),"sequence":1,"event":event,"requestId":null,"data":data});
+            p.frame(&format!("event-{event}"), base.clone(), true, "accept", host);
+            p.frame(&format!("event-direction-{event}"), base.clone(), true, "transport_error", !host);
+            for field in data.as_object().unwrap().keys() {
+                let mut v = base.clone();
+                v["data"].as_object_mut().unwrap().remove(field);
+                p.frame(&format!("missing-event-{event}-{field}"), v, false, "transport_error", host);
+            }
+            for (i, v) in missing_nulls(&base).into_iter().enumerate() {
+                p.frame(&format!("missing-null-event-{event}-{i:02}"), v, false, "transport_error", host);
+            }
+            let mut v = base.clone();
+            v["data"]["undeclared"] = json!(0);
+            p.frame(&format!("unknown-event-data-{event}"), v, false, "transport_error", host);
+            let mut v = base;
+            v["event"] = json!("future.event");
+            p.frame(&format!("unknown-event-{event}"), v, false, "transport_error", host);
+        }
+        for code in error_codes() {
+            for (branch, details) in [("empty", json!({})), ("nonempty", error_details(code))] {
+                let e = error_value(code, details);
+                p.data(&format!("error-{code}-{branch}"), e.clone(), "WireError", true, true);
+                if branch == "nonempty" {
+                    for key in e["details"].as_object().unwrap().keys() {
+                        let mut v = e.clone();
+                        v["details"][key] = Value::Null;
+                        if !e["details"][key].is_null() {
+                            p.data(&format!("error-{code}-null-{key}"), v, "WireError", false, false);
+                        }
+                        let mut v = e.clone();
+                        v["details"].as_object_mut().unwrap().remove(key);
+                        let valid = matches!(
+                            code,
+                            "INVALID_REQUEST"
+                                | "METHOD_NOT_FOUND"
+                                | "DEPENDENCY_CHANGED"
+                                | "INVALID_CANDIDATE"
+                                | "PROFILE_UNSUPPORTED"
+                                | "REPORT_MISMATCH"
+                                | "NOT_READY"
+                                | "NOT_FOUND"
+                                | "TIMEOUT"
+                                | "CANCELLED"
+                                | "TRANSPORT_ERROR"
+                                | "OUTCOME_UNKNOWN"
+                                | "INTERNAL_ERROR"
+                        ) || (matches!(code, "MODEL_ERROR" | "MALFORMED_RESPONSE") && key == "httpStatus");
+                        let empty = v["details"].as_object().unwrap().is_empty();
+                        p.data(&format!("error-{code}-omit-{key}"), v, "WireError", valid || empty, valid || empty);
+                    }
+                    if code == "STALE_DOCUMENT" {
+                        let mut v = e.clone();
+                        v["details"]["current"] = json!({"documentId":"doc-A","revision":"18446744073709551615"});
+                        p.data("error-STALE_DOCUMENT-current-stamp", v, "WireError", true, true);
+                    }
+                }
+                let mut bad = e.clone();
+                bad["details"]["undeclared"] = json!(true);
+                p.data(&format!("error-{code}-{branch}-unknown"), bad, "WireError", false, false);
+                for key in ["code", "message", "retry", "details"] {
+                    let mut bad = e.clone();
+                    bad.as_object_mut().unwrap().remove(key);
+                    p.data(&format!("error-{code}-{branch}-missing-{key}"), bad, "WireError", false, false);
+                }
+            }
+        }
+        p.data("error-future-code", error_value("FUTURE", json!({})), "WireError", false, false);
+        for (id, raw, valid) in [
+            ("document-stamp-zero", r#"{"documentId":"doc-A","revision":"0"}"#, true),
+            ("document-stamp-unsafe-js", r#"{"documentId":"doc-A","revision":"9007199254740993"}"#, true),
+            ("document-stamp-max-u64", r#"{"documentId":"doc-A","revision":"18446744073709551615"}"#, true),
+            ("document-stamp-numeric", r#"{"documentId":"doc-A","revision":0}"#, false),
+            ("document-stamp-leading-zero", r#"{"documentId":"doc-A","revision":"00"}"#, false),
+            ("document-stamp-overflow", r#"{"documentId":"doc-A","revision":"18446744073709551616"}"#, false),
+        ] {
+            p.raw(
+                id,
+                &format!("fixtures/{}/{id}.json", if valid { "valid" } else { "invalid" }),
+                raw.as_bytes().to_vec(),
+                "data",
+                Some("DocumentStamp"),
+                if valid { "valid" } else { "invalid" },
+                if valid { "accept" } else { "invalid_request" },
+                if valid { None } else { Some("INVALID_REQUEST") },
+                true,
+            );
+        }
+        for (i, n) in [0, 9_007_199_254_740_993, u64::MAX].into_iter().enumerate() {
+            let raw = format!(r#"{{"document_id":"doc-A","revision":{n}}}"#);
+            p.raw(
+                &format!("native-stamp-{i}"),
+                &format!("fixtures/valid/native-stamp-{i}.json"),
+                raw.into_bytes(),
+                "data",
+                None,
+                "not_applicable",
+                "accept",
+                None,
+                true,
+            );
+        }
+        for (id, v) in [("id-newline", json!("a\n")), ("id-unicode", json!("é")), ("id-overlength", json!("x".repeat(129)))] {
+            p.data(id, v, "Id", false, false);
+        }
+        p.data("id-max-length", json!("x".repeat(128)), "Id", true, true);
+        // `$` alone can match before a final LF. These exercise the actual published
+        // schema/evaluator and actual primitive parsers, not a regex-description check.
+        for (name, good) in [
+            ("Id", "a".to_owned()),
+            ("RequestId", "h:call".to_owned()),
+            ("Revision", "1".to_owned()),
+            ("Digest", format!("sha256:{}", "a".repeat(64))),
+            ("Timestamp", "2026-11-05T12:00:00.000Z".to_owned()),
+            ("SubmissionKey", "1793876400000:12345678-1234-4234-8234-123456789abc".to_owned()),
+        ] {
+            p.data(&format!("whole-string-{name}-valid"), json!(good), name, true, true);
+            for (suffix, label) in [("\n", "lf"), ("\r", "cr"), (" ", "space"), ("é", "non-ascii")] {
+                p.data(&format!("whole-string-{name}-{label}"), json!(format!("{good}{suffix}")), name, false, false);
+            }
+        }
+        for (label, revision) in [("leading-zero", "01"), ("non-ascii", "１"), ("overflow", "18446744073709551616")] {
+            p.data(&format!("whole-string-Revision-{label}-standalone"), json!(revision), "Revision", false, false);
+        }
+        p.data("whole-string-document-id-lf", json!({"documentId":"a\n","revision":"1"}), "DocumentStamp", false, false);
+        p.data("whole-string-scope-id-lf", json!({"sessionId":"a\n","turnId":null,"workflowRunId":null}), "Scope", false, false);
+        let mut bad_id = mastra_codec_request("session.start", json!({"workflowId":"w","instructions":"free text","bridge":null}), true);
+        bad_id["requestId"] = json!("h:call\n");
+        p.frame("whole-string-envelope-id-lf", bad_id, false, "transport_error", true);
+        let mut bad_scope = mastra_codec_request("session.start", json!({"workflowId":"w","instructions":"free text","bridge":null}), true);
+        bad_scope["scope"]["sessionId"] = json!("a\n");
+        p.frame("whole-string-envelope-scope-lf", bad_scope, false, "transport_error", true);
+        p.frame(
+            "whole-string-parameter-id-lf",
+            mastra_codec_request("session.start", json!({"workflowId":"a\n","instructions":"free text","bridge":null}), true),
+            false,
+            "invalid_request",
+            true,
+        );
+        p.frame("whole-string-free-text-lf",json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope("workflow.text"),"sequence":1,"requestId":null,"event":"workflow.text","data":{"text":"a\n","channel":"answer"}}),true,"accept",false);
+        p.data("revision-numeric-unsafe", json!(9_007_199_254_740_993_u64), "Revision", false, false);
+        p.data("revision-numeric-max", json!(u64::MAX), "Revision", false, false);
+        let control = mastra_codec_request("turn.cancel", json!({"reason":"user"}), true);
+        for field in ["protocolVersion", "kind", "scope", "requestId", "method", "params"] {
+            let mut v = control.clone();
+            v.as_object_mut().unwrap().remove(field);
+            p.frame(&format!("envelope-missing-{field}"), v, false, "transport_error", true);
+        }
+        for (field, v) in [
+            ("protocolVersion", json!("1.0.0")),
+            ("extra", json!(0)),
+            ("extensions", Value::Null),
+            ("requestId", json!("r:wrong")),
+            ("scope", json!({"sessionId":"s","turnId":"t","workflowRunId":null})),
+            ("params", Value::Null),
+        ] {
+            let mut bad = control.clone();
+            bad[field] = v;
+            // Direction prefix is checked by codec; neutral schema cannot infer sender.
+            p.frame(&format!("envelope-invalid-{field}"), bad, field == "requestId", "transport_error", true);
+        }
+        let raw = String::from_utf8(line(&control)).unwrap();
+        for (id, raw) in [
+            ("bytes-invalid-utf8", vec![0xff, b'\n']),
+            ("bytes-duplicate-root", raw.replacen('{', "{\"kind\":\"request\",", 1).into_bytes()),
+            ("bytes-duplicate-nested", raw.replace("\"params\":{", "\"params\":{\"reason\":\"user\",").into_bytes()),
+            ("bytes-duplicate-escaped", raw.replacen('{', "{\"extensions\":{\"x\":1,\"\\u0078\":2},", 1).into_bytes()),
+            ("bytes-no-lf", raw.trim_end_matches('\n').as_bytes().to_vec()),
+            ("bytes-crlf", raw.replace('\n', "\r\n").into_bytes()),
+            ("bytes-bom", format!("\u{feff}{raw}").into_bytes()),
+            ("bytes-multiple-lines", format!("{raw}{raw}").into_bytes()),
+            ("bytes-infinite", raw.replacen('{', "{\"extensions\":{\"n\":1e400},", 1).into_bytes()),
+        ] {
+            let parseable = matches!(id, "bytes-no-lf" | "bytes-crlf");
+            p.raw(
+                id,
+                &format!("fixtures/invalid/{id}.bin"),
+                raw,
+                "bytes",
+                if parseable { Some("Frame") } else { None },
+                if parseable { "valid" } else { "not_applicable" },
+                "transport_error",
+                Some("TRANSPORT_ERROR"),
+                true,
+            );
+        }
+        for (depth, valid) in [(64, true), (65, false)] {
+            let mut nested = json!(0);
+            for _ in 2..depth {
+                nested = json!([nested]);
+            }
+            let mut v = control.clone();
+            v["extensions"] = json!({"value":nested});
+            p.frame(&format!("depth-{depth}"), v, true, if valid { "accept" } else { "transport_error" }, true);
+        }
+        for (size, valid) in [(8_388_608, true), (8_388_609, false)] {
+            let mut v = control.clone();
+            v["extensions"] = json!({"padding":""});
+            let overhead = line(&v).len();
+            v["extensions"]["padding"] = json!("x".repeat(size - overhead));
+            p.frame(&format!("frame-bytes-{size}"), v, true, if valid { "accept" } else { "transport_error" }, true);
+        }
+        let model = methods.iter().find(|x| x.0 == "model.generate").unwrap().1.clone();
+        for (id, path, v, shape, valid) in [
+            ("timeout-zero", "/options/timeoutSeconds", json!(0), false, false),
+            ("integer-overflow", "/options/timeoutSeconds", json!(2147483648_u64), false, false),
+            ("integer-fraction", "/options/timeoutSeconds", json!(1.5), false, false),
+            ("output-tokens-overflow", "/options/maxOutputTokens", json!(131073), false, false),
+            ("temperature-overflow", "/options/temperature", json!(2.01), false, false),
+            ("reasoning-ascii-overflow", "/options/reasoningEffort", json!("x".repeat(65)), false, false),
+            ("reasoning-byte-overflow", "/options/reasoningEffort", json!("é".repeat(33)), true, false),
+            ("reasoning-byte-boundary", "/options/reasoningEffort", json!("é".repeat(32)), true, true),
+            ("text-byte-boundary", "/messages/0/content/0/text", json!("é".repeat(131072)), true, true),
+            ("text-byte-overflow", "/messages/0/content/0/text", json!("é".repeat(131073)), true, false),
+            ("tool-json-boundary", "/tools/0/inputSchema", json!({"s":"x".repeat(65528)}), true, true),
+            ("tool-json-overflow", "/tools/0/inputSchema", json!({"s":"x".repeat(65529)}), true, false),
+            ("messages-overflow", "/messages", json!(vec![model["messages"][0].clone(); 129]), false, false),
+            ("tools-overflow", "/tools", json!(vec![model["tools"][0].clone(); 65]), false, false),
+        ] {
+            let mut params = model.clone();
+            *params.pointer_mut(path).unwrap() = v;
+            p.frame(id, mastra_codec_request("model.generate", params, false), shape, if valid { "accept" } else { "invalid_request" }, false);
+        }
+        let assistant =
+            json!({"role":"assistant","content":[],"toolCalls":[{"id":"call","name":"measure","arguments":{"width":-1.25}}],"toolCallId":null});
+        let tool = json!({"role":"tool","content":[{"type":"text","text":"result"}],"toolCalls":[],"toolCallId":"call"});
+        for (id, messages, valid) in [
+            ("tool-identity-valid", json!([assistant.clone(), tool.clone()]), true),
+            ("tool-identity-orphan", json!([tool.clone()]), false),
+            ("tool-identity-duplicate", json!([assistant.clone(), tool.clone(), tool.clone()]), false),
+            ("tool-identity-pending", json!([assistant]), false),
+        ] {
+            let mut params = model.clone();
+            params["messages"] = messages;
+            p.frame(id, mastra_codec_request("model.generate", params, false), true, if valid { "accept" } else { "invalid_request" }, false);
+        }
+        for (size, shape, valid) in [(2048, true, true), (2049, false, false)] {
+            let mut e = error_value("INTERNAL_ERROR", json!({}));
+            e["message"] = json!("x".repeat(size));
+            p.data(&format!("error-ascii-{size}"), e, "WireError", shape, valid);
+        }
+        let mut e = error_value("INTERNAL_ERROR", json!({}));
+        e["message"] = json!("é".repeat(1025));
+        p.data("error-utf8-byte-overflow", e, "WireError", true, false);
+        for (key, limit) in serde_json::to_value(Limits::default()).unwrap().as_object().unwrap() {
+            let mut v = serde_json::to_value(Limits::default()).unwrap();
+            v[key] = if key == "storeBytes" { json!("8589934593") } else { json!(limit.as_u64().unwrap() + 1) };
+            p.data(&format!("limit-overflow-{key}"), v, "Limits", false, false);
+            let mut v = serde_json::to_value(Limits::default()).unwrap();
+            v[key] = if key == "storeBytes" { json!("0") } else { json!(0) };
+            p.data(&format!("limit-zero-{key}"), v, "Limits", false, false);
+        }
+        p.data("limits-default", json!(Limits::default()), "Limits", true, true);
+        p.data("budgets-default", json!(Budgets::default()), "Budgets", true, true);
+        p.data(
+            "budgets-zero",
+            json!({"modelCalls":0,"agentTasks":0,"cadCommands":0,"repairs":0,"validationRuns":0,"wallTimeSeconds":0}),
+            "Budgets",
+            true,
+            true,
+        );
+        for (key, limit) in serde_json::to_value(Budgets::default()).unwrap().as_object().unwrap() {
+            let mut v = serde_json::to_value(Budgets::default()).unwrap();
+            v[key] = json!(limit.as_u64().unwrap() + 1);
+            p.data(&format!("budget-overflow-{key}"), v, "Budgets", false, false);
+        }
+        let mut hello = mastra_codec_request("runtime.hello", methods[0].1.clone(), true);
+        hello["protocolVersion"] = json!("future");
+        p.raw(
+            "bootstrap-future-offer",
+            "fixtures/valid/bootstrap-future-offer.ndjson",
+            line(&hello),
+            "frame",
+            Some("BootstrapFrame"),
+            "valid",
+            "accept",
+            None,
+            true,
+        );
+        p.cases.get_mut("bootstrap-future-offer").unwrap().phase = "bootstrap".to_owned();
+        let refusal = json!({"protocolVersion":"future","kind":"response","scope":mastra_codec_scope("runtime.hello"),"requestId":"h:hello","outcome":"error","error":error_value("INCOMPATIBLE_VERSION",json!({"supported":["1.0"]}))});
+        p.raw(
+            "bootstrap-exact-refusal",
+            "fixtures/valid/bootstrap-exact-refusal.ndjson",
+            line(&refusal),
+            "frame",
+            Some("BootstrapFrame"),
+            "valid",
+            "accept",
+            None,
+            false,
+        );
+        p.cases.get_mut("bootstrap-exact-refusal").unwrap().phase = "bootstrap".to_owned();
+        let mut caps = methods[0].2.clone();
+        caps["capabilities"]["futureCapability"] = json!(true);
+        p.data("unknown-capability", caps, "RuntimeHelloResult", false, false);
+        for code in ["MODEL_ERROR", "MALFORMED_RESPONSE"] {
+            let mut e = error_value(code, error_details(code));
+            e["details"]["httpStatus"] = json!(2147483648_u64);
+            p.data(&format!("error-{code}-integer-overflow"), e, "WireError", false, false);
+        }
+        for (kind, content) in [
+            ("text", json!({"text":"progress"})),
+            ("tool", json!({"callId":"call","title":"Measure","state":"running"})),
+            ("plan", json!({"steps":[{"id":"step","title":"Measure","state":"pending"}]})),
+        ] {
+            let frame = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope("agent.progress"),"sequence":1,"requestId":null,"event":"agent.progress","data":{"agentSessionId":"as","kind":kind,"content":content}});
+            p.frame(&format!("agent-progress-{kind}"), frame, true, "accept", true);
+        }
+        let d = json!({"documentId":"doc-A","revision":"9007199254740993"});
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let manifest = json!({"schemaVersion":"1.0","candidateId":"candidate","source":d,"capturedAt":"2026-11-05T12:00:00.000Z","formatVersion":"solidcraft/fixture","engineVersion":"1","inputs":[{"path":"design.sc","kind":"design","dependencyId":"design","dependencyVersion":null,"digest":hash,"sizeBytes":1}]});
+        p.data("snapshot-manifest-wire-only", manifest.clone(), "SnapshotManifest", true, true);
+        let mut bad = manifest;
+        bad["inputs"][0]["path"] = json!("../live.sc");
+        p.data("snapshot-manifest-path-traversal", bad, "SnapshotManifest", true, false);
+        let profile = json!({"schemaVersion":"1.0","profileId":"profile","version":"1","checks":[{"checkId":"input.integrity","kind":"input.integrity","required":true,"parameters":{}}]});
+        p.data("check-profile-wire-only", profile, "CheckProfile", true, true);
+        p.data("write-outcome-unknown-wire-only",json!({"state":"unknown","request":{"bridgeId":"bridge","mcpSessionId":"mcp","requestId":"request"},"before":d,"after":null,"completed":null,"rollback":{"requested":false,"attempted":false,"restored":null,"undone":null},"expectation":null,"error":null}),"WriteOutcome",true,true);
+        issue8_plan(&mut p);
+        transcript_plan(&mut p);
+        p
+    }
+
+    fn native_data(schema: &str, v: Value) -> bool {
+        macro_rules! parse {
+            ($t:ty) => {
+                serde_json::from_value::<$t>(v).is_ok()
+            };
+        }
+        match schema {
+            "Id" => parse!(Id),
+            "Revision" => parse!(Revision),
+            "RequestId" => parse!(RequestId),
+            "Digest" => parse!(Digest),
+            "Timestamp" => parse!(Timestamp),
+            "SubmissionKey" => parse!(SubmissionKey),
+            "Scope" => parse!(Scope),
+            "DocumentStamp" => parse!(DocumentStamp),
+            "WireError" => parse!(WireError),
+            "SnapshotManifest" => serde_json::from_value::<SnapshotManifest>(v).is_ok_and(|x| x.validate(&Limits::default()).is_ok()),
+            "CheckProfile" => serde_json::from_value::<CheckProfile>(v).is_ok_and(|x| x.validate(&Limits::default()).is_ok()),
+            "WriteOutcome" => serde_json::from_value::<WriteOutcome>(v).is_ok_and(|x| x.validate(&Limits::default()).is_ok()),
+            "Limits" => serde_json::from_value::<Limits>(v).is_ok_and(|x| validate_limits(&x).is_ok()),
+            "Budgets" => serde_json::from_value::<Budgets>(v).is_ok_and(|x| validate_budgets(&x).is_ok()),
+            name => {
+                let Some((method, _, _)) = method_types().into_iter().find(|x| x.2 == name) else { return false };
+                let host = mastra_codec_catalog().0.into_iter().find(|x| x.0 == method).unwrap().3;
+                if host {
+                    decode_runtime_reply(method, v, &Limits::default()).is_ok()
+                } else {
+                    decode_host_reply(method, v, &Limits::default()).is_ok()
+                }
+            }
+        }
+    }
+    // The copied #8 proposal is represented here as original literal carriers and thin
+    // transformations. No product test reads the ignored SDD or treats these as IPC frames.
+    fn guard_raw(p: &mut Plan, id: &str, raw: String) {
+        p.raw(id, &format!("fixtures/valid/{id}.json"), raw.into_bytes(), "data", None, "not_applicable", "accept", None, true);
+    }
+    fn issue8_plan(p: &mut Plan) {
+        let stamps = vec![
+            r#"{"documentId":"doc-A","revision":"0"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"9007199254740993"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"18446744073709551615"}"#.to_owned(),
+            r#"{"documentId":"A0._:-z","revision":"0"}"#.to_owned(),
+            "null".to_owned(),
+            "0".to_owned(),
+            "true".to_owned(),
+            "[]".to_owned(),
+            r#""stamp""#.to_owned(),
+            "{}".to_owned(),
+            r#"{"documentId":"doc-A"}"#.to_owned(),
+            r#"{"revision":"0"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"0","extra":true}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":0}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":null}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":true}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":[]}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":{}}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":""}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"00"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"01"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"+1"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"-1"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"1e3"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"1.0"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"18446744073709551616"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"99999999999999999999"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"100000000000000000000"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":" 1"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"1 "}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"1\n"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"\t1"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"１"}"#.to_owned(),
+            r#"{"documentId":"doc-A","revision":"١"}"#.to_owned(),
+            r#"{"documentId":"","revision":"0"}"#.to_owned(),
+            r#"{"documentId":"-bad","revision":"0"}"#.to_owned(),
+            r#"{"documentId":"a/b","revision":"0"}"#.to_owned(),
+            r#"{"documentId":"é","revision":"0"}"#.to_owned(),
+            r#"{"documentId":null,"revision":"0"}"#.to_owned(),
+            r#"{"documentId":1,"revision":"0"}"#.to_owned(),
+            format!(r#"{{"documentId":"{}","revision":"0"}}"#, "x".repeat(128)),
+            format!(r#"{{"documentId":"{}","revision":"0"}}"#, "x".repeat(129)),
+        ];
+        for (i, stamp) in stamps.into_iter().enumerate() {
+            if [3, 40].contains(&i) {
+                p.raw(
+                    &format!("document-stamp-parser-{:02}", i + 1),
+                    &format!("fixtures/valid/document-stamp-parser-{:02}.json", i + 1),
+                    stamp.as_bytes().to_vec(),
+                    "data",
+                    Some("DocumentStamp"),
+                    "valid",
+                    "accept",
+                    None,
+                    true,
+                );
+            }
+            guard_raw(p, &format!("guard-parser-{:02}", i + 1), format!(r#"{{"expectedDocument":{stamp}}}"#));
+        }
+        for (label, message, field) in [
+            ("object", "expectedDocument must be an object", "expectedDocument"),
+            ("fields", "expectedDocument requires only documentId and revision", "expectedDocument"),
+            ("revision", "revision must be a canonical decimal u64 string", "expectedDocument.revision"),
+            ("id", "documentId must be a valid ASCII Id of at most 128 bytes", "expectedDocument.documentId"),
+        ] {
+            let message = serde_json::to_string(message).unwrap();
+            let field = serde_json::to_string(field).unwrap();
+            let error = format!(r#"{{"code":"INVALID_REQUEST","message":{message},"retry":"never","details":{{"field":{field}}}}}"#);
+            guard_raw(p, &format!("guard-parser-refusal-{label}-control"), format!(r#"{{"ok":false,"error":{message},"errorDetails":{error}}}"#));
+            guard_raw(p, &format!("guard-parser-refusal-{label}-mcp"), format!(r#"{{"error":{error},"message":{message}}}"#));
+        }
+        let controls = [
+            (
+                "matching-execute",
+                r#"{"id":1,"method":"engine.execute","params":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+                r#"{"id":1,"ok":true,"result":{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}"#,
+            ),
+            (
+                "matching-batch",
+                r#"{"id":2,"method":"engine.batch","params":{"commands":[{"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},{"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}],"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+                r#"{"id":2,"ok":true,"result":{"completed":2,"results":[{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},{"name":"width","expression":"30 mm","value":30.0,"display_value":30.0,"recomputed":0,"restored":0,"errors":[]}],"undone":0},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}"#,
+            ),
+            (
+                "stale",
+                r#"{"id":3,"method":"engine.execute","params":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+                r#"{"id":3,"ok":false,"error":"The document changed before this write could apply.","errorDetails":{"code":"STALE_DOCUMENT","message":"The document changed before this write could apply.","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":{"documentId":"doc-A","revision":"9007199254740994"}}}}"#,
+            ),
+            (
+                "closed",
+                r#"{"id":4,"method":"engine.execute","params":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+                r#"{"id":4,"ok":false,"error":"stale","errorDetails":{"code":"STALE_DOCUMENT","message":"stale","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}}}"#,
+            ),
+            (
+                "unsupported",
+                r#"{"id":5,"method":"engine.execute","params":{"command":"file.new","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+                r#"{"id":5,"ok":false,"error":"This execution path does not support guarded requests.","errorDetails":{"code":"UNSUPPORTED_CAPABILITY","message":"This execution path does not support guarded requests.","retry":"never","details":{"capability":"file.new"}}}"#,
+            ),
+            (
+                "primitive-wrapper",
+                r#"{"id":6,"method":"engine.execute","params":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+                r#"{"id":6,"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}"#,
+            ),
+        ];
+        for (label, req, rep) in controls {
+            guard_raw(p, &format!("guard-control-{label}-request"), req.to_owned());
+            guard_raw(p, &format!("guard-control-{label}-reply"), rep.to_owned());
+            let request: Value = serde_json::from_str(req).unwrap();
+            let response: Value = serde_json::from_str(rep).unwrap();
+            let id = request["id"].as_u64().unwrap();
+            let arguments = req.split_once(",\"params\":").unwrap().1.strip_suffix('}').unwrap();
+            guard_raw(
+                p,
+                &format!("guard-mcp-{label}-request"),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{}","arguments":{arguments}}}}}"#,
+                    if label == "matching-batch" { "batch" } else { "execute" }
+                ),
+            );
+            let body = if response["ok"] == false {
+                format!(
+                    r#"{{"error":{},"message":{}}}"#,
+                    rep.split_once(",\"errorDetails\":").unwrap().1.strip_suffix('}').unwrap(),
+                    serde_json::to_string(&response["error"]).unwrap()
+                )
+            } else if label == "matching-batch" {
+                let parts = rep.split_once(",\"result\":").unwrap().1;
+                let (result, stamp) = parts.rsplit_once(",\"documentStamp\":").unwrap();
+                format!(
+                    r#"{{"ok":true,{},"documentStamp":{}}}"#,
+                    result.strip_prefix('{').unwrap().strip_suffix('}').unwrap(),
+                    stamp.strip_suffix('}').unwrap()
+                )
+            } else {
+                format!("{{{}}}", rep.split_once(",\"ok\":true,").unwrap().1.strip_suffix('}').unwrap())
+            };
+            guard_raw(p, &format!("guard-mcp-{label}-reply"), mcp_reply(id, &body, None, response["ok"] == false));
+        }
+        for (label, raw) in [
+            (
+                "original-request",
+                r#"{"id":31,"method":"engine.execute","params":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}"#,
+            ),
+            (
+                "initial-reply",
+                r#"{"id":31,"ok":false,"running":true,"error":"timeout: `engine.execute` (parameters.list) is still running in the app (it only reads: nothing changes); ask `control.pending` for its answer"}"#,
+            ),
+            ("request", r#"{"id":32,"method":"control.pending","params":{}}"#),
+            (
+                "reply",
+                r#"{"id":32,"ok":true,"result":{"pending":31,"method":"engine.execute","done":true,"reply":{"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":"18446744073709551615"}}}}"#,
+            ),
+        ] {
+            guard_raw(p, &format!("guard-control-pending-{label}"), raw.to_owned());
+        }
+        for (label, raw) in [
+            (
+                "success-primitive-sibling",
+                r#"{"id":31,"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":"18446744073709551615"}}"#,
+            ),
+            ("success-null-sibling", r#"{"ok":true,"result":null,"documentStamp":{"documentId":"doc-A","revision":"18446744073709551615"}}"#),
+            ("success-array-sibling", r#"{"ok":true,"result":[1,"x"],"documentStamp":{"documentId":"doc-A","revision":"18446744073709551615"}}"#),
+            ("missing-stamp", r#"{"ok":true,"result":7}"#),
+            ("numeric-stamp-revision", r#"{"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":18446744073709551615}}"#),
+            ("missing-result", r#"{"ok":true,"documentStamp":{"documentId":"doc-A","revision":"18446744073709551615"}}"#),
+            ("native-command-error", r#"{"ok":false,"error":"native command failed"}"#),
+        ] {
+            guard_raw(p, &format!("guard-decode-{label}"), raw.to_owned());
+        }
+        guard_raw(
+            p,
+            "guard-mcp-pending-request",
+            r#"{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"pending","arguments":{}}}"#.to_owned(),
+        );
+        guard_raw(p,"guard-mcp-pending-original-request",r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"execute","arguments":{"command":"parameters.list","expect":{"bodies":0},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}}"#.to_owned());
+        let body = r#"{"pending":"`engine.execute` (parameters.list)","done":true,"result":{"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}},"expectation":null,"note":"Tool-level expectation checks were not executed for this pending request; the original effect facts are retained."}"#;
+        guard_raw(p, "guard-mcp-pending-reply", mcp_reply(107, body, None, false));
+        guard_raw(p,"guard-mcp-expectation-failed-request",r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expect":{"bodies":1},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}}}}"#.to_owned());
+        let body = r#"{"result":{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"},"expectation":{"ok":false,"measured":{"volume_mm3":0.0,"bodies":0,"bbox":null},"expected":{"bodies":1},"mismatch":["bodies: measured 0, expected 1"]}}"#;
+        guard_raw(
+            p,
+            "guard-mcp-expectation-failed-reply",
+            mcp_reply(
+                8,
+                body,
+                Some(
+                    "expectation not met: bodies: measured 0, expected 1. The completed command's result and document stamp are retained; no rollback was attempted.",
+                ),
+                true,
+            ),
+        );
+    }
+    fn mcp_reply(id: u64, body: &str, note: Option<&str>, is_error: bool) -> String {
+        let v: Value = serde_json::from_str(body).unwrap();
+        let text = serde_json::to_string(&serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let prefix = note.map(|n| format!(r#"{{"type":"text","text":{}}},"#, serde_json::to_string(n).unwrap())).unwrap_or_default();
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{prefix}{{"type":"text","text":{text}}}],"structuredContent":{body}{}}}}}"#,
+            if is_error { ",\"isError\":true" } else { "" }
+        )
+    }
+    fn guard_adapter(name: &str, v: &Value, evaluator: &mut Evaluator) -> Check {
+        if let Some(index) = name.strip_prefix("guard-parser-").filter(|s| s.len() == 2) {
+            let expected = matches!(index, "01" | "02" | "03" | "04" | "41");
+            let stamp = &v["expectedDocument"];
+            require(serde_json::from_value::<DocumentStamp>(stamp.clone()).is_ok() == expected, format!("{name}: native stamp accept"))?;
+            require(evaluator.accepts("#/$defs/DocumentStamp", stamp)? == expected, format!("{name}: stamp shape accept"))?;
+            return Ok(());
+        }
+        // Raw control/MCP envelopes are NEVER passed to decode_frame or the Frame schema.
+        fn components(v: &Value, evaluator: &mut Evaluator, numeric_bad: bool) -> Check {
+            match v {
+                Value::Object(m) => {
+                    for (key, child) in m {
+                        if ["documentStamp", "expectedDocument"].contains(&key.as_str()) {
+                            let ok = serde_json::from_value::<DocumentStamp>(child.clone()).is_ok();
+                            require(ok != numeric_bad, "guarded stamp component acceptance")?;
+                            require(evaluator.accepts("#/$defs/DocumentStamp", child)? == ok, "guarded stamp schema/native disagreement")?;
+                        } else if key == "errorDetails" || (key == "error" && child.get("code").is_some()) {
+                            require(
+                                serde_json::from_value::<WireError>(child.clone()).is_ok() && evaluator.accepts("#/$defs/WireError", child)?,
+                                "guarded structured error component",
+                            )?;
+                        } else {
+                            components(child, evaluator, numeric_bad)?;
+                        }
+                    }
+                }
+                Value::Array(a) => {
+                    for child in a {
+                        components(child, evaluator, numeric_bad)?;
+                    }
+                }
+                _ => (),
+            }
+            Ok(())
+        }
+        components(v, evaluator, name == "guard-decode-numeric-stamp-revision")?;
+        if name == "guard-control-pending-reply" {
+            require(
+                v["id"] == 32 && v["result"]["pending"] == 31 && v["result"]["reply"].get("id").is_none() && v["result"]["reply"]["result"] == 7,
+                "raw pending outer identity/nested primitive carrier changed",
+            )?;
+        }
+        if name == "guard-control-pending-initial-reply" {
+            require(
+                v["running"] == true && v["error"].as_str().is_some_and(|s| s.ends_with("ask `control.pending` for its answer")),
+                "pending timeout truncated",
+            )?;
+        }
+        if name == "guard-mcp-expectation-failed-reply" {
+            require(
+                v["result"]["isError"] == true
+                    && v["result"]["structuredContent"]["expectation"]["ok"] == false
+                    && v["result"]["structuredContent"].get("documentStamp").is_some(),
+                "expectation failure lost applied stamp/effect facts",
+            )?;
+        }
+        if name == "guard-mcp-pending-reply" {
+            require(
+                v["id"] == 107 && v["result"]["structuredContent"]["expectation"].is_null() && v["result"]["structuredContent"]["done"] == true,
+                "MCP pending facts changed",
+            )?;
+        }
+        Ok(())
+    }
+    fn catalog(root: &Path) -> Check<Catalog> {
+        serde_json::from_slice(&read(root, "cases.json")?).map_err(|e| e.to_string())
+    }
+    pub fn fixture_agreement(root: &Path) -> Check {
+        let mut evaluator = Evaluator::new(root)?;
+        for c in catalog(root)?.cases {
+            if c.kind == "transcript" {
+                continue;
+            }
+            let raw = read(root, &c.path)?;
+            if let Some(schema) = &c.schema_ref {
+                let v: Value = serde_json::from_slice(&raw).map_err(|e| format!("{} parse: {e}", c.id))?;
+                require(
+                    evaluator.accepts(schema, &v)? == (c.shape_expected == "valid"),
+                    format!("{}: schema acceptance mismatch ({})", c.id, c.shape_expected),
+                )?;
+            } else {
+                require(c.shape_expected == "not_applicable", format!("{}: missing shape layer", c.id))?;
+            }
+            let (handling, code) = if c.kind == "data" {
+                let v: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+                let ok = if c.id.starts_with("guard-") {
+                    guard_adapter(&c.id, &v, &mut evaluator)?;
+                    true
+                } else if c.id.starts_with("native-stamp-") {
+                    let native = v["revision"].as_u64().ok_or("native revision lost")?;
+                    let stamp =
+                        document_stamp_from_native(v["document_id"].as_str().ok_or("native document id")?, native).map_err(|e| e.to_string())?;
+                    require(document_stamp_to_native(&stamp) == ("doc-A".to_owned(), native), "native stamp adapter lost identity")?;
+                    let decimal = native.to_string();
+                    require(serde_json::to_value(stamp).unwrap()["revision"].as_str() == Some(decimal.as_str()), "wire revision became numeric")?;
+                    true
+                } else {
+                    native_data(c.schema_ref.as_deref().unwrap().trim_start_matches("#/$defs/"), v)
+                };
+                (if ok { "accept" } else { "invalid_request" }, if ok { None } else { Some("INVALID_REQUEST".to_owned()) })
+            } else {
+                let phase = if c.phase == "bootstrap" { DecodePhase::Bootstrap } else { DecodePhase::Negotiated };
+                let sender = if c.sender == "host" { Sender::Host } else { Sender::Runtime };
+                match decode_frame(&raw, phase, sender, &Limits::default()) {
+                    Ok(DecodeResult::Frame(frame)) => {
+                        // Accepted raw values survive the actual wire encoder and genuine JCS comparison.
+                        let encoded = encode_frame(&frame, &Limits::default()).map_err(|e| e.to_string())?;
+                        let a: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+                        let b: Value = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
+                        require(
+                            mastra_canonical_bytes(&a)? == mastra_canonical_bytes(&b)?,
+                            format!("{}: serialization changed identity/value", c.id),
+                        )?;
+                        ("accept", None)
+                    }
+                    Ok(DecodeResult::RequestError { error, .. }) => {
+                        let code = serde_json::to_value(error.code).unwrap().as_str().unwrap().to_owned();
+                        (if error.code == ErrorCode::MethodNotFound { "method_not_found" } else { "invalid_request" }, Some(code))
+                    }
+                    Err(e) => ("transport_error", Some(serde_json::to_value(e.wire_error().code).unwrap().as_str().unwrap().to_owned())),
+                }
+            };
+            require(
+                handling == c.handling_expected && code == c.error_code,
+                format!("{}: handling {handling}/{code:?} != {}/{:?}", c.id, c.handling_expected, c.error_code),
+            )?;
+        }
+        Ok(())
+    }
+    fn safe_path(path: &str) -> Check {
+        require(
+            !path.is_empty() && !path.contains(['\\', '\0', ':']) && path.split('/').all(|s| !s.is_empty() && s != "." && s != ".."),
+            format!("unsafe bundle path {path:?}"),
+        )
+    }
+    fn inventory(root: &Path) -> Check<BTreeMap<String, Vec<u8>>> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> Check {
+            require(!std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?.file_type().is_symlink(), "symlink directory")?;
+            for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                require(!meta.file_type().is_symlink(), "symlink artifact")?;
+                if meta.is_dir() {
+                    walk(root, &path, out)?;
+                } else {
+                    require(meta.is_file(), "non-file artifact")?;
+                    let name = path.strip_prefix(root).map_err(|e| e.to_string())?.to_str().ok_or("non-UTF8 path")?.to_owned();
+                    safe_path(&name)?;
+                    if name != "manifest.json" {
+                        out.insert(name, std::fs::read(&path).map_err(|e| e.to_string())?);
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out)?;
+        Ok(out)
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Entry {
+        path: String,
+        size_bytes: u64,
+        digest: String,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Manifest {
+        schema_version: String,
+        protocol_version: String,
+        files: Vec<Entry>,
+    }
+    fn manifest(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+        bytes(
+            &serde_json::to_value(Manifest {
+                schema_version: "1.0".to_owned(),
+                protocol_version: "1.0".to_owned(),
+                files: files.iter().map(|(path, raw)| Entry { path: path.clone(), size_bytes: raw.len() as u64, digest: digest(raw) }).collect(),
+            })
+            .unwrap(),
+        )
+    }
+    pub fn manifest_agreement(root: &Path) -> Check {
+        let raw = read(root, "manifest.json")?;
+        let m: Manifest = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        require(m.schema_version == "1.0" && m.protocol_version == "1.0", "manifest version")?;
+        let files = inventory(root)?;
+        let mut previous: Option<&str> = None;
+        for e in &m.files {
+            safe_path(&e.path)?;
+            require(e.path != "manifest.json" && previous.is_none_or(|p| p.as_bytes() < e.path.as_bytes()), "duplicate/unsorted/self manifest path")?;
+            previous = Some(&e.path);
+            let raw = files.get(&e.path).ok_or_else(|| format!("missing manifest file {}", e.path))?;
+            require(raw.len() as u64 == e.size_bytes && digest(raw) == e.digest, format!("size/digest mismatch {}", e.path))?;
+        }
+        require(files.len() == m.files.len(), "extra/unlisted artifact")?;
+        require(raw == manifest(&files), "non-deterministic manifest encoding")?;
+        println!("bundle manifest {} ({} entries)", digest(&raw), m.files.len());
+        Ok(())
+    }
+    pub fn coverage_agreement(root: &Path) -> Check {
+        let c = catalog(root)?;
+        require(c.schema_version == "1.0" && !c.cases.is_empty(), "empty/wrong catalog")?;
+        let expected = plan();
+        require(value(root, "cases.json")? == expected.catalog(), "catalog missing/changed coverage")?;
+        for (path, raw) in &expected.files {
+            require(read(root, path)? == *raw, format!("changed exact corpus/transcript bytes: {path}"))?;
+        }
+        let mut seen = BTreeSet::new();
+        let mut last = "";
+        for case in &c.cases {
+            require(last.as_bytes() < case.id.as_bytes() && seen.insert(&case.path), "unsorted/duplicate case identity/path")?;
+            last = &case.id;
+            require(["frame", "data", "transcript", "bytes"].contains(&case.kind.as_str()), "unknown case kind")?;
+            require(["valid", "invalid", "not_applicable"].contains(&case.shape_expected.as_str()), "unknown shape expectation")?;
+            require(
+                ["accept", "invalid_request", "method_not_found", "transport_error", "transcript"].contains(&case.handling_expected.as_str()),
+                "unknown handling expectation",
+            )?;
+        }
+        for (method, _, _, _) in mastra_codec_catalog().0 {
+            for prefix in ["request-", "response-", "response-error-", "result-"] {
+                require(c.cases.iter().any(|c| c.id == format!("{prefix}{method}")), format!("missing {prefix}{method}"))?;
+            }
+        }
+        for (event, _, _) in mastra_codec_catalog().1 {
+            require(c.cases.iter().any(|c| c.id == format!("event-{event}")), format!("missing {event}"))?;
+        }
+        for code in error_codes() {
+            for branch in ["empty", "nonempty"] {
+                require(c.cases.iter().any(|c| c.id == format!("error-{code}-{branch}")), format!("missing {code}/{branch}"))?;
+            }
+        }
+        println!("catalog: {} distinct persisted cases (shape, byte and transcript layers remain separate)", c.cases.len());
+        Ok(())
+    }
+    pub fn record() -> Check {
+        require(std::env::var("SOLIDCRAFT_MASTRA_RECORD").as_deref() == Ok("1"), "record permission missing")?;
+        let root = mastra_bundle_path();
+        let p = plan();
+        let catalog = bytes(&p.catalog());
+        let mut files = p.files;
+        files.insert("cases.json".to_owned(), catalog);
+        files.insert("protocol.schema.json".to_owned(), bytes(&schema()));
+        files.insert("README.md".to_owned(), read(&root, "README.md")?);
+        if root.exists() {
+            for existing in inventory(&root)?.keys() {
+                require(files.contains_key(existing), format!("recorder refuses unowned artifact {existing}"))?;
+            }
+        }
+        for (path, raw) in &files {
+            safe_path(path)?;
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(target, raw).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(root.join("manifest.json"), manifest(&files)).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn id(s: &str) -> Id {
+        Id::parse(s).unwrap()
+    }
+    fn request(method: &str, request_id: &str, params: Value) -> Value {
+        let mut v = mastra_codec_request(method, params, request_id.starts_with("h:"));
+        v["requestId"] = json!(request_id);
+        v
+    }
+    fn reply(request_id: &str, method: &str, result: Value) -> Value {
+        json!({"protocolVersion":"1.0","kind":"response","scope":mastra_codec_scope(method),"requestId":request_id,"outcome":"ok","result":result})
+    }
+    fn send(v: Value, control: bool) -> Value {
+        json!({"action":"send","lane":if control {"control"}else{"data"},"frame":v})
+    }
+    fn finished(request_id: &str, method: &str, result: Value) -> Value {
+        json!({"action":"finished","requestId":request_id,"scope":mastra_codec_scope(method),"method":method,"result":result})
+    }
+    fn closed(reason: &str) -> Vec<Value> {
+        vec![
+            json!({"action":"close_turn","scope":mastra_codec_scope("turn.start"),"reason":reason}),
+            json!({"action":"turn_closed","scope":mastra_codec_scope("turn.start"),"cause":reason}),
+        ]
+    }
+    fn runtime_error(code: &str) -> Value {
+        json!({"code":code,"message":match code {"TIMEOUT"=>"Runtime request deadline expired.","CANCELLED"=>"Runtime request was cancelled.","RESOURCE_EXHAUSTED"=>"Runtime admission is full.",_=>"Runtime transport closed."},"retry":"never","details":{}})
+    }
+    fn error_reply(request_id: &str, method: &str, code: &str) -> Value {
+        json!({"protocolVersion":"1.0","kind":"response","scope":mastra_codec_scope(method),"requestId":request_id,"outcome":"error","error":runtime_error(code)})
+    }
+    struct Trace<'a> {
+        plan: &'a mut Plan,
+        id: &'static str,
+        limits: Limits,
+        steps: Vec<Value>,
+    }
+    impl Trace<'_> {
+        fn wire(&mut self, tag: &str, v: Value, actions: Vec<Value>) {
+            let path = format!("fixtures/valid/trace-{}-{:03}.ndjson", self.id, self.steps.len());
+            assert!(self.plan.files.insert(path.clone(), line(&v)).is_none());
+            self.steps.push(
+                json!({"tag":tag,"path":path,"phase":if v["method"]=="runtime.hello"||(v["kind"]=="response"&&v["requestId"]=="h:hello") {"bootstrap"}else{"negotiated"}}),
+            );
+            self.expect(actions);
+        }
+        fn expect(&mut self, actions: Vec<Value>) {
+            self.steps.push(json!({"tag":"expect_actions","actions":actions}));
+        }
+        fn complete(&mut self, op: &str, actions: Vec<Value>) {
+            self.steps.push(json!({"tag":"host_complete","operation":op}));
+            self.expect(actions);
+        }
+        fn prefix(&mut self, acknowledge_turn: bool) {
+            let catalog = mastra_codec_catalog().0;
+            let instance = if self.id == "reset-replacement" && !self.steps.is_empty() { "i2" } else { "i" };
+            let get = |name: &str| catalog.iter().find(|x| x.0 == name).unwrap();
+            let hello = request("runtime.hello", "h:hello", json!({"supportedVersions":["1.0"],"hostVersion":"1","limits":self.limits}));
+            self.wire("host_request", hello.clone(), vec![send(hello, false)]);
+            let mut hello_result = get("runtime.hello").2.clone();
+            hello_result["runtimeInstanceId"] = json!(instance);
+            hello_result["limits"] = json!(self.limits);
+            hello_result["capabilities"]["hostModelCalls"] = json!(true);
+            hello_result["capabilities"]["hostAgentTasks"] = json!(true);
+            self.wire(
+                "runtime_frame",
+                reply("h:hello", "runtime.hello", hello_result.clone()),
+                vec![finished("h:hello", "runtime.hello", hello_result)],
+            );
+            self.wire("runtime_frame",json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope("runtime.ready"),"sequence":1,"requestId":"h:hello","event":"runtime.ready","data":{"runtimeInstanceId":instance}}),vec![json!({"action":"ready","runtimeInstanceId":instance})]);
+            let session = request("session.start", "h:session", get("session.start").1.clone());
+            self.wire("host_request", session.clone(), vec![send(session, false)]);
+            self.wire(
+                "runtime_frame",
+                reply("h:session", "session.start", get("session.start").2.clone()),
+                vec![finished("h:session", "session.start", get("session.start").2.clone())],
+            );
+            let turn = request("turn.start", "h:turn", get("turn.start").1.clone());
+            self.wire("host_request", turn.clone(), vec![send(turn, false)]);
+            if acknowledge_turn {
+                self.wire(
+                    "runtime_frame",
+                    reply("h:turn", "turn.start", json!({"state":"accepted"})),
+                    vec![finished("h:turn", "turn.start", json!({"state":"accepted"}))],
+                );
+            }
+        }
+        fn callback(&mut self, name: &str, request_id: &str) {
+            let params = mastra_codec_catalog().0.into_iter().find(|x| x.0 == name).unwrap().1;
+            self.wire(
+                "runtime_frame",
+                request(name, request_id, params.clone()),
+                vec![json!({"action":"dispatch","scope":mastra_codec_scope(name),"method":name,"params":params,"deadlineMs":1000,"cancelled":false})],
+            );
+        }
+        fn callback_finish(&mut self, name: &str, request_id: &str, expect: bool) {
+            let result = mastra_codec_catalog().0.into_iter().find(|x| x.0 == name).unwrap().2;
+            let path = format!("fixtures/valid/trace-{}-reply-{}.json", self.id, self.steps.len());
+            self.plan.files.insert(path.clone(), bytes(&result));
+            self.steps.push(json!({"tag":"host_complete","operation":"callback","requestId":request_id,"path":path}));
+            self.expect(if expect { vec![send(reply(request_id, name, result), false)] } else { vec![] });
+        }
+        fn tick(&mut self, ms: u64, actions: Vec<Value>) {
+            self.steps.push(json!({"tag":"advance_ms","milliseconds":ms}));
+            self.expect(actions);
+        }
+        fn finish(self) {
+            let path = format!("transcripts/{}.json", self.id);
+            let v = json!({"schemaVersion":"1.0","id":self.id,"initialLimits":self.limits,"steps":self.steps});
+            self.plan.raw(&format!("transcript-{}", self.id), &path, bytes(&v), "transcript", None, "not_applicable", "transcript", None, true);
+        }
+    }
+    fn fatal_actions(pending: Option<&str>) -> Vec<Value> {
+        let mut a = vec![
+            json!({"action":"close_turn","scope":mastra_codec_scope("turn.start"),"reason":"TransportLoss"}),
+            json!({"action":"retire_session","sessionId":"s"}),
+            json!({"action":"turn_closed","scope":mastra_codec_scope("turn.start"),"cause":"TransportLoss"}),
+        ];
+        if let Some(id) = pending {
+            a.push(json!({"action":"finished","requestId":id,"scope":mastra_codec_scope("turn.start"),"error":"TRANSPORT_ERROR"}));
+        }
+        a.extend([json!({"action":"transport_closed","cause":"TRANSPORT_ERROR"}), json!({"action":"stop_tree"})]);
+        a
+    }
+    fn transcript_plan(p: &mut Plan) {
+        let mut t = Trace { plan: p, id: "nested-callback", limits: Limits::default(), steps: vec![] };
+        t.prefix(false);
+        t.callback("model.generate", "r:call");
+        t.callback_finish("model.generate", "r:call", true);
+        t.wire(
+            "runtime_frame",
+            reply("h:turn", "turn.start", json!({"state":"accepted"})),
+            vec![finished("h:turn", "turn.start", json!({"state":"accepted"}))],
+        );
+        t.finish();
+        let mut t = Trace { plan: p, id: "cancel-late-terminal", limits: Limits::default(), steps: vec![] };
+        t.prefix(true);
+        let cancel = request("turn.cancel", "h:cancel", json!({"reason":"user"}));
+        let mut a = closed("User");
+        a.push(send(cancel.clone(), true));
+        t.wire("host_request", cancel, a);
+        for sequence in [2, 3] {
+            t.wire("runtime_frame",json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope("turn.start"),"sequence":sequence,"requestId":"h:turn","event":"turn.finished","data":{"state":"validated_success","reason":"runtime proposal is not host acceptance","document":{"documentId":"d","revision":"18446744073709551615"},"changes":"unknown","validationRunId":null,"report":null}}),vec![]);
+        }
+        t.wire(
+            "runtime_frame",
+            reply("h:cancel", "turn.cancel", json!({"state":"cancelling"})),
+            vec![finished("h:cancel", "turn.cancel", json!({"state":"cancelling"}))],
+        );
+        t.tick(5000, vec![]);
+        t.finish();
+        let mut t = Trace { plan: p, id: "eof-once", limits: Limits::default(), steps: vec![] };
+        t.prefix(false);
+        t.callback("agent.run", "r:call");
+        t.complete("eof", fatal_actions(Some("h:turn")));
+        t.callback_finish("agent.run", "r:call", false);
+        t.complete("eof", vec![]);
+        t.finish();
+        let mut t = Trace { plan: p, id: "callback-timeout", limits: Limits::default(), steps: vec![] };
+        t.prefix(true);
+        t.callback("model.generate", "r:call");
+        t.tick(999, vec![]);
+        t.tick(1, vec![send(error_reply("r:call", "model.generate", "TIMEOUT"), false)]);
+        t.callback_finish("model.generate", "r:call", false);
+        t.finish();
+        let mut t = Trace { plan: p, id: "backpressure-control", limits: Limits { pending_requests: 1, ..Limits::default() }, steps: vec![] };
+        t.prefix(true);
+        t.callback("model.generate", "r:call");
+        let params = mastra_codec_catalog().0.into_iter().find(|x| x.0 == "model.generate").unwrap().1;
+        t.wire(
+            "runtime_frame",
+            request("model.generate", "r:busy", params),
+            vec![send(error_reply("r:busy", "model.generate", "RESOURCE_EXHAUSTED"), false)],
+        );
+        t.wire(
+            "runtime_frame",
+            request("request.cancel", "r:cancel", json!({"targetRequestId":"r:call"})),
+            vec![
+                send(error_reply("r:call", "model.generate", "CANCELLED"), false),
+                send(reply("r:cancel", "request.cancel", json!({"state":"terminal"})), true),
+            ],
+        );
+        t.callback_finish("model.generate", "r:call", false);
+        t.finish();
+        let mut t = Trace { plan: p, id: "reset-replacement", limits: Limits::default(), steps: vec![] };
+        t.prefix(true);
+        t.callback("agent.run", "r:call");
+        let reset = request("session.reset", "h:reset", json!({"nextSessionId":"next","instructions":"reset"}));
+        let mut a = closed("Reset");
+        a.insert(1, json!({"action":"retire_session","sessionId":"s"}));
+        a.push(send(error_reply("r:call", "agent.run", "CANCELLED"), false));
+        a.push(send(reset.clone(), false));
+        t.wire("host_request", reset, a);
+        t.steps.push(json!({"tag":"host_complete","operation":"replace","generation":"g2"}));
+        t.expect(vec![]);
+        t.callback_finish("agent.run", "r:call", false);
+        let late = reply("h:turn", "turn.start", json!({"state":"accepted"}));
+        let path = "fixtures/valid/trace-reset-old-generation.ndjson";
+        t.plan.files.insert(path.to_owned(), line(&late));
+        t.steps.push(json!({"tag":"runtime_frame","path":path,"generation":"g","phase":"negotiated"}));
+        t.expect(vec![]);
+        t.prefix(true);
+        let path = "fixtures/valid/trace-retired-permission.json";
+        t.plan.files.insert(path.to_owned(),bytes(&json!({"agentSessionId":"old-agent","kind":"permission","content":{"permissionId":"old-permission","title":"Retired","state":"waiting"}})));
+        t.steps.push(json!({"tag":"host_complete","operation":"progress","requestId":"r:call","path":path}));
+        t.expect(vec![]);
+        t.finish();
+        let mut t = Trace { plan: p, id: "method-neutral-correlation", limits: Limits::default(), steps: vec![] };
+        t.prefix(false);
+        t.wire("runtime_frame", reply("h:turn", "turn.start", json!({"state":"cancelling"})), fatal_actions(Some("h:turn")));
+        t.finish();
+        let mut t = Trace { plan: p, id: "strict-input-flood", limits: Limits::default(), steps: vec![] };
+        t.prefix(true);
+        t.steps.push(json!({"tag":"runtime_frame","path":"fixtures/invalid/bytes-no-lf.bin","phase":"negotiated"}));
+        t.expect(fatal_actions(None));
+        t.finish();
+        let mut t = Trace { plan: p, id: "cancel-coalescing-deadline", limits: Limits::default(), steps: vec![] };
+        t.prefix(true);
+        let cancel = request("turn.cancel", "h:cancel", json!({"reason":"user"}));
+        let mut a = closed("User");
+        a.push(send(cancel.clone(), true));
+        t.wire("host_request", cancel, a);
+        t.wire(
+            "host_request",
+            request("turn.cancel", "h:again", json!({"reason":"user"})),
+            vec![json!({"action":"coalesced","requestId":"h:again","existingRequestId":"h:cancel"})],
+        );
+        t.tick(4999, vec![]);
+        t.tick(
+            1,
+            vec![
+                json!({"action":"retire_session","sessionId":"s"}),
+                json!({"action":"finished","requestId":"h:cancel","scope":mastra_codec_scope("turn.cancel"),"error":"TIMEOUT"}),
+                json!({"action":"stop_tree"}),
+            ],
+        );
+        t.tick(3000, vec![json!({"action":"transport_closed","cause":"TRANSPORT_ERROR"})]);
+        t.tick(1, vec![]);
+        t.finish();
+        let mut t = Trace { plan: p, id: "turn-wall-deadline", limits: Limits::default(), steps: vec![] };
+        t.prefix(true);
+        t.tick(1200000, closed("Deadline"));
+        t.finish();
+    }
+    fn host_call_value(call: &HostCall) -> Value {
+        match call {
+            HostCall::ConnectionDescribe(x) => json!(x),
+            HostCall::ModelGenerate(x) => json!(x),
+            HostCall::AgentRun(x) => json!(x),
+            HostCall::ValidationSubmit(x) => json!(x),
+            HostCall::ValidationStatus(x) => json!(x),
+            HostCall::ValidationReport(x) => json!(x),
+            HostCall::ValidationCancel(x) => json!(x),
+        }
+    }
+    fn runtime_reply_value(reply: &RuntimeReply) -> Value {
+        match reply {
+            RuntimeReply::RuntimeHello(x) => json!(x),
+            RuntimeReply::SessionStart(x) => json!(x),
+            RuntimeReply::TurnStart(x) => json!(x),
+            RuntimeReply::TurnCancel(x) => json!(x),
+            RuntimeReply::RequestCancel(x) => json!(x),
+            RuntimeReply::SessionReset(x) => json!(x),
+            RuntimeReply::RuntimeShutdown(x) => json!(x),
+        }
+    }
+    fn summary(a: &MachineAction, start: Instant) -> Value {
+        match a {
+            MachineAction::Send { bytes, lane, .. } => {
+                send(serde_json::from_slice(bytes).unwrap(), matches!(lane, super::super::process::PipeLane::Control))
+            }
+            MachineAction::Dispatch(c) => {
+                json!({"action":"dispatch","scope":c.scope,"method":c.call.method(),"params":host_call_value(&c.call),"deadlineMs":c.deadline.duration_since(start).as_millis() as u64,"cancelled":c.cancellation.is_cancelled()})
+            }
+            MachineAction::CloseTurn { scope, reason } => {
+                json!({"action":"close_turn","scope":Scope::Turn(scope.clone()),"reason":format!("{reason:?}")})
+            }
+            MachineAction::RetireSession(id) => json!({"action":"retire_session","sessionId":id}),
+            MachineAction::StopTree => json!({"action":"stop_tree"}),
+            MachineAction::Rejected { request_id, error } => json!({"action":"rejected","requestId":request_id,"error":error.code}),
+            MachineAction::Coalesced { request_id, existing_request_id } => {
+                json!({"action":"coalesced","requestId":request_id,"existingRequestId":existing_request_id})
+            }
+            MachineAction::Notice { notice, .. } => match notice.as_ref() {
+                ClientNotice::RuntimeReady(i) => json!({"action":"ready","runtimeInstanceId":i.runtime_instance_id}),
+                ClientNotice::RequestFinished { request_id, scope, result } => match result {
+                    Ok(r) => json!({"action":"finished","requestId":request_id,"scope":scope,"method":r.method(),"result":runtime_reply_value(r)}),
+                    Err(e) => json!({"action":"finished","requestId":request_id,"scope":scope,"error":e.code}),
+                },
+                ClientNotice::TurnClosed { scope, cause } => {
+                    json!({"action":"turn_closed","scope":Scope::Turn(scope.clone()),"cause":format!("{cause:?}")})
+                }
+                ClientNotice::TransportClosed { cause, .. } => {
+                    json!({"action":"transport_closed","cause":match cause {TransportCause::ExpectedEof=>"expected_eof",TransportCause::Error(_)=>"TRANSPORT_ERROR"}})
+                }
+                ClientNotice::TurnFinishedProposal { scope, proposal } => json!({"action":"proposal","scope":scope,"proposal":proposal}),
+                ClientNotice::Event { scope, event } => json!({"action":"event","scope":scope,"event":event.method()}),
+            },
+        }
+    }
+    fn machine(generation: &Id, limits: Limits, now: Instant) -> Check<RuntimeMachine> {
+        let mut m = RuntimeMachine::new(generation.clone(), limits, now).map_err(|e| format!("{e:?}"))?;
+        require(
+            m.apply(
+                MachineInput::Services {
+                    generation: generation.clone(),
+                    services: ServiceCapabilities {
+                        connection_describe: true,
+                        model_generate: true,
+                        agent_run: true,
+                        validation: true,
+                        streaming: false,
+                    },
+                },
+                now,
+            )
+            .is_empty(),
+            "unexpected initial services actions",
+        )?;
+        Ok(m)
+    }
+    fn replay(root: &Path, path: &str) -> Check {
+        let trace = value(root, path)?;
+        require(
+            trace.as_object().is_some_and(|m| m.len() == 4) && trace["schemaVersion"] == "1.0" && trace["id"].is_string(),
+            "invalid transcript envelope",
+        )?;
+        let limits: Limits = serde_json::from_value(trace["initialLimits"].clone()).map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        let mut now = start;
+        let mut generation = id("g");
+        let mut m = machine(&generation, limits.clone(), now)?;
+        let mut pending = Vec::<MachineAction>::new();
+        let mut tokens = BTreeMap::<String, (CallbackToken, String)>::new();
+        let steps = trace["steps"].as_array().ok_or("transcript steps")?;
+        require(!steps.is_empty(), "empty transcript")?;
+        for (i, step) in steps.iter().enumerate() {
+            let generation_input = step["generation"].as_str().map(id).unwrap_or_else(|| generation.clone());
+            let actions = match step["tag"].as_str().ok_or("step tag")? {
+                "expect_actions" => {
+                    let actual = json!(pending.iter().map(|a| summary(a, start)).collect::<Vec<_>>());
+                    require(actual == step["actions"], format!("{path} step {i}:\nactual {actual}\nexpected {}", step["actions"]))?;
+                    for action in pending.drain(..) {
+                        let release = match action {
+                            MachineAction::Send { ticket, .. } => Some(MachineInput::Written { generation: generation.clone(), ticket }),
+                            MachineAction::Notice { ticket, .. } => Some(MachineInput::NoticeConsumed { generation: generation.clone(), ticket }),
+                            _ => None,
+                        };
+                        if let Some(input) = release {
+                            require(m.apply(input, now).is_empty(), "release generated unaccounted actions")?;
+                        }
+                    }
+                    vec![]
+                }
+                "advance_ms" => {
+                    now = now.checked_add(Duration::from_millis(step["milliseconds"].as_u64().ok_or("milliseconds")?)).ok_or("clock overflow")?;
+                    m.apply(MachineInput::Tick, now)
+                }
+                "host_request" | "runtime_frame" => {
+                    let raw = read(root, step["path"].as_str().ok_or("frame path")?)?;
+                    let host = step["tag"] == "host_request";
+                    let phase = if step["phase"] == "bootstrap" { DecodePhase::Bootstrap } else { DecodePhase::Negotiated };
+                    if host {
+                        let DecodeResult::Frame(Frame::Request { header, body: RequestBody::Host(request) }) =
+                            decode_frame(&raw, phase, Sender::Host, &limits).map_err(|e| e.to_string())?
+                        else {
+                            return Err("not a typed host request".to_owned());
+                        };
+                        m.apply(
+                            MachineInput::Submit {
+                                generation: generation_input,
+                                request_id: header.request_id,
+                                scope: header.scope,
+                                request,
+                                deadline: now + Duration::from_secs(300),
+                            },
+                            now,
+                        )
+                    } else {
+                        let decoded = decode_frame(&raw, phase, Sender::Runtime, &limits);
+                        let request_id = serde_json::from_slice::<Value>(&raw).ok().and_then(|v| v["requestId"].as_str().map(str::to_owned));
+                        let a = match decoded {
+                            Ok(decoded) => {
+                                m.apply(MachineInput::Peer { generation: generation_input.clone(), sender: Sender::Runtime, decoded }, now)
+                            }
+                            Err(_) => m.apply(MachineInput::InputFailed { generation: generation_input }, now),
+                        };
+                        for action in &a {
+                            if let MachineAction::Dispatch(c) = action {
+                                tokens.insert(request_id.clone().ok_or("callback identity")?, (c.token.clone(), c.call.method().to_owned()));
+                            }
+                        }
+                        a
+                    }
+                }
+                "host_complete" => match step["operation"].as_str().ok_or("completion operation")? {
+                    "callback" => {
+                        let (token, method) = tokens.get(step["requestId"].as_str().ok_or("completion identity")?).ok_or("unknown callback token")?;
+                        let result = decode_host_reply(method, value(root, step["path"].as_str().ok_or("reply path")?)?, &limits)
+                            .map_err(|e| e.to_string())?;
+                        m.apply(MachineInput::CallbackFinished { token: token.clone(), result: Box::new(Ok(result)) }, now)
+                    }
+                    "progress" => {
+                        let (token, _) = tokens.get(step["requestId"].as_str().ok_or("progress identity")?).ok_or("unknown progress token")?;
+                        let event: AgentProgress =
+                            serde_json::from_value(value(root, step["path"].as_str().ok_or("progress path")?)?).map_err(|e| e.to_string())?;
+                        m.apply(MachineInput::Progress { token: token.clone(), event: CallProgress::AgentProgress(event) }, now)
+                    }
+                    "eof" => m.apply(MachineInput::Eof { generation: generation_input, stderr_tail: vec![] }, now),
+                    "replace" => {
+                        require(pending.is_empty(), "replacement with unconsumed actions")?;
+                        generation = step["generation"].as_str().map(id).ok_or("replacement generation")?;
+                        m = machine(&generation, limits.clone(), now)?;
+                        vec![]
+                    }
+                    _ => return Err("unknown completion operation".to_owned()),
+                },
+                _ => return Err("unknown transcript tag".to_owned()),
+            };
+            pending.extend(actions);
+        }
+        require(pending.is_empty(), "transcript ends with unverified actions")
+    }
+    pub fn transcript_agreement(root: &Path) -> Check {
+        let traces = catalog(root)?.cases.into_iter().filter(|c| c.kind == "transcript").collect::<Vec<_>>();
+        require(!traces.is_empty(), "no actual-machine transcripts")?;
+        let failures = traces.iter().filter_map(|t| replay(root, &t.path).err()).collect::<Vec<_>>();
+        require(failures.is_empty(), failures.join("\n\n"))
+    }
+    pub fn contract_review() -> Check {
+        let p = plan();
+        let root = schema();
+        local_refs(&root, &root)?;
+        let mut eval = Evaluator { root, validators: HashMap::new() };
+        for c in p.cases.values() {
+            if let Some(schema) = &c.schema_ref {
+                let v: Value = serde_json::from_slice(&p.files[&c.path]).map_err(|e| format!("{}: {e}", c.id))?;
+                require(eval.accepts(schema, &v)? == (c.shape_expected == "valid"), format!("intended shape {} != {}", c.id, c.shape_expected))?;
+            }
+        }
+        println!(
+            "Reviewed generated contract: {} persisted cases, {} files; Draft2020-12 evaluator with offline/local refs",
+            p.cases.len(),
+            p.files.len()
+        );
+        Ok(())
+    }
+    struct TempBundle(PathBuf);
+    impl TempBundle {
+        fn copy() -> Check<Self> {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "solidcraft-mastra-bundle-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+            let owner = Self(root);
+            let mut files = inventory(&mastra_bundle_path())?;
+            files.insert("manifest.json".to_owned(), read(&mastra_bundle_path(), "manifest.json")?);
+            for (path, raw) in files {
+                let target = owner.0.join(path);
+                std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+                std::fs::write(target, raw).map_err(|e| e.to_string())?;
+            }
+            Ok(owner)
+        }
+        fn write(&self, path: &str, v: &Value) -> Check {
+            std::fs::write(self.0.join(path), bytes(v)).map_err(|e| e.to_string())
+        }
+        fn reseal(&self) -> Check {
+            std::fs::write(self.0.join("manifest.json"), manifest(&inventory(&self.0)?)).map_err(|e| e.to_string())
+        }
+    }
+    impl Drop for TempBundle {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("owned temp bundle cleanup {}: {e}", self.0.display());
+            }
+        }
+    }
+    pub fn mutations() -> Check {
+        for mutation in ["add", "omit", "change", "digest", "unsafe", "duplicate"] {
+            let t = TempBundle::copy()?;
+            match mutation {
+                "add" => std::fs::write(t.0.join("extra.json"), b"{}".as_slice()).map_err(|e| e.to_string())?,
+                "omit" => std::fs::remove_file(t.0.join("fixtures/valid/document-stamp-unsafe-js.json")).map_err(|e| e.to_string())?,
+                "change" => std::fs::write(t.0.join("fixtures/valid/document-stamp-unsafe-js.json"), b"{}".as_slice()).map_err(|e| e.to_string())?,
+                name => {
+                    let mut m = value(&t.0, "manifest.json")?;
+                    match name {
+                        "digest" => m["files"][0]["digest"] = json!(format!("sha256:{}", "0".repeat(64))),
+                        "unsafe" => m["files"][0]["path"] = json!("../escape"),
+                        "duplicate" => {
+                            let duplicate = m["files"][0].clone();
+                            m["files"].as_array_mut().unwrap().insert(0, duplicate);
+                        }
+                        _ => return Err("unknown manifest mutation".to_owned()),
+                    };
+                    t.write("manifest.json", &m)?;
+                }
+            }
+            require(manifest_agreement(&t.0).is_err(), format!("manifest mutation accepted: {mutation}"))?;
+        }
+        #[cfg(unix)]
+        {
+            let t = TempBundle::copy()?;
+            std::os::unix::fs::symlink(t.0.join("README.md"), t.0.join("alias.json")).map_err(|e| e.to_string())?;
+            require(manifest_agreement(&t.0).is_err(), "symlink accepted")?;
+        }
+        let t = TempBundle::copy()?;
+        let path = "transcripts/cancel-late-terminal.json";
+        replay(&t.0, path)?;
+        let mut trace = value(&t.0, path)?;
+        let mut changed = false;
+        for step in trace["steps"].as_array_mut().unwrap() {
+            if let Some(actions) = step.get_mut("actions").and_then(Value::as_array_mut) {
+                for action in actions {
+                    if action["action"] == "turn_closed" {
+                        action["cause"] = json!("TerminalProposal");
+                        changed = true;
+                    }
+                }
+            }
+        }
+        require(changed, "terminal mutation did not target a real assertion")?;
+        t.write(path, &trace)?;
+        t.reseal()?;
+        manifest_agreement(&t.0)?;
+        require(replay(&t.0, path).is_err(), "re-sealed false terminal transcript accepted")?;
+        let t = TempBundle::copy()?;
+        fixture_agreement(&t.0)?;
+        t.write("fixtures/valid/document-stamp-unsafe-js.json", &json!({"documentId":"doc-A","revision":9_007_199_254_740_993_u64}))?;
+        t.reseal()?;
+        manifest_agreement(&t.0)?;
+        require(fixture_agreement(&t.0).is_err(), "re-sealed numeric revision accepted")?;
+        Ok(())
+    }
+}
+
+type MastraEventCase = (String, Value, bool);
+fn mastra_codec_catalog() -> (Vec<MastraMethodCase>, Vec<MastraEventCase>) {
+    let artifact = json!({"artifactId":"a","digest":format!("sha256:{}", "0".repeat(64)),"sizeBytes":1,"mediaType":"application/json"});
+    let document = json!({"documentId":"d","revision":"18446744073709551615"});
+    let profile = json!({"profileId":"p","version":"1","digest":artifact["digest"]});
+    let candidate =
+        json!({"candidateId":"c","source":document,"candidateDigest":artifact["digest"],"manifestDigest":artifact["digest"],"artifact":artifact});
+    let capabilities = json!({"modelGenerate":false,"agentRun":false,"tools":false,"images":false,"documents":false,"structuredOutput":false,"modelSelection":false,"usage":false,"delivery":"buffered"});
+    let report = json!({"schemaVersion":"1.0","runId":"v","candidateId":"c","candidateDigest":artifact["digest"],"manifestDigest":artifact["digest"],"profile":profile,"runner":{"runnerId":"r","version":"1","engineVersion":"1"},"state":"cancelled","startedAt":null,"finishedAt":"2026-11-05T12:00:00.000Z","checks":[],"error":null});
+    let text = json!([{"type":"text","text":"hi"}]);
+    let methods = vec![
+        ("runtime.hello", json!({"supportedVersions":["1.0"],"hostVersion":"1","limits":super::mastra_protocol::Limits::default()}), json!({"selectedVersion":"1.0","runtimeInstanceId":"i","runtimeVersion":"1","capabilities":{"workflowIds":["w"],"hostModelCalls":false,"hostAgentTasks":false,"guardedExecute":false,"guardedBatch":false,"snapshotValidation":false},"limits":super::mastra_protocol::Limits::default()}), true),
+        ("session.start", json!({"workflowId":"w","instructions":"hi","bridge":null}), json!({"state":"ready","workflowId":"w"}), true),
+        ("turn.start", json!({"binding":{"workflowId":"w","connectionId":"c","modelId":"m","document":document,"profile":profile},"parts":text,"context":{"selection":[{"x":-1.25,"large":9007199254740992_u64}],"requirements":null},"budgets":super::mastra_protocol::Budgets::default()}), json!({"state":"accepted"}), true),
+        ("turn.cancel", json!({"reason":"user"}), json!({"state":"cancelling"}), true),
+        ("request.cancel", json!({"targetRequestId":"h:"}), json!({"state":"terminal"}), true),
+        ("session.reset", json!({"nextSessionId":"next","instructions":"hi"}), json!({"state":"ready","sessionId":"next"}), true),
+        ("runtime.shutdown", json!({"reason":"app_exit"}), json!({"state":"stopping"}), true),
+        ("connection.describe", json!({"connectionId":"c","modelId":"m"}), json!({"state":"available","capabilities":capabilities,"authMethods":[]}), false),
+        ("model.generate", json!({"connectionId":"c","modelId":"m","messages":[{"role":"user","content":text,"toolCalls":[],"toolCallId":null}],"tools":[{"name":"measure","description":"exact","inputSchema":{"type":"object","properties":{"x":{"minimum":-1.25}}}}],"options":{"delivery":"buffered","timeoutSeconds":1,"maxOutputTokens":null,"temperature":null,"reasoningEffort":null,"outputSchema":null},"continuation":null}), json!({"content":text,"toolCalls":[{"id":"call","name":"measure","arguments":{"x":-1.25,"n":9007199254740992_u64}}],"finishReason":"tool_calls","usage":null,"continuation":null,"delivery":"buffered"}), false),
+        ("agent.run", json!({"connectionId":"c","modelId":"m","task":text,"context":{"document":document,"requirements":null,"delegationMode":"proposal_only"},"timeoutSeconds":1}), json!({"agentSessionId":"as","state":"completed","content":text,"stopReason":"stop","usage":null}), false),
+        ("validation.submit", json!({"candidate":candidate,"profile":profile,"requestId":"1793876400000:12345678-1234-4234-8234-123456789abc"}), json!({"runId":"v","state":"queued","candidate":candidate,"profile":profile}), false),
+        ("validation.status", json!({"runId":"v"}), json!({"runId":"v","state":"running","candidate":candidate,"profile":profile,"updatedAt":"2026-11-05T12:00:00.000Z","reportAvailable":false}), false),
+        ("validation.report", json!({"runId":"v"}), json!({"report":report,"reference":artifact}), false),
+        ("validation.cancel", json!({"runId":"v"}), json!({"runId":"v","state":"cancelled"}), false),
+    ].into_iter().map(|(m,p,r,h)| (m.to_owned(),p,r,h)).collect();
+    let events = vec![
+        ("runtime.ready", json!({"runtimeInstanceId":"i"}), false),
+        (
+            "connection.state",
+            json!({"connectionId":"c","state":"auth_required","authMethods":[{"id":"sign-in","name":"Sign in","description":"Host UI"}]}),
+            true,
+        ),
+        ("workflow.stage", json!({"stageId":"s","title":"Build","state":"running"}), false),
+        ("workflow.text", json!({"text":"hello","channel":"answer"}), false),
+        ("workflow.plan", json!({"steps":[{"id":"s","title":"Build","state":"pending"}]}), false),
+        ("workflow.tool", json!({"callId":"c","name":"measure","state":"completed","output":null}), false),
+        (
+            "agent.progress",
+            json!({"agentSessionId":"as","kind":"permission","content":{"permissionId":"p","title":"Allow?","state":"waiting"}}),
+            true,
+        ),
+        ("model.delta", json!({"index":0,"text":"hello"}), true),
+        (
+            "turn.finished",
+            json!({"state":"cancelled","reason":"user","document":document,"changes":"unknown","validationRunId":null,"report":null}),
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(e, d, h)| (e.to_owned(), d, h))
+    .collect();
+    (methods, events)
+}
+
+fn mastra_codec_scope(method: &str) -> Value {
+    match method {
+        "runtime.hello" | "runtime.shutdown" | "runtime.ready" => json!({"sessionId":null,"turnId":null,"workflowRunId":null}),
+        "session.start" | "session.reset" | "connection.describe" => json!({"sessionId":"s","turnId":null,"workflowRunId":null}),
+        _ => json!({"sessionId":"s","turnId":"t","workflowRunId":"w"}),
+    }
+}
+
+fn mastra_codec_request(method: &str, params: Value, host: bool) -> Value {
+    json!({"protocolVersion":"1.0","kind":"request","scope":mastra_codec_scope(method),"requestId":if host {"h:"} else {"r:"},"method":method,"params":params})
+}
+
+fn mastra_codec_decode(value: &Value, host: bool) -> Result<super::mastra_protocol::DecodeResult, super::mastra_protocol::ProtocolViolation> {
+    use super::mastra_protocol::*;
+    decode_frame(format!("{value}\n").as_bytes(), DecodePhase::Negotiated, if host { Sender::Host } else { Sender::Runtime }, &Limits::default())
+}
+
+// Mutation caught: accepting serde's duplicate-key collapse, or missing == nullable.
+#[test]
+fn mastra_codec_duplicate_keys_and_required_nulls() {
+    use super::mastra_protocol::*;
+    let (methods, events) = mastra_codec_catalog();
+    let good = mastra_codec_request("turn.cancel", json!({"reason":"user"}), true);
+    let raw = good.to_string();
+    for text in [
+        raw.replacen('{', "{\"kind\":\"request\",", 1),
+        raw.replacen("\"params\":{", "\"params\":{\"reason\":\"user\",", 1),
+        raw.replacen('{', "{\"extensions\":{\"x\":{\"z\":1,\"z\":2}},", 1),
+        raw.replacen('{', "{\"extensions\":{\"x\":1,\"\\u0078\":2},", 1),
+    ] {
+        assert!(
+            decode_frame(format!("{text}\n").as_bytes(), DecodePhase::Negotiated, Sender::Host, &Limits::default()).is_err(),
+            "duplicate accepted: {text}"
+        );
+    }
+    let model = &methods.iter().find(|m| m.0 == "model.generate").unwrap().1;
+    let mut request = mastra_codec_request("model.generate", model.clone(), false);
+    request["params"]["messages"][0]["role"] = json!("assistant");
+    request["params"]["messages"][0]["toolCalls"] = json!([{"id":"c","name":"m","arguments":{"x":1}}]);
+    let duplicate = request.to_string().replace("\"arguments\":{\"x\":1}", "\"arguments\":{\"x\":1,\"x\":2}");
+    assert!(decode_frame(format!("{duplicate}\n").as_bytes(), DecodePhase::Negotiated, Sender::Runtime, &Limits::default()).is_err());
+    fn remove_nulls(value: &Value) -> Vec<Value> {
+        let mut cases = Vec::new();
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if child.is_null() {
+                        let mut changed = value.clone();
+                        changed.as_object_mut().unwrap().remove(key);
+                        cases.push(changed);
+                    }
+                    for nested in remove_nulls(child) {
+                        let mut changed = value.clone();
+                        changed[key] = nested;
+                        cases.push(changed);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    for nested in remove_nulls(child) {
+                        let mut changed = value.clone();
+                        changed[i] = nested;
+                        cases.push(changed);
+                    }
+                }
+            }
+            _ => (),
+        }
+        cases
+    }
+    for (method, params, result, host) in methods {
+        let request = mastra_codec_request(&method, params, host);
+        assert!(matches!(mastra_codec_decode(&request, host), Ok(DecodeResult::Frame(_))), "valid {method}");
+        for missing in remove_nulls(&request) {
+            assert!(!matches!(mastra_codec_decode(&missing, host), Ok(DecodeResult::Frame(_))), "missing nullable {method}: {missing}");
+        }
+        for missing in remove_nulls(&result) {
+            let decoded = if host {
+                decode_runtime_reply(&method, missing, &Limits::default()).map(|_| ())
+            } else {
+                decode_host_reply(&method, missing, &Limits::default()).map(|_| ())
+            };
+            assert!(decoded.is_err(), "missing result nullable {method}");
+        }
+    }
+    for (event, data, host) in events {
+        let frame = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope(&event),"sequence":1,"event":event,"requestId":null,"data":data});
+        assert!(matches!(mastra_codec_decode(&frame, host), Ok(DecodeResult::Frame(_))), "valid event {event}");
+        for missing in remove_nulls(&frame) {
+            assert!(mastra_codec_decode(&missing, host).is_err(), "missing event nullable {event}");
+        }
+    }
+}
+
+// Mutation caught: lossy UTF-8, extra framing, counting depth/bytes without root/LF.
+#[test]
+fn mastra_codec_byte_and_depth_boundaries() {
+    use super::mastra_protocol::*;
+    let good = mastra_codec_request("turn.cancel", json!({"reason":"user"}), true);
+    let line = format!("{good}\n");
+    for bytes in [
+        vec![0xff, b'\n'],
+        format!("\u{feff}{line}").into_bytes(),
+        good.to_string().into_bytes(),
+        b"\n".to_vec(),
+        b"[]\n".to_vec(),
+        b"null\n".to_vec(),
+        format!("{good}{good}\n").into_bytes(),
+        format!("{good}\n\n").into_bytes(),
+        format!("{good}\r\n").into_bytes(),
+    ] {
+        assert!(decode_frame(&bytes, DecodePhase::Negotiated, Sender::Host, &Limits::default()).is_err(), "invalid frame accepted");
+    }
+    for number in ["NaN", "Infinity", "1e400", "-1e400"] {
+        let raw = line.replacen('{', &format!("{{\"extensions\":{{\"n\":{number}}},"), 1);
+        assert!(decode_frame(raw.as_bytes(), DecodePhase::Negotiated, Sender::Host, &Limits::default()).is_err());
+    }
+    for (depth, valid) in [(64, true), (65, false)] {
+        // root + extensions + nested arrays = depth.
+        let mut value = json!(0);
+        for _ in 2..depth {
+            value = json!([value]);
+        }
+        let mut frame = good.clone();
+        frame["extensions"] = json!({"value":value});
+        assert_eq!(mastra_codec_decode(&frame, true).is_ok(), valid, "depth {depth}");
+    }
+    for (length, valid) in [(8_388_608, true), (8_388_609, false)] {
+        let mut frame = good.clone();
+        frame["extensions"] = json!({"padding":""});
+        let overhead = frame.to_string().len() + 1;
+        frame["extensions"]["padding"] = json!("x".repeat(length - overhead));
+        let line = format!("{frame}\n");
+        assert_eq!(line.len(), length);
+        assert_eq!(decode_frame(line.as_bytes(), DecodePhase::Negotiated, Sender::Host, &Limits::default()).is_ok(), valid, "bytes {length}");
+    }
+}
+
+// Mutation caught: treating bad params as fatal, or a bad identity as recoverable.
+#[test]
+fn mastra_codec_request_errors_preserve_transport() {
+    use super::mastra_protocol::*;
+    let good = mastra_codec_request("session.start", json!({"workflowId":"w","instructions":"hi","bridge":null}), true);
+    for (field, value, code) in [
+        ("params", json!({}), "INVALID_REQUEST"),
+        ("method", json!("future.method"), "METHOD_NOT_FOUND"),
+        ("params", json!({"workflowId":"/bad","instructions":"hi","bridge":null}), "INVALID_REQUEST"),
+    ] {
+        let mut bad = good.clone();
+        bad[field] = value;
+        let DecodeResult::RequestError { header, error } = mastra_codec_decode(&bad, true).unwrap() else {
+            panic!("not a recoverable request error")
+        };
+        assert_eq!(header.request_id.as_str(), "h:");
+        assert_eq!(serde_json::to_value(error).unwrap()["code"], code);
+    }
+    for (field, value) in [
+        ("requestId", json!("r:wrong")),
+        ("requestId", json!("/bad")),
+        ("scope", json!({"sessionId":"s","turnId":"t","workflowRunId":null})),
+        ("protocolVersion", json!("2.0")),
+        ("extensions", Value::Null),
+        ("extra", json!(0)),
+        ("params", Value::Null),
+    ] {
+        let mut bad = good.clone();
+        bad[field] = value;
+        let error = mastra_codec_decode(&bad, true).unwrap_err();
+        assert_eq!(serde_json::to_value(error.wire_error()).unwrap()["code"], "TRANSPORT_ERROR");
+    }
+    let mut bootstrap = mastra_codec_request("runtime.hello", mastra_codec_catalog().0[0].1.clone(), true);
+    bootstrap["protocolVersion"] = json!("2.0");
+    assert!(decode_frame(format!("{bootstrap}\n").as_bytes(), DecodePhase::Bootstrap, Sender::Host, &Limits::default()).is_ok());
+    assert!(mastra_codec_decode(&good, false).is_err());
+    let mut bad_scope = good.clone();
+    bad_scope["scope"] = mastra_codec_scope("runtime.hello");
+    assert!(mastra_codec_decode(&bad_scope, true).is_err());
+}
+
+// Mutation caught: omitted variants, unchecked raw result delivery, permissive errors.
+#[test]
+fn mastra_codec_all_variants_and_error_details() {
+    use super::mastra_protocol::*;
+    let (methods, events) = mastra_codec_catalog();
+    assert_eq!(methods.len(), 14);
+    assert_eq!(events.len(), 9);
+    for (method, params, result, host) in methods {
+        let request = mastra_codec_request(&method, params, host);
+        let DecodeResult::Frame(frame) = mastra_codec_decode(&request, host).unwrap() else { panic!("{method}") };
+        assert_eq!(serde_json::from_slice::<Value>(&encode_frame(&frame, &Limits::default()).unwrap()).unwrap(), request);
+        if host {
+            assert!(decode_runtime_reply(&method, result.clone(), &Limits::default()).is_ok(), "{method}");
+        } else {
+            assert!(decode_host_reply(&method, result.clone(), &Limits::default()).is_ok(), "{method}");
+        }
+        let response = json!({"protocolVersion":"1.0","kind":"response","scope":request["scope"],"requestId":request["requestId"],"outcome":"ok","result":result});
+        let DecodeResult::Frame(frame) = mastra_codec_decode(&response, !host).unwrap() else { panic!("response") };
+        assert_eq!(serde_json::from_slice::<Value>(&encode_frame(&frame, &Limits::default()).unwrap()).unwrap(), response);
+        let mut unknown = request;
+        unknown["params"]["undeclared"] = json!(true);
+        assert!(matches!(mastra_codec_decode(&unknown, host), Ok(DecodeResult::RequestError { .. })), "unknown param {method}");
+    }
+    for (event, data, host) in events {
+        let value = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope(&event),"sequence":1,"requestId":null,"event":event,"data":data});
+        let DecodeResult::Frame(frame) = mastra_codec_decode(&value, host).unwrap() else { panic!("{event}") };
+        assert_eq!(serde_json::from_slice::<Value>(&encode_frame(&frame, &Limits::default()).unwrap()).unwrap(), value);
+        assert!(mastra_codec_decode(&value, !host).is_err(), "wrong event direction {event}");
+    }
+    let codes = [
+        "INCOMPATIBLE_VERSION",
+        "INVALID_REQUEST",
+        "METHOD_NOT_FOUND",
+        "UNSUPPORTED_CAPABILITY",
+        "AUTH_REQUIRED",
+        "CONNECTION_CHANGED",
+        "PERMISSION_DENIED",
+        "MODEL_ERROR",
+        "MALFORMED_RESPONSE",
+        "TASK_FAILED",
+        "INVALID_PROPOSAL",
+        "STALE_DOCUMENT",
+        "DEPENDENCY_CHANGED",
+        "INVALID_CANDIDATE",
+        "PROFILE_UNSUPPORTED",
+        "REPORT_MISMATCH",
+        "NOT_READY",
+        "NOT_FOUND",
+        "IDEMPOTENCY_CONFLICT",
+        "REQUEST_EXPIRED",
+        "RESOURCE_EXHAUSTED",
+        "TIMEOUT",
+        "CANCELLED",
+        "TRANSPORT_ERROR",
+        "OUTCOME_UNKNOWN",
+        "INTERNAL_ERROR",
+    ];
+    assert_eq!(codes.len(), 26);
+    for code in codes {
+        let base = json!({"code":code,"message":"safe","retry":"never","details":{}});
+        let parsed = serde_json::from_value::<WireError>(base.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), base);
+        let details = match code {
+            "INCOMPATIBLE_VERSION" => json!({"supported":["1.0"]}),
+            "INVALID_REQUEST" | "METHOD_NOT_FOUND" => json!({"field":"x","method":"m"}),
+            "UNSUPPORTED_CAPABILITY" => json!({"capability":"tools"}),
+            "AUTH_REQUIRED" | "CONNECTION_CHANGED" | "MODEL_ERROR" | "MALFORMED_RESPONSE" | "TASK_FAILED" | "INVALID_PROPOSAL" => {
+                json!({"connectionId":"c"})
+            }
+            "PERMISSION_DENIED" => json!({"permissionId":"p"}),
+            "STALE_DOCUMENT" => json!({"expected":{"documentId":"d","revision":"18446744073709551615"},"current":null}),
+            "DEPENDENCY_CHANGED" | "INVALID_CANDIDATE" => json!({"candidateId":"c"}),
+            "PROFILE_UNSUPPORTED" | "REPORT_MISMATCH" => json!({"profileId":"p"}),
+            "NOT_READY" | "NOT_FOUND" => json!({"artifactId":"a"}),
+            "IDEMPOTENCY_CONFLICT" | "REQUEST_EXPIRED" => json!({"submissionRequestId":"s"}),
+            "RESOURCE_EXHAUSTED" => json!({"resource":"r","limit":1}),
+            _ => json!({"operation":"request.cancel"}),
+        };
+        let mut nonempty = base.clone();
+        nonempty["details"] = details;
+        assert!(serde_json::from_value::<WireError>(nonempty.clone()).is_ok(), "{code}");
+        let keys: Vec<_> = nonempty["details"].as_object().unwrap().keys().cloned().collect();
+        for key in keys {
+            if nonempty["details"][&key].is_null() {
+                continue;
+            }
+            let mut bad = nonempty.clone();
+            bad["details"][key] = Value::Null;
+            assert!(serde_json::from_value::<WireError>(bad).is_err(), "optional null {code}");
+        }
+        nonempty["details"]["unknown"] = json!(0);
+        assert!(serde_json::from_value::<WireError>(nonempty).is_err(), "{code}");
+        let mut oversized = base;
+        oversized["message"] = json!("é".repeat(1025));
+        assert!(serde_json::from_value::<WireError>(oversized).is_err());
+    }
+    assert!(serde_json::from_value::<WireError>(json!({"code":"FUTURE","message":"safe","retry":"never","details":{}})).is_err());
+}
+
+#[test]
+fn mastra_codec_field_limits_and_model_rounds() {
+    use super::mastra_protocol::*;
+    let catalog = mastra_codec_catalog().0;
+    let params = catalog.iter().find(|m| m.0 == "model.generate").unwrap().1.clone();
+    for (pointer, value) in [
+        ("/options/timeoutSeconds", json!(0)),
+        ("/options/timeoutSeconds", json!(2147483648_u64)),
+        ("/options/maxOutputTokens", json!(0)),
+        ("/options/maxOutputTokens", json!(131073)),
+        ("/options/temperature", json!(-0.01)),
+        ("/options/temperature", json!(2.01)),
+        ("/options/reasoningEffort", json!("é".repeat(33))),
+        ("/messages/0/content/0/text", json!("é".repeat(131073))),
+        ("/messages", json!(vec![params["messages"][0].clone(); 129])),
+        ("/tools", json!(vec![params["tools"][0].clone(); 65])),
+        ("/tools/0/inputSchema", json!({"s":"x".repeat(65529)})),
+        ("/options/outputSchema", json!({"s":"x".repeat(65529)})),
+    ] {
+        let mut bad = params.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            matches!(mastra_codec_decode(&mastra_codec_request("model.generate", bad, false), false), Ok(DecodeResult::RequestError { .. })),
+            "accepted {pointer}"
+        );
+    }
+    let mut edge = params.clone();
+    edge["options"]["temperature"] = json!(2);
+    edge["options"]["maxOutputTokens"] = json!(131072);
+    edge["options"]["reasoningEffort"] = json!("é".repeat(32));
+    edge["options"]["outputSchema"] = json!({"s":"x".repeat(65528)});
+    assert!(matches!(mastra_codec_decode(&mastra_codec_request("model.generate", edge, false), false), Ok(DecodeResult::Frame(_))));
+    let assistant = json!({"role":"assistant","content":[],"toolCalls":[{"id":"call","name":"m","arguments":{}}],"toolCallId":null});
+    let tool = json!({"role":"tool","content":[{"type":"text","text":"result"}],"toolCalls":[],"toolCallId":"call"});
+    for (messages, valid) in [
+        (json!([assistant.clone(), tool.clone()]), true),
+        (json!([tool.clone()]), false),
+        (json!([assistant.clone(), tool.clone(), tool.clone()]), false),
+        (json!([assistant.clone(),{"role":"user","content":[],"toolCalls":[],"toolCallId":null}]), false),
+        (json!([{ "role":"user","content":[],"toolCalls":[{"id":"call","name":"m","arguments":{}}],"toolCallId":null}]), false),
+        (json!([{ "role":"assistant","content":[],"toolCalls":[],"toolCallId":"call"}]), false),
+    ] {
+        let mut p = params.clone();
+        p["messages"] = messages;
+        assert_eq!(matches!(mastra_codec_decode(&mastra_codec_request("model.generate", p, false), false), Ok(DecodeResult::Frame(_))), valid);
+    }
+    let mut result = catalog.iter().find(|m| m.0 == "model.generate").unwrap().2.clone();
+    result["usage"] = json!({"inputTokens":null,"outputTokens":null,"totalTokens":null});
+    for key in ["inputTokens", "outputTokens", "totalTokens"] {
+        let mut missing = result.clone();
+        missing["usage"].as_object_mut().unwrap().remove(key);
+        assert!(decode_host_reply("model.generate", missing, &Limits::default()).is_err());
+        let mut large = result.clone();
+        large["usage"][key] = json!(2147483648_u64);
+        assert!(decode_host_reply("model.generate", large, &Limits::default()).is_err());
+    }
+    for name in ["model.generate", "agent.run"] {
+        let mut r = catalog.iter().find(|m| m.0 == name).unwrap().2.clone();
+        r["content"] = json!([{"type":"image","artifact":{"artifactId":"a","digest":format!("sha256:{}","0".repeat(64)),"sizeBytes":1,"mediaType":"image/png"}}]);
+        assert!(decode_host_reply(name, r, &Limits::default()).is_err());
+    }
+}
+
+#[test]
+fn mastra_codec_referenced_data_and_attachment_bounds() {
+    use super::mastra_protocol::*;
+    let digest = format!("sha256:{}", "0".repeat(64));
+    let manifest = json!({"schemaVersion":"1.0","candidateId":"c","source":{"documentId":"d","revision":"18446744073709551615"},"capturedAt":"2024-02-29T23:59:59.999Z","formatVersion":"1","engineVersion":"1","inputs":[{"path":"design.sc","kind":"design","dependencyId":"d","dependencyVersion":null,"digest":digest,"sizeBytes":1}]});
+    let parsed: SnapshotManifest = serde_json::from_value(manifest.clone()).unwrap();
+    assert!(parsed.validate(&Limits::default()).is_ok());
+    for path in ["/a.sc", "a/../b.sc", "a//b.sc", "a\\b.sc", "./a.sc", &"a".repeat(241)] {
+        let mut bad = manifest.clone();
+        bad["inputs"][0]["path"] = json!(path);
+        assert!(serde_json::from_value::<SnapshotManifest>(bad).unwrap().validate(&Limits::default()).is_err(), "{path}");
+    }
+    let mut missing = manifest.clone();
+    missing["inputs"][0].as_object_mut().unwrap().remove("dependencyVersion");
+    assert!(serde_json::from_value::<SnapshotManifest>(missing).is_err());
+    for text in ["2023-02-29T12:00:00.000Z", "2026-11-05T12:00:00Z", "2026-11-05T12:00:00.000+00:00", "2026-11-05T24:00:00.000Z"] {
+        assert!(Timestamp::parse(text).is_err());
+    }
+    let write = json!({"state":"unknown","request":{"bridgeId":"b","mcpSessionId":"s","requestId":"r"},"before":{"documentId":"d","revision":"18446744073709551615"},"after":null,"completed":null,"rollback":{"requested":false,"attempted":false,"restored":null,"undone":null},"expectation":null,"error":null});
+    assert!(serde_json::from_value::<WriteOutcome>(write.clone()).is_ok());
+    for key in ["after", "completed", "expectation", "error"] {
+        let mut bad = write.clone();
+        bad.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<WriteOutcome>(bad).is_err());
+    }
+    for key in ["restored", "undone"] {
+        let mut bad = write.clone();
+        bad["rollback"].as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<WriteOutcome>(bad).is_err());
+    }
+    let mut params = mastra_codec_catalog().0.iter().find(|m| m.0 == "agent.run").unwrap().1.clone();
+    let artifact = json!({"artifactId":"a","digest":digest,"sizeBytes":4194304,"mediaType":"image/png"});
+    for (task, valid) in [
+        (json!([{"type":"image","artifact":artifact.clone()}]), true),
+        (json!(vec![json!({"type":"image","artifact":artifact.clone()}); 5]), false),
+        (json!([{"type":"document","name":"a","artifact":artifact.clone()}]), false),
+    ] {
+        params["task"] = task;
+        assert_eq!(
+            matches!(mastra_codec_decode(&mastra_codec_request("agent.run", params.clone(), false), false), Ok(DecodeResult::Frame(_))),
+            valid
+        );
+    }
+    params["task"] = json!([{"type":"image","artifact":artifact}]);
+    params["task"][0]["artifact"]["sizeBytes"] = json!(4194305);
+    assert!(matches!(mastra_codec_decode(&mastra_codec_request("agent.run", params, false), false), Ok(DecodeResult::RequestError { .. })));
+}
+
+#[test]
+fn mastra_codec_local_encoding_and_progress_are_strict() {
+    use super::mastra_protocol::*;
+    let params = mastra_codec_catalog().0.iter().find(|m| m.0 == "model.generate").unwrap().1.clone();
+    let request = mastra_codec_request("model.generate", params, false);
+    let DecodeResult::Frame(mut frame) = mastra_codec_decode(&request, false).unwrap() else { panic!("frame") };
+    if let Frame::Request { body: RequestBody::Runtime(HostCall::ModelGenerate(p)), .. } = &mut frame {
+        p.options.temperature = RequiredNullable(Some(f64::NAN));
+    }
+    assert!(encode_frame(&frame, &Limits::default()).is_err(), "do not silently serialize NaN as null");
+    for (kind, content) in [
+        ("text", json!({"text":"hi"})),
+        ("tool", json!({"callId":"c","title":"Measure","state":"completed"})),
+        ("plan", json!({"steps":[{"id":"s","title":"Build","state":"pending"}]})),
+        ("permission", json!({"permissionId":"p","title":"Allow?","state":"denied"})),
+    ] {
+        let good = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope("agent.progress"),"sequence":1,"requestId":"r:c","event":"agent.progress","data":{"agentSessionId":"as","kind":kind,"content":content}});
+        assert!(mastra_codec_decode(&good, true).is_ok());
+        let mut bad = good.clone();
+        bad["data"]["content"]["extra"] = json!(0);
+        assert!(mastra_codec_decode(&bad, true).is_err());
+        let mut bad = good;
+        bad["data"]["kind"] = json!("future");
+        assert!(mastra_codec_decode(&bad, true).is_err());
+    }
+    let mut response = json!({"protocolVersion":"1.0","kind":"response","scope":mastra_codec_scope("turn.cancel"),"requestId":"h:c","outcome":"ok","result":{"state":"cancelling"}});
+    let DecodeResult::Frame(Frame::Response { body: ResponseBody::Ok(pending), .. }) = mastra_codec_decode(&response, false).unwrap() else {
+        panic!("pending")
+    };
+    assert!(pending.decode_runtime("session.start", &Limits::default()).is_err(), "origin method required");
+    response["method"] = json!("turn.cancel");
+    assert!(mastra_codec_decode(&response, false).is_err());
+    let mut control = mastra_codec_request("request.cancel", json!({"targetRequestId":"r:_1"}), false);
+    assert!(matches!(mastra_codec_decode(&control, false), Ok(DecodeResult::Frame(_))));
+    control["params"]["targetRequestId"] = json!("h:_1");
+    assert!(matches!(mastra_codec_decode(&control, false), Ok(DecodeResult::RequestError { .. })));
+    for details in [json!({"expected":{"documentId":"d","revision":"0"}}), json!({"current":null})] {
+        assert!(serde_json::from_value::<WireError>(json!({"code":"STALE_DOCUMENT","message":"safe","retry":"never","details":details})).is_err());
+    }
+    let limits = Limits { tool_calls: 1, ..Limits::default() };
+    let mut result = mastra_codec_catalog().0.iter().find(|m| m.0 == "model.generate").unwrap().2.clone();
+    result["toolCalls"] = json!([{"id":"c1","name":"m","arguments":{}},{"id":"c2","name":"m","arguments":{}}]);
+    assert!(decode_host_reply("model.generate", result, &limits).is_err());
+}
+
+#[test]
+fn mastra_codec_profiles_and_control_capacity() {
+    use super::mastra_protocol::*;
+    let profile = json!({"schemaVersion":"1.0","profileId":"p","version":"1","checks":[{"checkId":"p","kind":"parameters.required","required":true,"parameters":{"requirements":[{"name":"width","value":-1.25,"absTolerance":0.01}]}}]});
+    let parsed: CheckProfile = serde_json::from_value(profile.clone()).unwrap();
+    assert!(parsed.validate(&Limits::default()).is_ok());
+    for parameters in [
+        json!({"requirements":[]}),
+        json!({"requirements":[{"name":"width","value":1,"absTolerance":-0.01}]}),
+        json!({"requirements":[{"name":"width","value":1,"absTolerance":0,"extra":true}]}),
+    ] {
+        let mut p = profile.clone();
+        p["checks"][0]["parameters"] = parameters;
+        assert!(serde_json::from_value::<CheckProfile>(p).unwrap().validate(&Limits::default()).is_err());
+    }
+    let long = "x".repeat(128);
+    let response = json!({"protocolVersion":"1.0","kind":"response","scope":{"sessionId":long,"turnId":long,"workflowRunId":long},"requestId":format!("h:{}","x".repeat(126)),"outcome":"error","error":{"code":"CANCELLED","message":"x".repeat(2048),"retry":"never","details":{"operation":"request.cancel"}}});
+    let DecodeResult::Frame(frame) = mastra_codec_decode(&response, false).unwrap() else { panic!("control") };
+    assert_eq!(encode_control_frame(&frame, &Limits::default()).unwrap().len(), 2792);
+    assert_eq!(minimum_control_frame_bytes(), 2792);
+    for code in [ErrorCode::InvalidRequest, ErrorCode::ResourceExhausted] {
+        let wire = json!({"protocolVersion":"1.0","kind":"response","scope":mastra_codec_scope("turn.cancel"),"requestId":"r:cancel","outcome":"error","error":{"code":code,"message":"Invalid cancel state.","retry":"never","details":{}}});
+        let DecodeResult::Frame(frame) = mastra_codec_decode(&wire, true).unwrap() else { panic!("control method error") };
+        let limits = Limits { frame_bytes: 3000, queue_bytes: 6000, control_lane_bytes: 3000, ..Limits::default() };
+        let bytes = encode_control_frame(&frame, &limits).unwrap();
+        assert!(bytes.len() <= 3000);
+        assert!(matches!(decode_frame(&bytes, DecodePhase::Negotiated, Sender::Host, &limits), Ok(DecodeResult::Frame(_))));
+    }
+    let mut escaped = response;
+    escaped["error"]["message"] = json!("\u{0001}".repeat(2048));
+    let DecodeResult::Frame(frame) = mastra_codec_decode(&escaped, false).unwrap() else { panic!("peer error") };
+    assert!(encode_frame(&frame, &Limits::default()).unwrap().len() > 4096);
+    assert!(encode_control_frame(&frame, &Limits::default()).is_err(), "remote escaped text is not a 4096 byte guarantee");
+}
+
+#[test]
+fn mastra_codec_nested_caps_extensions_and_redaction() {
+    use super::mastra_protocol::*;
+    let (methods, _) = mastra_codec_catalog();
+    let mut model = methods.iter().find(|m| m.0 == "model.generate").unwrap().1.clone();
+    let mut call = json!({"id":"c","name":"measure","arguments":{"x":"x".repeat(65528)}});
+    let mut result = methods.iter().find(|m| m.0 == "model.generate").unwrap().2.clone();
+    result["toolCalls"] = json!([call.clone()]);
+    assert!(decode_host_reply("model.generate", result.clone(), &Limits::default()).is_ok());
+    call["arguments"]["x"] = json!("x".repeat(65529));
+    result["toolCalls"] = json!([call]);
+    assert!(decode_host_reply("model.generate", result, &Limits::default()).is_err());
+    model["messages"][0]["content"][0]["text"] = json!("é".repeat(131072));
+    assert!(matches!(mastra_codec_decode(&mastra_codec_request("model.generate", model, false), false), Ok(DecodeResult::Frame(_))));
+    let base = mastra_codec_request("turn.cancel", json!({"reason":"user"}), true);
+    for (extensions, valid) in [
+        (json!({"negative":-1.25,"large":9007199254740992_u64,"toolCalls":[{"not":"a call"}]}), true),
+        (json!([]), false),
+        (json!(1), false),
+        (Value::Null, false),
+    ] {
+        let mut value = base.clone();
+        value["extensions"] = extensions;
+        assert_eq!(mastra_codec_decode(&value, true).is_ok(), valid);
+    }
+    let mut invalid = base;
+    invalid["params"]["reason"] = json!("private-provider-body-secret");
+    let DecodeResult::RequestError { error, .. } = mastra_codec_decode(&invalid, true).unwrap() else { panic!("params") };
+    assert!(!format!("{error:?} {error} {}", serde_json::to_string(&error).unwrap()).contains("private-provider-body-secret"));
+    let mut plan = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope("workflow.plan"),"sequence":1,"requestId":null,"event":"workflow.plan","data":{"steps":(0..64).map(|i|json!({"id":format!("s{i}"),"title":"step","state":"pending"})).collect::<Vec<_>>()}});
+    assert!(mastra_codec_decode(&plan, false).is_ok());
+    plan["data"]["steps"].as_array_mut().unwrap().push(json!({"id":"s64","title":"step","state":"pending"}));
+    assert!(mastra_codec_decode(&plan, false).is_err());
+    let error: WireError = serde_json::from_value(
+        json!({"code":"MODEL_ERROR","message":"peer-supplied-secret","retry":"read_only","details":{"connectionId":"c","httpStatus":2147483647}}),
+    )
+    .unwrap();
+    assert!(!format!("{error:?} {error}").contains("peer-supplied-secret"));
+    for details in [
+        json!({"connectionId":"c","httpStatus":2147483648_u64}),
+        json!({"connectionId":"c","httpStatus":null}),
+        json!({"connectionId":"c","httpStatus":-1}),
+    ] {
+        assert!(serde_json::from_value::<WireError>(json!({"code":"MODEL_ERROR","message":"safe","retry":"never","details":details})).is_err());
+    }
+}
+
+#[test]
+fn mastra_codec_bootstrap_refusal_preserves_version_string() {
+    use super::mastra_protocol::*;
+    let value = json!({"protocolVersion":"future","kind":"response","scope":mastra_codec_scope("runtime.hello"),"requestId":"h:","outcome":"error","error":{"code":"INCOMPATIBLE_VERSION","message":"No common version.","retry":"never","details":{"supported":["1.0"]}}});
+    let bytes = format!("{value}\n").into_bytes();
+    let DecodeResult::Frame(frame) = decode_frame(&bytes, DecodePhase::Bootstrap, Sender::Runtime, &Limits::default()).unwrap() else {
+        panic!("refusal")
+    };
+    assert_eq!(serde_json::from_slice::<Value>(&encode_frame(&frame, &Limits::default()).unwrap()).unwrap(), value);
+    assert!(decode_frame(&bytes, DecodePhase::Negotiated, Sender::Runtime, &Limits::default()).is_err());
+}
+
+#[test]
+fn mastra_codec_text_limit_lowering_preserves_control_metadata() {
+    use super::mastra_protocol::*;
+    let offered = Limits::default();
+    let returned = Limits { text_bytes: 1, ..offered.clone() };
+    assert!(validate_limits(&returned).is_ok());
+    let limits = negotiate_limits(&offered, &returned).unwrap();
+    assert_eq!(limits.text_bytes, 1, "do not mask the bug by raising a negotiated minimum");
+    let long_id = "x".repeat(128);
+    let long_request_id = format!("h:{}", "_".repeat(126));
+    for (method, params) in [
+        ("turn.cancel", json!({"reason":"user"})),
+        ("turn.cancel", json!({"reason":"reset"})),
+        ("turn.cancel", json!({"reason":"deadline"})),
+        ("turn.cancel", json!({"reason":"shutdown"})),
+        ("request.cancel", json!({"targetRequestId":long_request_id})),
+        ("runtime.shutdown", json!({"reason":"app_exit"})),
+        ("runtime.shutdown", json!({"reason":"reconfigure"})),
+        ("runtime.shutdown", json!({"reason":"protocol_error"})),
+    ] {
+        let mut value = mastra_codec_request(method, params, true);
+        value["requestId"] = json!(long_request_id);
+        if method != "runtime.shutdown" {
+            value["scope"] = json!({"sessionId":long_id,"turnId":long_id,"workflowRunId":long_id});
+        }
+        let bytes = format!("{value}\n").into_bytes();
+        let DecodeResult::Frame(frame) = decode_frame(&bytes, DecodePhase::Negotiated, Sender::Host, &offered).unwrap() else {
+            panic!("default control")
+        };
+        assert!(encode_control_frame(&frame, &limits).is_ok(), "typed {method} must still encode at textBytes=1");
+        let decoded = decode_frame(&bytes, DecodePhase::Negotiated, Sender::Host, &limits).unwrap();
+        assert!(matches!(decoded, DecodeResult::Frame(_)), "{method} metadata is not a text block: {decoded:?}");
+    }
+    let (methods, events) = mastra_codec_catalog();
+    for (method, mut params, mut result, host) in methods {
+        // Only real text blocks are shortened. Instructions, labels, versions,
+        // states, model IDs, media types and digest strings keep their own rules.
+        let body_path = match method.as_str() {
+            "turn.start" => Some("/parts/0/text"),
+            "model.generate" => Some("/messages/0/content/0/text"),
+            "agent.run" => Some("/task/0/text"),
+            _ => None,
+        };
+        if let Some(path) = body_path {
+            *params.pointer_mut(path).unwrap() = json!("x");
+        }
+        if matches!(method.as_str(), "model.generate" | "agent.run") {
+            result["content"][0]["text"] = json!("x");
+        }
+        if method == "runtime.hello" {
+            params["limits"] = json!(returned);
+            result["limits"] = json!(returned);
+        }
+        if method == "turn.start" {
+            params["binding"]["document"]["documentId"] = json!(long_id);
+            params["binding"]["profile"]["profileId"] = json!(long_id);
+            params["binding"]["profile"]["version"] = json!("1.0.0-stable");
+        }
+        let value = mastra_codec_request(&method, params, host);
+        let bytes = format!("{value}\n").into_bytes();
+        let sender = if host { Sender::Host } else { Sender::Runtime };
+        let DecodeResult::Frame(frame) = decode_frame(&bytes, DecodePhase::Negotiated, sender, &limits).unwrap() else {
+            panic!("metadata incorrectly capped in {method}")
+        };
+        assert_eq!(serde_json::from_slice::<Value>(&encode_frame(&frame, &limits).unwrap()).unwrap(), value, "{method}");
+        if host {
+            assert!(decode_runtime_reply(&method, result, &limits).is_ok(), "reply {method}");
+        } else {
+            assert!(decode_host_reply(&method, result, &limits).is_ok(), "reply {method}");
+        }
+    }
+    for (event, mut data, host) in events {
+        if matches!(event.as_str(), "workflow.text" | "model.delta") {
+            data["text"] = json!("x");
+        }
+        let value = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope(&event),"sequence":1,"requestId":null,"event":event,"data":data});
+        let sender = if host { Sender::Host } else { Sender::Runtime };
+        let DecodeResult::Frame(frame) = decode_frame(format!("{value}\n").as_bytes(), DecodePhase::Negotiated, sender, &limits).unwrap() else {
+            panic!("event")
+        };
+        assert_eq!(serde_json::from_slice::<Value>(&encode_frame(&frame, &limits).unwrap()).unwrap(), value, "event {event}");
+    }
+    assert!(Id::parse(&long_id).is_ok());
+    assert!(Id::parse(&"x".repeat(129)).is_err());
+    assert!(Digest::parse(&format!("sha256:{}", "a".repeat(64))).is_ok());
+    assert!(Digest::parse(&format!("sha256:{}", "a".repeat(65))).is_err());
+}
+
+#[test]
+fn mastra_codec_text_limit_checks_typed_bodies_without_opaque_loopholes() {
+    use super::mastra_protocol::*;
+    let limits = negotiate_limits(&Limits::default(), &Limits { text_bytes: 1, ..Limits::default() }).unwrap();
+    let (methods, _) = mastra_codec_catalog();
+    for (method, path) in [("turn.start", "/parts/0/text"), ("model.generate", "/messages/0/content/0/text"), ("agent.run", "/task/0/text")] {
+        for (text, valid) in [("x", true), ("é", false)] {
+            let mut params = methods.iter().find(|m| m.0 == method).unwrap().1.clone();
+            *params.pointer_mut(path).unwrap() = json!(text);
+            if method == "model.generate" {
+                params["tools"][0]["inputSchema"] = json!({"text":"long opaque schema string","type":"object"});
+                params["options"]["outputSchema"] = json!({"content":[{"type":"text","text":"not a protocol block"}]});
+            }
+            let host = method == "turn.start";
+            let value = mastra_codec_request(method, params, host);
+            let sender = if host { Sender::Host } else { Sender::Runtime };
+            let bytes = format!("{value}\n").into_bytes();
+            let decoded = decode_frame(&bytes, DecodePhase::Negotiated, sender, &limits).unwrap();
+            assert_eq!(matches!(decoded, DecodeResult::Frame(_)), valid, "{method}: {text:?}");
+            if let DecodeResult::RequestError { error, .. } = decoded {
+                assert_eq!(serde_json::to_value(error).unwrap()["code"], "INVALID_REQUEST");
+            }
+            let DecodeResult::Frame(frame) = decode_frame(&bytes, DecodePhase::Negotiated, sender, &Limits::default()).unwrap() else {
+                panic!("default")
+            };
+            assert_eq!(encode_frame(&frame, &limits).is_ok(), valid, "encode {method}: {text:?}");
+        }
+    }
+    for name in ["model.generate", "agent.run"] {
+        for (text, valid) in [("x", true), ("é", false)] {
+            let mut result = methods.iter().find(|m| m.0 == name).unwrap().2.clone();
+            result["content"][0]["text"] = json!(text);
+            assert_eq!(decode_host_reply(name, result.clone(), &limits).is_ok(), valid, "result {name}");
+            let typed = decode_host_reply(name, result, &Limits::default()).unwrap();
+            assert_eq!(ResponseBody::host_ok(typed, &limits).is_ok(), valid, "typed result {name}");
+        }
+    }
+    for (event, data, host) in [
+        ("workflow.text", json!({"text":"x","channel":"answer"}), false),
+        ("model.delta", json!({"index":0,"text":"x"}), true),
+        ("agent.progress", json!({"agentSessionId":"as","kind":"text","content":{"text":"x"}}), true),
+    ] {
+        for (text, valid) in [("x", true), ("é", false)] {
+            let mut data = data.clone();
+            if event == "agent.progress" {
+                data["content"]["text"] = json!(text);
+            } else {
+                data["text"] = json!(text);
+            }
+            let value = json!({"protocolVersion":"1.0","kind":"event","scope":mastra_codec_scope(event),"sequence":1,"requestId":null,"event":event,"data":data});
+            let bytes = format!("{value}\n").into_bytes();
+            let sender = if host { Sender::Host } else { Sender::Runtime };
+            assert_eq!(decode_frame(&bytes, DecodePhase::Negotiated, sender, &limits).is_ok(), valid, "event {event}");
+            let DecodeResult::Frame(frame) = decode_frame(&bytes, DecodePhase::Negotiated, sender, &Limits::default()).unwrap() else {
+                panic!("event")
+            };
+            assert_eq!(encode_frame(&frame, &limits).is_ok(), valid, "encode event {event}");
+        }
+    }
+    let mut opaque = methods.iter().find(|m| m.0 == "model.generate").unwrap().2.clone();
+    opaque["content"][0]["text"] = json!("x");
+    opaque["toolCalls"][0]["arguments"] = json!({"type":"text","text":"long opaque argument","x":-1.25});
+    assert!(decode_host_reply("model.generate", opaque, &limits).is_ok());
+    let too_long: WorkflowText = serde_json::from_value(json!({"text":"é","channel":"progress"})).unwrap();
+    assert!(too_long.validate(&limits).is_err(), "direct DTO validation also enforces its text field");
+}
+
+#[test]
+fn mastra_codec_text_limit_keeps_error_and_reasoning_bounds_independent() {
+    use super::mastra_protocol::*;
+    let limits = negotiate_limits(&Limits::default(), &Limits { text_bytes: 1, ..Limits::default() }).unwrap();
+    let (methods, _) = mastra_codec_catalog();
+    let mut model = methods.iter().find(|m| m.0 == "model.generate").unwrap().1.clone();
+    model["messages"][0]["content"][0]["text"] = json!("x");
+    for (bytes, valid) in [(64, true), (65, false)] {
+        model["options"]["reasoningEffort"] = json!("x".repeat(bytes));
+        let value = mastra_codec_request("model.generate", model.clone(), false);
+        assert_eq!(
+            matches!(decode_frame(format!("{value}\n").as_bytes(), DecodePhase::Negotiated, Sender::Runtime, &limits), Ok(DecodeResult::Frame(_))),
+            valid,
+            "reasoning {bytes}"
+        );
+    }
+    for (bytes, valid) in [(2048, true), (2049, false)] {
+        let mut result = methods.iter().find(|m| m.0 == "validation.report").unwrap().2.clone();
+        result["report"]["error"] = json!({"code":"CANCELLED","message":"x".repeat(bytes),"retry":"never","details":{"operation":"request.cancel"}});
+        assert_eq!(decode_host_reply("validation.report", result, &limits).is_ok(), valid, "nested error {bytes}");
+    }
+}
+
+#[test]
+fn mastra_values_request_id_parser_uses_whole_id_and_sender() {
+    use super::mastra_protocol::{RequestId, Sender};
+    for (sender, prefix, other_prefix) in [(Sender::Host, "h:", "r:"), (Sender::Runtime, "r:", "h:")] {
+        for suffix in ["_1", ".1", ":1", "-1", ""] {
+            let text = format!("{prefix}{suffix}");
+            let parsed = RequestId::parse(&text, sender);
+            assert!(parsed.is_ok(), "whole Id {text:?} must be accepted: {parsed:?}");
+            assert_eq!(parsed.unwrap().as_str(), text);
+            assert!(RequestId::parse(&format!("{other_prefix}{suffix}"), sender).is_err(), "wrong sender");
+        }
+        let longest = format!("{prefix}{}", "_".repeat(126));
+        assert_eq!(longest.len(), 128);
+        assert_eq!(RequestId::parse(&longest, sender).unwrap().as_str(), longest);
+        let oversized = format!("{prefix}{}", "_".repeat(127));
+        assert_eq!(oversized.len(), 129);
+        assert!(RequestId::parse(&oversized, sender).is_err());
+        for text in ["call", "h:/secret", "r:bad space", "h:é", "r:\n", "H:_1", "r_1"] {
+            assert!(RequestId::parse(text, sender).is_err(), "{text:?}");
+        }
+    }
+}
+
+#[test]
+fn mastra_values_request_id_serde_uses_whole_id() {
+    use super::mastra_protocol::RequestId;
+    for prefix in ["h:", "r:"] {
+        for suffix in ["_1", ".1", ":1", "-1", "", &"_".repeat(126)] {
+            let text = format!("{prefix}{suffix}");
+            let parsed = serde_json::from_str::<RequestId>(&serde_json::to_string(&text).unwrap());
+            assert!(parsed.is_ok(), "serde must accept whole Id {text:?}: {parsed:?}");
+            let id = parsed.unwrap();
+            assert_eq!(id.as_str(), text);
+            assert_eq!(serde_json::to_value(id).unwrap(), json!(text));
+        }
+        let oversized = format!("{prefix}{}", "_".repeat(127));
+        assert!(serde_json::from_str::<RequestId>(&serde_json::to_string(&oversized).unwrap()).is_err());
+    }
+    for value in [json!("call"), json!("h:/secret"), json!("r:bad space"), json!("H:_1"), json!("r_1"), json!(0), Value::Null] {
+        assert!(serde_json::from_value::<RequestId>(value).is_err());
+    }
+}
+
+#[test]
+fn mastra_values_revision_round_trips() {
+    use super::mastra_protocol::Revision;
+    for (text, native) in [("0", 0), ("9007199254740993", 9_007_199_254_740_993), ("18446744073709551615", u64::MAX)] {
+        let revision = Revision::parse(text).unwrap();
+        assert_eq!(revision.as_u64(), native);
+        assert_eq!(serde_json::to_value(revision).unwrap(), json!(text));
+        assert_eq!(serde_json::from_value::<Revision>(json!(text)).unwrap(), Revision::from_u64(native));
+    }
+    for text in ["", "00", "01", "-1", "+1", " 1", "1 ", "1.0", "1e2", "１２", "18446744073709551616"] {
+        assert!(Revision::parse(text).is_err(), "{text:?}");
+        assert!(serde_json::from_value::<Revision>(json!(text)).is_err(), "{text:?}");
+    }
+    for value in [json!(0), json!(9_007_199_254_740_993_u64), json!(u64::MAX), json!(-1), json!(1.0), Value::Null] {
+        assert!(serde_json::from_value::<Revision>(value).is_err());
+    }
+}
+
+#[test]
+fn mastra_values_identity_and_scope() {
+    use super::mastra_protocol::{Digest, Id, RequestId, Scope, Sender, TurnScope};
+    for text in ["A", "0", "a.b_c:d-e", &"x".repeat(128)] {
+        let id = Id::parse(text).unwrap();
+        assert_eq!(id.as_str(), text);
+        assert_eq!(serde_json::to_value(&id).unwrap(), json!(text));
+        assert_eq!(serde_json::from_value::<Id>(json!(text)).unwrap(), id);
+    }
+    for text in ["", ".a", "_a", ":a", "-a", "a/b", "a b", "a\n", "é", &"x".repeat(129)] {
+        assert!(Id::parse(text).is_err(), "{text:?}");
+        assert!(serde_json::from_value::<Id>(json!(text)).is_err());
+    }
+    for (sender, good, bad) in [(Sender::Host, "h:call", "r:call"), (Sender::Runtime, "r:call", "h:call")] {
+        let id = RequestId::parse(good, sender).unwrap();
+        assert_eq!(id.as_str(), good);
+        assert_eq!(serde_json::to_value(&id).unwrap(), json!(good));
+        assert_eq!(serde_json::from_value::<RequestId>(json!(good)).unwrap(), id);
+        for text in [bad, "call", "h:/secret"] {
+            assert!(RequestId::parse(text, sender).is_err(), "{text:?}");
+        }
+    }
+    for text in ["call", "h:/secret"] {
+        assert!(serde_json::from_value::<RequestId>(json!(text)).is_err());
+    }
+    let digest_text = format!("sha256:{}", "0123456789abcdef".repeat(4));
+    let digest = Digest::parse(&digest_text).unwrap();
+    assert_eq!(digest.bytes(), &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(4).as_slice());
+    assert_eq!(serde_json::to_value(&digest).unwrap(), json!(digest_text));
+    assert_eq!(serde_json::from_value::<Digest>(json!(digest_text)).unwrap(), digest);
+    for text in [
+        digest_text.to_uppercase(),
+        format!("sha256:{}", "A".repeat(64)),
+        "0".repeat(64),
+        format!("sha256:{}", "0".repeat(63)),
+        format!("sha256:{}", "0".repeat(65)),
+        format!("sha256:{}g", "0".repeat(63)),
+    ] {
+        assert!(Digest::parse(&text).is_err());
+    }
+    for (scope, expected) in [
+        (Scope::Runtime, json!({"sessionId":null,"turnId":null,"workflowRunId":null})),
+        (Scope::Session(Id::parse("s").unwrap()), json!({"sessionId":"s","turnId":null,"workflowRunId":null})),
+        (
+            Scope::Turn(TurnScope {
+                session_id: Id::parse("s").unwrap(),
+                turn_id: Id::parse("t").unwrap(),
+                workflow_run_id: Id::parse("w").unwrap(),
+            }),
+            json!({"sessionId":"s","turnId":"t","workflowRunId":"w"}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&scope).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<Scope>(expected.clone()).unwrap(), scope);
+        for key in ["sessionId", "turnId", "workflowRunId"] {
+            let mut missing = expected.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<Scope>(missing).is_err(), "missing {key}");
+        }
+    }
+    for (session, turn, workflow) in
+        [(None, Some("t"), None), (None, None, Some("w")), (None, Some("t"), Some("w")), (Some("s"), Some("t"), None), (Some("s"), None, Some("w"))]
+    {
+        assert!(serde_json::from_value::<Scope>(json!({"sessionId":session,"turnId":turn,"workflowRunId":workflow})).is_err());
+    }
+    for raw in [
+        r#"{"turnId":null,"workflowRunId":null}"#,
+        r#"{"sessionId":null,"workflowRunId":null}"#,
+        r#"{"sessionId":null,"turnId":null}"#,
+        r#"{"sessionId":null,"turnId":null,"workflowRunId":null,"extra":0}"#,
+        r#"{"sessionId":null,"sessionId":"s","turnId":null,"workflowRunId":null}"#,
+        r#"{"sessionId":null,"turnId":null,"turnId":null,"workflowRunId":null}"#,
+        r#"{"sessionId":null,"turnId":null,"workflowRunId":null,"workflowRunId":null}"#,
+    ] {
+        assert!(serde_json::from_str::<Scope>(raw).is_err(), "{raw}");
+    }
+}
+
+#[test]
+fn mastra_values_negotiation_cannot_raise_or_disable_limits() {
+    use super::mastra_protocol::{
+        Budgets, CONTROL_FRAME_BYTES, Limits, minimum_control_frame_bytes, negotiate_limits, validate_budgets, validate_limits,
+    };
+    let offered = Limits::default();
+    assert!(validate_limits(&offered).is_ok());
+    assert_eq!(negotiate_limits(&offered, &offered).unwrap(), offered);
+    let encoded = serde_json::to_value(&offered).unwrap();
+    // Independent contract ceilings: a wrong default must not move the tested boundary too.
+    let ceilings: Value = serde_json::from_str(
+        r#"{
+        "frameBytes":8388608,"jsonDepth":64,"queueBytes":16777216,"controlLaneBytes":65536,
+        "pendingRequests":32,"controlSlots":1,"requestLedgerEntries":4096,
+        "runtimeInstances":8,"sessions":1,"activeTurns":1,
+        "stderrLines":40,"stderrLineScalars":400,"stderrBytes":65536,
+        "modelMessages":128,"toolDefinitions":64,"toolCalls":32,"textBytes":262144,"toolJsonBytes":65536,
+        "attachments":4,"attachmentBytes":4194304,"attachmentTotalBytes":16777216,
+        "historyBytes":16777216,"historyMessages":128,
+        "continuationHandles":32,"continuationBytes":16777216,"continuationTtlSeconds":86400,
+        "httpPerConnection":2,"httpPerHost":8,"cadWritesInFlight":1,"cadReadsInFlight":4,
+        "handshakeSeconds":10,"sessionStartSeconds":30,"callDefaultSeconds":300,"callMaxSeconds":600,
+        "cancelAckSeconds":5,"shutdownSeconds":3,
+        "validationWorkers":2,"validationQueue":8,"validationSeconds":600,"validationQueueSeconds":300,
+        "snapshotBytes":1073741824,"snapshotInputs":256,"manifestBytes":1048576,
+        "reportBytes":4194304,"checks":128,"evidenceArtifacts":64,"evidenceBytes":16777216,"evidenceTotalBytes":67108864,
+        "storeBytes":"8589934592","jobRecords":10000,"retentionSeconds":604800
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(encoded, ceilings);
+    for (key, value) in ceilings.as_object().unwrap() {
+        let ceiling = if key == "storeBytes" { 8_589_934_592 } else { value.as_u64().unwrap() };
+        for invalid in [0, ceiling + 1] {
+            let mut changed = encoded.clone();
+            changed[key] = if key == "storeBytes" { json!(invalid.to_string()) } else { json!(invalid) };
+            let limits: Limits = serde_json::from_value(changed).unwrap();
+            assert!(validate_limits(&limits).is_err(), "{key}={invalid}");
+            assert!(negotiate_limits(&offered, &limits).is_err());
+            assert!(negotiate_limits(&limits, &offered).is_err(), "invalid offer {key}");
+        }
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<Limits>(missing).is_err(), "missing {key}");
+    }
+    for invalid in [json!(8_589_934_592_u64), json!("08589934592"), json!(-1), Value::Null] {
+        let mut changed = encoded.clone();
+        changed["storeBytes"] = invalid;
+        assert!(serde_json::from_value::<Limits>(changed).is_err());
+    }
+    for (key, value) in [
+        ("queueBytes", json!(65_535)),
+        ("queueBytes", json!(8_454_143)),
+        ("requestLedgerEntries", json!(74)),
+        ("pendingRequests", json!(u32::MAX)),
+        ("callMaxSeconds", json!(299)),
+        ("httpPerHost", json!(1)),
+        ("attachmentTotalBytes", json!(4_194_303)),
+        ("evidenceTotalBytes", json!(16_777_215)),
+    ] {
+        let mut changed = encoded.clone();
+        changed[key] = value;
+        assert!(validate_limits(&serde_json::from_value(changed).unwrap()).is_err(), "{key}");
+    }
+    let mut lowered = offered.clone();
+    lowered.pending_requests = 1;
+    lowered.request_ledger_entries = 13; // Strictly more than 2 * (1 + 1) + 8.
+    lowered.frame_bytes = 3000;
+    lowered.control_lane_bytes = 3000;
+    lowered.queue_bytes = 6000;
+    // Cancellation error: 232 fixed JSON/LF bytes + four 128-byte IDs + 2048 text bytes.
+    assert_eq!(minimum_control_frame_bytes(), 2792);
+    assert!(minimum_control_frame_bytes() <= CONTROL_FRAME_BYTES);
+    assert!(validate_limits(&lowered).is_ok(), "do not impose an arbitrary 4096-byte minimum");
+    assert_eq!(negotiate_limits(&offered, &lowered).unwrap(), lowered);
+    assert!(negotiate_limits(&lowered, &offered).is_err(), "return cannot raise even a below-ceiling offer");
+    lowered.frame_bytes = 2792;
+    lowered.control_lane_bytes = 2792;
+    lowered.queue_bytes = 5584;
+    assert!(validate_limits(&lowered).is_ok());
+    lowered.frame_bytes = 2791;
+    assert!(validate_limits(&lowered).is_err());
+    lowered.frame_bytes = 2792;
+    lowered.control_lane_bytes = 2791;
+    assert!(validate_limits(&lowered).is_err());
+    assert!(serde_json::from_str::<Limits>(&format!(r#"{{"frameBytes":1,{}"#, &serde_json::to_string(&offered).unwrap()[1..])).is_err());
+    let mut unknown = encoded;
+    unknown["extra"] = json!(1);
+    assert!(serde_json::from_value::<Limits>(unknown).is_err());
+
+    let budgets = Budgets::default();
+    assert!(validate_budgets(&budgets).is_ok());
+    let encoded = serde_json::to_value(budgets).unwrap();
+    assert_eq!(encoded, json!({"modelCalls":20,"agentTasks":4,"cadCommands":64,"repairs":2,"validationRuns":3,"wallTimeSeconds":1200}));
+    let mut zero = encoded.clone();
+    for (key, value) in encoded.as_object().unwrap() {
+        let mut raised = encoded.clone();
+        raised[key] = json!(value.as_u64().unwrap() + 1);
+        assert!(validate_budgets(&serde_json::from_value(raised).unwrap()).is_err(), "{key}");
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<Budgets>(missing).is_err(), "missing {key}");
+        zero[key] = json!(0);
+    }
+    let zero: Budgets = serde_json::from_value(zero).unwrap();
+    assert!(validate_budgets(&zero).is_ok(), "zero is admitted, not an invalid request");
+    assert_eq!(zero.wall_time_seconds, 0, "later turn execution must see immediate exhaustion, not a default");
+    for invalid in [json!(-1), json!(1.5), json!("1"), Value::Null] {
+        let mut malformed = encoded.clone();
+        malformed["modelCalls"] = invalid;
+        assert!(serde_json::from_value::<Budgets>(malformed).is_err());
+    }
+    assert!(
+        serde_json::from_str::<Budgets>(
+            r#"{"modelCalls":0,"modelCalls":1,"agentTasks":0,"cadCommands":0,"repairs":0,"validationRuns":0,"wallTimeSeconds":0}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn mastra_values_native_stamp_adapter_has_no_numeric_loss() {
+    use super::mastra_protocol::{DocumentStamp, document_stamp_from_native, document_stamp_to_native};
+    for revision in [0, 9_007_199_254_740_993, u64::MAX] {
+        let stamp = document_stamp_from_native("doc:original", revision).unwrap();
+        assert_eq!(document_stamp_to_native(&stamp), ("doc:original".to_owned(), revision));
+        let encoded = serde_json::to_value(&stamp).unwrap();
+        assert_eq!(encoded, json!({"documentId":"doc:original","revision":revision.to_string()}));
+        let decoded: DocumentStamp = serde_json::from_value(encoded).unwrap();
+        assert_eq!(document_stamp_to_native(&decoded), ("doc:original".to_owned(), revision));
+    }
+    let native_error = document_stamp_from_native("/private/secret", 0).unwrap_err();
+    assert_eq!(
+        serde_json::to_value(&native_error).unwrap(),
+        json!({"code":"INTERNAL_ERROR","message":"Internal protocol value error.","retry":"never","details":{}})
+    );
+    let supplied_error = super::mastra_protocol::Id::parse("/private/secret").unwrap_err();
+    assert_eq!(
+        serde_json::to_value(&supplied_error).unwrap(),
+        json!({"code":"INVALID_REQUEST","message":"Invalid protocol value.","retry":"never","details":{}})
+    );
+    assert!(!format!("{native_error:?} {native_error} {supplied_error:?} {supplied_error}").contains("secret"));
+    for raw in [
+        r#"{"documentId":"doc"}"#,
+        r#"{"revision":"0"}"#,
+        r#"{"documentId":"doc","revision":0}"#,
+        r#"{"documentId":"doc","revision":"0","revision":"1"}"#,
+        r#"{"documentId":"doc","revision":"0","extra":null}"#,
+    ] {
+        assert!(serde_json::from_str::<DocumentStamp>(raw).is_err());
+    }
+}
+
 fn transcript_clipboard_harness(layout: crate::shell::LayoutMode) -> crate::scenario::Harness {
     let mut h = narrow_chat();
     h.app.ui.layout = layout;

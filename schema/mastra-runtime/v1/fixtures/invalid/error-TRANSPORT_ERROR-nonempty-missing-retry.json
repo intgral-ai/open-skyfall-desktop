@@ -1,0 +1,7 @@
+{
+  "code": "TRANSPORT_ERROR",
+  "details": {
+    "operation": "request.cancel"
+  },
+  "message": "Redacted diagnostic."
+}

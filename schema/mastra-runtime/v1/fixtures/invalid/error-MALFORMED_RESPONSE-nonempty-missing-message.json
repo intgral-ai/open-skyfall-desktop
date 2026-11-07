@@ -1,0 +1,8 @@
+{
+  "code": "MALFORMED_RESPONSE",
+  "details": {
+    "connectionId": "c",
+    "httpStatus": 429
+  },
+  "retry": "never"
+}

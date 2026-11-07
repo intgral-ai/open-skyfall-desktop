@@ -1,0 +1,9 @@
+{
+  "code": "METHOD_NOT_FOUND",
+  "details": {
+    "field": "params",
+    "method": null
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

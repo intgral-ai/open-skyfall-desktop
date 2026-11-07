@@ -1,0 +1,11 @@
+{
+  "content": [
+    {
+      "text": "hi",
+      "type": "text"
+    }
+  ],
+  "state": "completed",
+  "stopReason": "stop",
+  "usage": null
+}

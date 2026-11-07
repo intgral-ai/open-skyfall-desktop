@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"{\n  \"documentStamp\": {\n    \"documentId\": \"doc-A\",\n    \"revision\": \"9007199254740994\"\n  },\n  \"result\": 7\n}"}],"structuredContent":{"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}}}

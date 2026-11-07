@@ -19,7 +19,7 @@ PR backlog is down, so give new commands both schemas now. Set `SOLIDCRAFT_SCHEM
 to make the missing-schema check fail today.
 
 - **"`x.y` has no input or output schema"** (or "no input schema", "no output schema"): a new
-  command. Give it what it lacks, as below. Don't add it to `schema/unconverted.txt`: that list
+  command. Give it what it lacks, as below. Don't add it to `crates/engine/src/schema/unconverted.txt`: that list
   holds only the commands that predate the rule.
 - **"`x.y` has its schemas now: remove its line from unconverted.txt"**: you converted an old
   command. Delete its line.
@@ -223,7 +223,7 @@ nested type's defaults are yours to check.
 
 ### 7. Converting a command that already exists
 
-Do steps 1 to 6, remove its line from `schema/unconverted.txt`, then check the contract against
+Do steps 1 to 6, remove its line from `crates/engine/src/schema/unconverted.txt`, then check the contract against
 every caller the tests have: run the whole suite with the audit recorder and summarise it.
 
 ```text

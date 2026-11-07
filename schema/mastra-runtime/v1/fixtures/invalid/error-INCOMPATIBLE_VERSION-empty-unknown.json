@@ -1,0 +1,8 @@
+{
+  "code": "INCOMPATIBLE_VERSION",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

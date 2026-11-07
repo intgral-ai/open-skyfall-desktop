@@ -1,0 +1,8 @@
+{
+  "code": "INVALID_REQUEST",
+  "details": {
+    "undeclared": true
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}

@@ -1,0 +1,8 @@
+{
+  "code": "CANCELLED",
+  "details": {
+    "operation": "request.cancel"
+  },
+  "message": "Redacted diagnostic.",
+  "retry": "never"
+}
