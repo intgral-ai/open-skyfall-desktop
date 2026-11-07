@@ -1,0 +1,262 @@
+# Raw failures stay red, even when the separate reviewed regression gate accepts a known failure.
+# This is evidence, not a publisher or permission to release with unknown failures.
+name: Native baseline (raw)
+
+on:
+  push:
+    branches: [develop, main]
+  schedule:
+    - cron: "47 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-baseline-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Reuse the real full T4 gate: native/platform, randomized properties, all action
+  # shards/determinism, docs, oracle, wasm and repository checks. No successful stub
+  # for absent #7/#14 consumers; release_required remains a separate blocked path.
+  regression:
+    name: Full required regression evidence (not raw success)
+    uses: ./.github/workflows/ci.yml
+    with:
+      validation_mode: full
+      release_required: false
+
+  raw-native:
+    name: Full native and heavy properties (raw)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_INCREMENTAL: "0"
+      ACTION_MATRIX_JOBS: "2"
+      SOLIDCRAFT_GPU: software
+      SOLIDCRAFT_REQUIRE_GPU: "1"
+      WGPU_BACKEND: vulkan
+      PROPTEST_CASES: "32"
+      ATOMIC_SEEDS: "0..8"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Software Vulkan and native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 libasound2-dev libudev-dev libxkbcommon-dev
+      - run: scripts/ci/build-jobs.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-tests
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') }}
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest
+      - name: Bind full selection to actual checkout
+        run: python3 -I scripts/ci/main_merge.py select --mode full --release-required false --out selection/plan.json
+      - name: Initial resource sample
+        run: |
+          mkdir -p evidence/raw-native
+          { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; uname -a; free -h; df -h .; } > evidence/raw-native/resources-before.txt
+      - name: Run full raw native baseline
+        run: |
+          python3 -I - <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts/ci")
+          import gate, main_merge
+
+          plan_file = Path("selection/plan.json")
+          plan = gate.BoundPlan(plan_file.read_bytes())
+          main_merge.check_revision(plan)
+          out = Path("evidence/raw-native")
+          out.mkdir(parents=True, exist_ok=True)
+          problems = []
+          try:
+              # Reuse actual full listing/run/receipt/grader; never treat its known-failure
+              # acceptance as raw success. all() also includes boolean_props/atomic_commands.
+              main_merge.execute_workflow(plan_file, "rust", out, full=True)
+          except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+              problems.append(str(error))
+          commands_file = out / "commands.json"
+          commands = gate.parse_json(commands_file.read_bytes()) if commands_file.is_file() else []
+          expected, outcomes, known = set(), {}, set()
+          try:
+              gate.require(len(commands) >= 2, "missing native listing/run commands")
+              gate.require(commands[0]["exitCode"] == 0, "native listing failed")
+              gate.require(gate.nextest_configuration(commands[0]["argv"], "list") ==
+                           gate.nextest_configuration(commands[1]["argv"], "run"), "listing/run mismatch")
+              expected = gate.read_nextest_selection(out / "selection.json")
+              outcomes = gate.read_junit(out / "junit.xml")
+              known = gate.read_known_failures(gate.KNOWN_FAILING)
+              gate.require(set(outcomes) == expected, "incomplete/unexpected raw outcomes")
+              gate.require("skipped" not in outcomes.values(), "skipped expected raw tests")
+              gate.require(commands[1]["exitCode"] in (0, 100), "native infrastructure exit")
+              gate.require(("failed" in outcomes.values()) == (commands[1]["exitCode"] == 100),
+                           "native exit disagrees with raw failures")
+          except (OSError, ValueError, KeyError) as error:
+              problems.append(str(error))
+          main_merge.check_revision(plan)
+          # Preserve the FIRST real failure, including nextest 100 despite a successful
+          # reviewed grader. Missing/bad evidence also fails, never a green empty run.
+          status = next((c["exitCode"] for c in commands if c["exitCode"]), 1 if problems else 0)
+          failed = sorted(k for k, v in outcomes.items() if v == "failed")
+          result = dict(sourceRevision=plan["sourceRevision"], planDigest=gate.digest_for(plan),
+                        commands=commands, exitCode=status, problems=problems, expectedIds=sorted(expected),
+                        passedIds=sorted(k for k, v in outcomes.items() if v == "passed"), failedIds=failed,
+                        skippedIds=sorted(k for k, v in outcomes.items() if v == "skipped"),
+                        knownFailingIds=sorted(set(failed) & known))
+          (out / "raw-result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              print("## Raw native baseline: " + ("RED" if status else "PASS"), file=summary)
+              print("Source: " + plan["sourceRevision"] + "; raw exit: " + str(status), file=summary)
+              print("This is separate from the selected regression gate; unknown failures block release.", file=summary)
+              print("Raw failed IDs: " + json.dumps(failed), file=summary)
+              print("Existing reviewed allowances (not raw passes): " + json.dumps(result["knownFailingIds"]), file=summary)
+              print("Evidence errors: " + json.dumps(problems), file=summary)
+          raise SystemExit(status)
+          PY
+      - name: Final resource sample
+        if: always()
+        run: df -h . > evidence/raw-native/resources-after.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: raw-native-baseline-${{ github.sha }}
+          path: |
+            selection/
+            evidence/raw-native/
+            target/nextest/ci/junit.xml
+            crates/kernel/tests/*.proptest-regressions
+          if-no-files-found: error
+          retention-days: 14
+
+  raw-heavy:
+    name: Raw ignored action matrix (${{ matrix.shard }})
+    needs: regression
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, determinism]
+    env:
+      CARGO_TARGET_DIR: target
+      ACTION_MATRIX_JOBS: "2"
+      SOLIDCRAFT_GPU: software
+      SOLIDCRAFT_REQUIRE_GPU: "1"
+      WGPU_BACKEND: vulkan
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest
+      - name: Software Vulkan runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+      # Consume T4's actual archive and exact selection bytes even when another
+      # full-regression job failed. A missing archive/plan fails, never a skipped pass.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: selection-plan
+          path: selection
+      - name: Run raw ignored matrix suite
+        env:
+          BASELINE_SUITE: ${{ matrix.shard }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, shutil, sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts/ci")
+          import gate, main_merge
+
+          plan = gate.BoundPlan(Path("selection/plan.json").read_bytes())
+          main_merge.check_revision(plan)
+          out = Path("evidence/raw-heavy")
+          out.mkdir(parents=True, exist_ok=True)
+          suite = os.environ["BASELINE_SUITE"]
+          gate.require(suite == "determinism" or suite in {str(n) for n in range(1, 17)}, "invalid matrix shard")
+          test = "action_matrix_determinism" if suite == "determinism" else "action_matrix_shard"
+          if suite != "determinism":
+              os.environ["ACTION_MATRIX_SHARD"] = suite + "/16"
+          for key, value in {"ACTION_MATRIX_RESULTS": "results.json", "ACTION_MATRIX_TIMINGS": "timings.jsonl",
+                             "ACTION_MATRIX_WORKDIR": "raw"}.items():
+              os.environ[key] = str((out / value).resolve())
+          common = ["--archive-file", "tests.tar.zst", "--workspace-remap", ".", "--extract-to", ".",
+                    "--extract-overwrite", "--profile", "ci", "--ignore-default-filter", "--run-ignored", "only",
+                    "-E", "binary(action_matrix) & test(=" + test + ")"]
+          junit = Path("target/nextest/ci/junit.xml")
+          junit.unlink(missing_ok=True)
+          commands = main_merge.capture_commands([
+              ["cargo", "nextest", "list", *common, "--message-format", "json"],
+              ["cargo", "nextest", "run", *common, "--test-threads", "2"]], out)
+          if junit.is_file():
+              shutil.copyfile(junit, out / "junit.xml")
+          problems, expected, outcomes = [], set(), {}
+          try:
+              gate.require(len(commands) == 2 and commands[0]["exitCode"] == 0, "missing/failed heavy listing/run")
+              gate.require(gate.nextest_configuration(commands[0]["argv"], "list") ==
+                           gate.nextest_configuration(commands[1]["argv"], "run"), "heavy listing/run mismatch")
+              expected = gate.read_nextest_selection(out / "selection.json")
+              outcomes = gate.read_junit(out / "junit.xml")
+              gate.require(set(outcomes) == expected and "skipped" not in outcomes.values(), "incomplete heavy evidence")
+              gate.require(commands[1]["exitCode"] in (0, 100), "heavy infrastructure exit")
+              gate.require(("failed" in outcomes.values()) == (commands[1]["exitCode"] == 100), "heavy exit/outcome mismatch")
+          except (OSError, ValueError, KeyError) as error:
+              problems.append(str(error))
+          main_merge.check_revision(plan)
+          status = next((c["exitCode"] for c in commands if c["exitCode"]), 1 if problems else 0)
+          result = dict(sourceRevision=plan["sourceRevision"], planDigest=gate.digest_for(plan), suite=suite,
+                        commands=commands, exitCode=status, problems=problems, expectedIds=sorted(expected),
+                        **{key: sorted(k for k, v in outcomes.items() if v == value) for key, value in
+                           (("passedIds", "passed"), ("failedIds", "failed"), ("skippedIds", "skipped"))})
+          (out / "raw-result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              print("## Raw ignored matrix baseline: " + ("RED" if status else "PASS"), file=summary)
+              print(json.dumps(result, sort_keys=True), file=summary)
+          raise SystemExit(status)
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: raw-action-matrix-${{ matrix.shard }}-${{ github.sha }}
+          path: |
+            selection/
+            evidence/raw-heavy/
+          if-no-files-found: error
+          retention-days: 14
+
+  baseline:
+    name: Native baseline conclusion (raw)
+    needs: [regression, raw-native, raw-heavy]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report actual full and raw results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          needs = json.loads(os.environ["NEEDS"])
+          ok = set(needs) == {"regression", "raw-native", "raw-heavy"} and all(v["result"] == "success" for v in needs.values())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              print("## Full native baseline: " + ("PASS" if ok else "RED / incomplete"), file=summary)
+              print(json.dumps(needs, sort_keys=True), file=summary)
+              print("Raw failures are not waived by the selected regression gate. Unknown applicable failures block release.", file=summary)
+          raise SystemExit(0 if ok else 1)
+          PY

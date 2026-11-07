@@ -1,12 +1,12 @@
 # Files many pull requests add to are kept so that additions don't conflict: one file per change
 # or one sorted line per item (CONTRIBUTING.md, "Lists many changes add to"). Fast, no build.
 # Pull requests get the same checks in CI's "Format and repository checks" job (one runner slot
-# per PR instead of three); this copy keeps main honest.
+# per PR instead of three); this copy checks both stable and integration pushes.
 name: Lists
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: read
@@ -30,4 +30,5 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: lists
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') }}
       - run: cargo xtask lists

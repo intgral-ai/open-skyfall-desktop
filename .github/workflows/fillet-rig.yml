@@ -6,8 +6,9 @@
 #
 # GitHub filters a workflow by whole files, so the fillet parts of crates/doc/src/eval*.rs and
 # crates/engine/src/cmd/features.rs select it whenever those files change. Pushes to main and
-# develop that touch the same paths run it too and save the compiler cache (a Blacksmith sticky
-# disk) that pull requests then mount read-only.
+# develop that touch the same paths run it too and save the compiler cache that pull requests
+# then mount read-only. This fork uses versioned GitHub-hosted runners and does not depend on
+# unconfigured self-hosted runner labels or sticky disks.
 name: Fillet rig
 
 on:
@@ -59,7 +60,7 @@ jobs:
     name: Fillet rig
     # Draft pull requests run no CI, as in ci.yml.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
@@ -71,15 +72,8 @@ jobs:
       - name: Size parallel compiles to the job's memory
         run: scripts/ci/build-jobs.sh
       - uses: dtolnay/rust-toolchain@stable
-      # Only main and develop commit the cache; pull requests and forks mount a clone and never
-      # write back.
-      - name: Mount the compiler cache
-        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
-        continue-on-error: true
-        with:
-          key: ${{ github.repository }}-sccache-fillet-rig
-          path: /home/runner/.cache/sccache
-          commit: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') && 'on-change' || 'false' }}
+      # Only main and develop save the cache; pull requests read a repository-scoped cache and
+      # never write it back.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fillet-rig

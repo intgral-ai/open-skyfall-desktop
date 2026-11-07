@@ -15,6 +15,63 @@ profile and the wasm build check.
 | Kill mid-save | `apps/solidcraft-cli/tests/kill_mid_save.rs` | a save killed at any moment leaves a readable file |
 | Reference tests | `cargo xtask oracle` → [docs/oracle.md](oracle.md) | parts rebuilt from `tests/oracle/*/recipe.json`, compared with analytic or FreeCAD expected values |
 
+## Fork CI selection and evidence
+
+Follow [fork governance](../../../fork-governance.md) for task PRs to `develop`
+(squash) and checked promotion/reconciliation with merge ancestry. The initial
+merge queue is disabled, and the observed repository does not offer auto-merge.
+Zero mandatory independent approvals is not administrator bypass. Exact GitHub
+settings and required contexts still need separate approval, activation and
+read-back.
+
+[`scripts/ci/plan.py`](../../../../scripts/ci/plan.py) emits a source-bound plan
+using the existing Rust reverse-dependency selector and actual consumer inventory.
+Both rename names and deleted inputs count. Unknown or incomplete diffs and shared
+build/CI inputs are conservative. All PRs, including drafts and external PRs, run
+their selected checks; `approved-for-ci` is not a scheduling prerequisite. Ordinary
+documentation does not require native tests, but policy or shared inputs may select
+additional consumers. Scheduled/full validation selects existing full consumers;
+main-target promotion additionally sets `releaseRequired`.
+
+The always-evaluated `ci` aggregate in `.github/workflows/ci.yml` checks actual
+selected `needs` via `scripts/ci/main_merge.py` and `scripts/ci/gate.py`. Inspect:
+
+1. The exact checkout SHA, immutable plan bytes/digest, selected jobs and scope.
+2. Real selected job results and matching source/plan-bound receipts. Missing,
+   failed, cancelled or skipped required jobs fail; nonselected jobs are not passes.
+3. Complete, nonempty selected test identities and executed counts, command exits
+   and real reports. An empty filter, no-tests result, skipped case, stale report
+   or constant success flag cannot satisfy a selected consumer.
+4. Explicit `not_applicable` reasons and `openObligations` for absent future
+   consumers on a payload-free host foundation. That is **not runtime tested**.
+   A requested, deleted or partial required input blocks, not a foundation exemption.
+
+The planner keeps `artifact-policy` as an explicit host-foundation non-applicability
+until #15's verifier handoff exists; it is never a silent pass. When that handoff
+lands, the job must run #15's counted `distribution_` tests and its production
+policy and repository host-only CLI modes, then emit a matched receipt. Known policy
+metadata and packaging utility tests select the owning checks, not installed-runtime
+acceptance; unknown packaging/build inputs stay conservative. The #5 contract, #7
+runtime, runtime-required artifact and #14 installed consumers remain owner
+handoffs. A selected job without its real adapter or receipt fails closed; do not
+document future commands as runnable or invent successful stubs.
+
+The stable `release-gate` checks full native/wasm/platform/heavy/package evidence,
+all final package descriptors, the full rig/ladder handoff and required owner
+consumers. Those absent consumers remain blocking; native or packaging success
+cannot waive them. See [releasing](../../../releasing.md) for final-SHA rebuilds
+and the publication quarantine. Host-only or policy validity is not artifact
+admission.
+
+### Raw baseline and diagnostic limits
+
+`.github/workflows/native-baseline.yml` preserves the independent raw native and
+ignored-heavy baseline. Preserve raw exits, named failures and counts separately
+from the reviewed known-failing regression grader. An accepted known failure is
+still raw red; unknown failures block. Do not broaden exclusions or a failure list
+to label the whole suite green. A `cargo xtask ci` run and its actual exit must be
+recorded before a commit; focused checks are feedback, not a replacement.
+
 ## Dependency advisories
 
 Scheduled and manually dispatched CI runs have a separate **Dependency advisories** job that

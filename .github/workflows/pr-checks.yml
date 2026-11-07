@@ -1,11 +1,13 @@
 # Three quick checks on every pull request (CONTRIBUTING.md, "Sending a change"): no second open PR
 # for an issue a lower-numbered one already closes, the "Changes a default:" line is filled in, and
-# a PR adding to the showcase shows a picture. None is a required status check. The logic is in scripts/pr-checks/pr-checks.js (tested in ci.yml).
+# a PR adding to the showcase shows a picture. These are advisory checks, not branch admission.
+# The pure branchPolicy export is for the required CI policy job, not a write-enabled bot job.
+# The logic is in scripts/pr-checks/pr-checks.js (tested in ci.yml).
 name: PR checks
 
 on:
-  # pull_request, never pull_request_target: nothing here checks out or runs the PR's code, and the
-  # token is read-only for fork PRs. Only scripts/pr-checks from the PR's own merge commit is run.
+  # Never pull_request_target. Read-only checks run scripts from the PR merge commit.
+  # The write-enabled label job uses only the trusted base commit, never PR code.
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
@@ -77,6 +79,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
           sparse-checkout: scripts/pr-checks
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:

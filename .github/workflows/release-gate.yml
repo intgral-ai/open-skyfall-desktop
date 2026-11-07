@@ -1,74 +1,167 @@
-# The release gate: everything, in full and in parallel, on one branch's head, before that branch
-# replaces main as a release (develop, rebased onto main). Run it by hand:
-#   gh workflow run release-gate.yml --ref develop
-# It calls the workflows that own each check instead of copying their jobs:
-# - ci.yml as Run workflow with cross-compilation: every native suite in full (not scoped), the
-#   reference tests, the doc tests, the GPU path tests, the action matrix (all 16 shards) and its
-#   determinism check, the property tests, the repository checks (web-offline among them),
-#   WebAssembly and RISC-V, Windows D3D12 FXC and Windows app startup;
-# - kernel-rig.yml: every rig area against its KNOWN_FAILING and the ladder against its golden;
-# - release.yml as a dry run (draft false, packages_only): the Linux, Flatpak, Snap, FreeBSD,
-#   macOS, Windows and web packages with their smoke tests and package checks, unsigned (no
-#   secrets are passed, so no signing secret or SignPath quota is used) and without the release
-#   job (checksums, update signing, publishing).
-# The gate passes only when all three pass. Before main is replaced, tag the old main
-# (main-before-develop-<date>) and push the tag.
+# Nonpublishing full validation of this exact PR/group/manual checkout, never an
+# older candidate. A changed promotion merge SHA requires a rebuild, not retagging.
 name: Release gate
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-gate-${{ github.ref }}
+  group: release-gate-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   ci:
-    name: CI
+    # Merge groups have no branches filter in Actions. Develop groups use their
+    # ordinary ci context; the release context is required only for main.
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
     uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      # Select checks reads this commit's other runs.
-      actions: read
     with:
+      validation_mode: full
+      release_required: true
       cross_compile: true
 
   kernel-rig:
-    name: Kernel rig
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
     uses: ./.github/workflows/kernel-rig.yml
-    permissions:
-      contents: read
+    with:
+      full_validation: true
 
   packages:
-    name: Packages
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
     uses: ./.github/workflows/release.yml
-    # No secrets: the signing steps skip without them. GitHub checks a called workflow's job
-    # permissions before the run, skipped jobs included, so the release job's contents: write must
-    # be granted here; packages_only skips that job, and no step that runs writes to the
-    # repository. actions: read is the Windows job's.
-    permissions:
-      contents: write
-      actions: read
-    with:
-      draft: false
-      packages_only: true
 
   release-gate:
     name: release-gate
     needs: [ci, kernel-rig, packages]
     if: always()
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
-      - name: Every part passed
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always() && (github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main')
+        with:
+          name: selection-plan
+          path: selection
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always() && (github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main')
+        with:
+          pattern: evidence-*
+          path: evidence
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always() && (github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main')
+        with:
+          pattern: package-evidence-*
+          path: package-evidence
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always() && (github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main')
+        with:
+          name: kernel-rig-handoff-${{ github.sha }}
+          path: rig-handoff
+      - name: Evaluate actual full evidence and outstanding owner consumers
+        if: always()
         env:
-          CI: ${{ needs.ci.result }}
-          KERNEL_RIG: ${{ needs.kernel-rig.result }}
-          PACKAGES: ${{ needs.packages.result }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          GROUP_BASE: ${{ github.event.merge_group.base_ref }}
         run: |
-          echo "ci=$CI kernel-rig=$KERNEL_RIG packages=$PACKAGES"
-          test "$CI" = success
-          test "$KERNEL_RIG" = success
-          test "$PACKAGES" = success
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/ci')
+          import gate
+          import kernel_rig_plan as rig
+
+          if os.environ.get('EVENT_NAME') == 'merge_group' and os.environ.get('GROUP_BASE') != 'refs/heads/main':
+              print('release-gate: not_applicable (develop merge group; no stable promotion)')
+              sys.exit(0)
+          problems = []
+          needs = gate.parse_json(os.environ['NEEDS_JSON'])
+          for job in ('ci', 'kernel-rig', 'packages'):
+              if needs.get(job, {}).get('result') != 'success':
+                  problems.append(job + ': real job result is not success: ' + str(needs.get(job, {}).get('result', 'missing')))
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if sha != os.environ['GITHUB_SHA']:
+              problems.append('checkout sourceRevision mismatch')
+          if subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--']).returncode != 0:
+              problems.append('dirty tracked release checkout')
+          try:
+              rig.verify_handoff(Path.cwd(), Path('rig-handoff'), sha)
+          except (OSError, ValueError, TypeError, KeyError) as error:
+              problems.append('kernel-rig handoff: ' + str(error))
+          try:
+              plan = gate.BoundPlan(Path('selection/plan.json').read_bytes())
+              gate.require(plan['sourceRevision'] == sha, 'plan sourceRevision mismatch')
+              gate.require(plan['scope'] == 'full' and plan['releaseRequired'], 'release requires full releaseRequired plan')
+              receipts = {}
+              for path in sorted(Path('evidence').rglob('receipt.json')):
+                  receipt = gate.parse_json(path.read_bytes())
+                  job = receipt.get('jobId')
+                  gate.require(job not in receipts, 'duplicate receipt: ' + str(job))
+                  receipts[job] = receipt
+              # The audited nested ci aggregate checks its actual per-job needs,
+              # including platform/heavy jobs. Recheck its exact plan/receipts;
+              # a green nested wrapper alone cannot satisfy this context.
+              results = {job: needs.get('ci', {}).get('result') for job in plan['jobs']}
+              problems.extend(gate.evaluate(plan, results, receipts))
+          except (OSError, ValueError, TypeError, KeyError) as error:
+              problems.append('execution evidence: ' + str(error))
+
+          contract = Path('schema/mastra-runtime/v1/manifest.json')
+          digest = 'sha256:' + hashlib.sha256(contract.read_bytes()).hexdigest() if contract.is_file() else None
+          if digest is None:
+              problems.append('#5: missing same-checkout contract manifest/digest')
+          expected = {
+              **{f'release-{kind}-{arch}': f'{arch}-unknown-linux-gnu'
+                 for kind in ('linux', 'flatpak', 'arch', 'snap') for arch in ('x86_64', 'aarch64')},
+              'release-freebsd-x86_64': 'x86_64-unknown-freebsd',
+              'release-macos': 'universal-apple-darwin',
+              **{f'release-windows-{arch}': target for arch, target in (
+                  ('x64', 'x86_64-pc-windows-msvc'), ('x86', 'i686-pc-windows-msvc'), ('arm64', 'aarch64-pc-windows-msvc'))},
+              'release-web': 'wasm32-unknown-unknown'}
+          descriptors = {}
+          for path in sorted(Path('package-evidence').rglob('build.json')):
+              try:
+                  data = gate.parse_json(path.read_bytes())
+                  identity = data.get('packageId')
+                  gate.require(identity in expected and identity not in descriptors, 'unknown/duplicate package descriptor')
+                  descriptors[identity] = data
+                  gate.require(data.get('sourceRevision') == sha, identity + ': sourceRevision mismatch; rebuild at final SHA')
+                  gate.require(data.get('target') == expected[identity], identity + ': target mismatch')
+                  gate.require(digest is not None and data.get('contractDigest') == digest, identity + ': contractDigest mismatch/missing')
+                  artifacts = data.get('artifacts')
+                  gate.require(isinstance(artifacts, list) and artifacts, identity + ': missing artifact identities')
+                  names = set()
+                  for artifact in artifacts:
+                      name = artifact.get('name', '')
+                      gate.require(isinstance(name, str) and name and Path(name).name == name and name not in names,
+                                   identity + ': invalid/duplicate artifact name')
+                      names.add(name)
+                      gate.require(re.fullmatch('[0-9a-f]{64}', artifact.get('sha256', '')) is not None,
+                                   identity + ': missing artifact digest')
+              except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+                  problems.append('package evidence: ' + str(error))
+          for identity in sorted(set(expected) - set(descriptors)):
+              problems.append(identity + ': missing package descriptor')
+          # Deliberate integration stops, NOT success adapters or a verifier.
+          # #15 owns inventory parsing/verification and its artifact/verified
+          # result. File presence, policy_valid, host_only/not_applicable, or an
+          # arbitrary uploaded "verified" JSON cannot remove either stop.
+          problems.append('#15: required runtime-artifact artifact/verified inventory adapter not integrated; policy/host-only cannot substitute')
+          problems.append('#14: required installed-runtime consumers/evidence not integrated (all release targets)')
+          for problem in problems:
+              print('FAIL: ' + problem)
+          sys.exit(1 if problems else 0)
+          PY

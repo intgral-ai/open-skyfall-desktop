@@ -7,6 +7,9 @@ FILE holds the changed paths relative to the repository root, separated by NUL (
 "-" reads standard input. --metadata is the output of `cargo metadata --no-deps
 --format-version 1` (run on demand when omitted).
 
+Rust-only API: select(meta, paths) returns (full, sorted package names). Its legacy
+CLI and scope remain unchanged; plan.py adds explicit monorepo applicability.
+
 Prints and optionally appends to $GITHUB_OUTPUT:
   full=true|false   test the whole workspace
   packages=a b c    the affected packages (empty when full, or when nothing needs building)

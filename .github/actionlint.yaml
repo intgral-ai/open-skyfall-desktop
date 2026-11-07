@@ -2,10 +2,6 @@ self-hosted-runner:
   labels:
     - self-hosted-fast
     - self-hosted-light
-    # Blacksmith (see the top of workflows/ci.yml).
-    - blacksmith-2vcpu-ubuntu-2404
-    - blacksmith-4vcpu-ubuntu-2404
-    - blacksmith-8vcpu-ubuntu-2404
-    - blacksmith-16vcpu-ubuntu-2404
-    - blacksmith-32vcpu-ubuntu-2404
-    - blacksmith-8vcpu-windows-2025
+    # Fork CI uses versioned GitHub-hosted labels. These entries only teach
+    # actionlint about optional self-hosted labels; they establish no access.
+    # No workflow currently relies on an external or Blacksmith runner label.

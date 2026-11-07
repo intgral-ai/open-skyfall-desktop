@@ -1,11 +1,11 @@
 # cargo-nextest settings for CI (`cargo xtask test` does not use nextest).
-# CI builds the tests once and runs them in one job on a 32 vCPU runner (.github/workflows/ci.yml),
-# except the GPU path tracer's tests (the gpu-path group below), which run in four shards of their own.
+# CI bounds test execution to two threads on standard runners (.github/workflows/ci.yml).
+# GPU path tests retain their serial group. Capacity must be established by real runner evidence.
 
 [profile.ci]
 # Heavy tests (one to twelve minutes each on a CI runner) that pull requests skip. They run on
-# every push to main and nightly (`--ignore-default-filter`), and in `cargo xtask test`. The
-# boolean_props property tests run only nightly (ci.yml excludes them from pushes to main).
+# every integration push and full/nightly/release validation (`--ignore-default-filter`),
+# and in `cargo xtask test`, including boolean_props. Full CI also exposes a raw property lane.
 # Keep this list in sync with docs/book/src/dev/testing.md and CONTRIBUTING.md.
 default-filter = """
 not (
@@ -39,7 +39,7 @@ path = "junit.xml"
 # and it starts first, beside the other slow tests.
 [[profile.ci.overrides]]
 filter = "binary(action_matrix) & test(=action_matrix_sample)"
-threads-required = 12
+threads-required = 2
 priority = 100
 
 # The slowest tests start first, so a shard does not end with one of them running alone on a
@@ -71,7 +71,8 @@ priority = 100
 # Each nextest test has its own process/device. Concurrent cold lavapipe path
 # compiles contend for CPU and can exhaust the 600 s pipeline setup budget.
 # Serialize this module per CI shard; other tests retain their normal parallelism.
-# CI runs these in their own job (GPU path tests in ci.yml), split into count partitions.
+# Fork CI includes these in the counted native selection; any future partitions
+# must use the same partition for listing and execution.
 [test-groups.gpu-path]
 max-threads = 1
 

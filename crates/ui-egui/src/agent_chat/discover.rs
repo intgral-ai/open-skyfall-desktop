@@ -581,14 +581,22 @@ mod tests {
             assert_eq!(std::env::var_os("PATH"), inherited_path, "only the child's PATH may change");
 
             let mut process = AgentProcess::spawn(&found.argv, &root, &[], || {}).unwrap();
-            let message = serde_json::json!({"id": 1, "method": "initialize"});
-            process.send(&message);
-            let reply = process.from_agent.recv_timeout(Duration::from_secs(20)).unwrap();
-            process.shutdown(true);
-            match reply {
-                FromAgent::Line(line) => assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), message),
-                FromAgent::Exited(tail) => panic!("the recovered adapter did not start: {tail:?}"),
+            let messages = [
+                serde_json::json!({"id": 1, "method": "initialize"}),
+                serde_json::json!({"id": 2, "method": "session/prompt", "text": "quote: \" slash: \\ newline: \n 零"}),
+            ];
+            for message in &messages {
+                process.send(message);
             }
+            let replies: Vec<_> = messages.iter().map(|_| process.from_agent.recv_timeout(Duration::from_secs(20)).unwrap()).collect();
+            process.shutdown(true);
+            for (reply, message) in replies.into_iter().zip(messages) {
+                match reply {
+                    FromAgent::Line(line) => assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), message),
+                    FromAgent::Exited(tail) => panic!("the recovered adapter did not start: {tail:?}"),
+                }
+            }
+            assert_eq!(std::env::var_os("PATH"), inherited_path, "the live session must not change the parent's PATH");
 
             // An older runtime that already runs the adapter is left alone.
             std::fs::write(old.join("node"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo v18.19.1; else echo adapter 9.9.9; fi\n").unwrap();
@@ -616,12 +624,13 @@ mod tests {
             (old.join("node"), BROKEN_NODE),
             (
                 newer.join("node"),
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo v22.0.0; elif [ \"$2\" = \"--version\" ]; then echo adapter 1.2.3; elif [ \"$(node --version)\" = v22.0.0 ]; then /bin/cat; else exit 1; fi\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo v22.0.0; elif [ \"$2\" = \"--version\" ]; then echo adapter 1.2.3; elif [ \"$(node --version)\" = v22.0.0 ]; then while IFS= read -r line; do printf '%s\\n' \"$line\"; done; else exit 1; fi\n",
             ),
         ] {
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let inherited_path = std::env::var_os("PATH");
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "agent_chat::discover::tests::a_node_adapter_recovers_from_an_incompatible_desktop_runtime", "--nocapture"])
             .env(CHILD, &root)
@@ -629,6 +638,7 @@ mod tests {
             .env("NPM_CONFIG_PREFIX", root.join("modern"))
             .output()
             .unwrap();
+        assert_eq!(std::env::var_os("PATH"), inherited_path, "the fixture must only restrict its child's PATH");
         let _ = std::fs::remove_dir_all(root);
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }
@@ -958,19 +968,29 @@ mod tests {
         const CHILD: &str = "SOLIDCRAFT_AGENT_PATH_TEST";
         if let Some(root) = std::env::var_os(CHILD) {
             let root = PathBuf::from(root);
+            let inherited_path = std::env::var_os("PATH");
             let agent = find_in("solidcraft-test-agent", &search_dirs()).unwrap();
             // Generous limits: both answer at once, but a whole test run on a loaded machine
             // can keep `env`, the shell and the script from starting within 3 s.
             assert_eq!(probe(&agent, Duration::from_secs(20)).version.as_deref(), Some("1.2.3"));
+            assert_eq!(std::env::var_os("PATH"), inherited_path, "discovery must not change the parent's PATH");
             let mut p = AgentProcess::spawn(&[agent.to_string_lossy().into_owned()], &root, &[], || {}).unwrap();
-            let message = serde_json::json!({"id": 1, "method": "initialize"});
-            p.send(&message);
-            let reply = p.from_agent.recv_timeout(Duration::from_secs(20)).unwrap();
-            p.shutdown(true);
-            match reply {
-                FromAgent::Line(line) => assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), message),
-                FromAgent::Exited(tail) => panic!("the agent could not start its runtime: {tail:?}"),
+            let messages = [
+                serde_json::json!({"id": 1, "method": "initialize"}),
+                serde_json::json!({"id": 2, "method": "session/prompt", "text": "quote: \" slash: \\ newline: \n 零"}),
+            ];
+            for message in &messages {
+                p.send(message);
             }
+            let replies: Vec<_> = messages.iter().map(|_| p.from_agent.recv_timeout(Duration::from_secs(20)).unwrap()).collect();
+            p.shutdown(true);
+            for (reply, message) in replies.into_iter().zip(messages) {
+                match reply {
+                    FromAgent::Line(line) => assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), message),
+                    FromAgent::Exited(tail) => panic!("the agent could not start its runtime: {tail:?}"),
+                }
+            }
+            assert_eq!(std::env::var_os("PATH"), inherited_path, "the live session must not change the parent's PATH");
             return;
         }
 
@@ -979,13 +999,17 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         for (name, script) in [
             ("solidcraft-test-agent", "#!/usr/bin/env solidcraft-test-runtime\n"),
-            ("solidcraft-test-runtime", "#!/bin/sh\nif [ \"$2\" = \"--version\" ]; then printf 'test-agent 1.2.3\\n'; else cat; fi\n"),
+            (
+                "solidcraft-test-runtime",
+                "#!/bin/sh\nif [ \"$2\" = \"--version\" ]; then printf 'test-agent 1.2.3\\n'; else while IFS= read -r line; do printf '%s\\n' \"$line\"; done; fi\n",
+            ),
         ] {
             let path = bin.join(name);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         // Change only a child process's environment: no global mutation or unsafe set_var.
+        let inherited_path = std::env::var_os("PATH");
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "agent_chat::discover::tests::desktop_path_can_start_an_agent_and_its_runtime", "--nocapture"])
             .env(CHILD, &root)
@@ -994,6 +1018,7 @@ mod tests {
             .env_remove("NPM_CONFIG_PREFIX")
             .output()
             .unwrap();
+        assert_eq!(std::env::var_os("PATH"), inherited_path, "the fixture must only restrict its child's PATH");
         let _ = std::fs::remove_dir_all(root);
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }

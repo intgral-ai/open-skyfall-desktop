@@ -1,5 +1,4 @@
-# Files generated from the code are rewritten here, on main, after each merge, so pull requests
-# never edit them (two pull requests that each regenerated one would always conflict):
+# Generated files go through a draft integration PR, never a protected-branch bypass:
 # THIRD-PARTY-LICENSES.txt (`cargo xtask licences`) and docs/features.md (`cargo xtask features`).
 # Pending files (assets/locales/pending, attribution/pending) are folded into the catalogs and
 # ATTRIBUTION.md by `cargo xtask fold-pending`.
@@ -7,7 +6,7 @@ name: Generated files
 
 on:
   push:
-    branches: [main]
+    branches: [develop]
     # THIRD-PARTY-LICENSES.txt follows the manifests, the lockfile, the vendored crates' licence
     # files and the fonts' licences; docs/features.md follows the command registry (crates/engine),
     # read through solidcraft-cli. Other pushes regenerate nothing.
@@ -25,7 +24,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 # One run at a time; a burst of merges leaves one run waiting, which sees all of them.
 concurrency:
@@ -33,17 +32,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  regenerate:
-    name: Regenerate and commit
+  generate:
+    name: Generate data at the trusted integration SHA
+    if: github.ref == 'refs/heads/develop'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      # Always main itself, never pull request code, since this job can push.
+      # Never check out the reserved branch or persist a token for Cargo to read.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
-          # main goes through the merge queue; this deploy key may push past it.
-          ssh-key: ${{ secrets.GENERATED_FILES_DEPLOY_KEY }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -54,15 +53,119 @@ jobs:
         run: cargo xtask features
       - name: Pending locale strings and attribution rows
         run: cargo xtask fold-pending
-      - name: Commit if changed
+      - name: Capture only regular generated output data
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+          OUTPUT_FILE: ${{ runner.temp }}/generated-output/generated.json
         run: |
-          if [ -z "$(git status --porcelain)" ]; then echo "unchanged"; exit 0; fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A THIRD-PARTY-LICENSES.txt docs/features.md assets/locales ATTRIBUTION.md attribution
-          git commit -m "Regenerate generated files and fold pending files [skip ci]"
-          for _ in 1 2 3; do
-            git pull --rebase origin main && git push origin HEAD:main && exit 0
-            sleep 10
-          done
-          exit 1
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const checks = require('./scripts/pr-checks/pr-checks.js');
+          const data = checks.captureGenerated({ cwd: process.cwd(), sourceRevision: process.env.SOURCE_REVISION });
+          fs.mkdirSync(path.dirname(process.env.OUTPUT_FILE), { recursive: true });
+          fs.writeFileSync(process.env.OUTPUT_FILE, JSON.stringify(data));
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generated-output
+          path: ${{ runner.temp }}/generated-output/generated.json
+          if-no-files-found: error
+
+  maintain:
+    name: Maintain only generated blobs and a draft PR
+    needs: generate
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # The executable module always comes from this fixed trusted SHA, not the artifact or branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: generated-output
+          path: ${{ runner.temp }}/generated-output
+      - name: Require any existing generation PR to remain draft
+        id: draft
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { data: pulls } = await github.rest.pulls.list({
+              ...context.repo, state: 'open', head: `${context.repo.owner}:chore/generated-files`,
+            });
+            if (pulls.length > 1 || pulls.some((p) => !p.draft || p.base.ref !== 'develop')) {
+              core.setFailed('Generation blocked: the reserved branch must have at most one draft PR to develop. Finish or close its current PR before regenerating.');
+            }
+      - name: Validate reserved delta and prepare only generated Git blobs
+        id: branch
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+          OUTPUT_FILE: ${{ runner.temp }}/generated-output/generated.json
+        with:
+          script: |
+            try {
+              const checks = require('./scripts/pr-checks/pr-checks.js');
+              const payload = JSON.parse(require('node:fs').readFileSync(process.env.OUTPUT_FILE, 'utf8'));
+              const result = checks.prepareGenerated({ cwd: process.cwd(), sourceRevision: process.env.SOURCE_REVISION, payload });
+              core.setOutput('changed', result.changed);
+              core.setOutput('expected-head', result.expectedHead);
+              core.setOutput('commit', result.commit || '');
+            } catch (error) {
+              core.setFailed(`Generation blocked: ${error.message}`);
+            }
+      - name: Recheck PR and branch head then push only prepared output
+        id: commit
+        if: steps.branch.outputs.changed == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EXPECTED_HEAD: ${{ steps.branch.outputs.expected-head }}
+          PREPARED_COMMIT: ${{ steps.branch.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            try {
+              const checks = require('./scripts/pr-checks/pr-checks.js');
+              await checks.pushGenerated({ github, context, cwd: process.cwd(), expectedHead: process.env.EXPECTED_HEAD,
+                commit: process.env.PREPARED_COMMIT, token: process.env.GH_TOKEN });
+            } catch (error) {
+              core.setFailed(`Generation blocked: ${error.message}`);
+            }
+      - name: Open or update the draft PR to develop
+        id: pull-request
+        if: steps.branch.outputs.changed == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            try {
+              const { data: pulls } = await github.rest.pulls.list({
+                ...context.repo, state: 'open', head: `${context.repo.owner}:chore/generated-files`,
+              });
+              if (pulls.length > 1 || pulls.some((p) => !p.draft || p.base.ref !== 'develop')) {
+                core.setFailed('Generation blocked: only a draft PR to develop may be updated.');
+                return;
+              }
+              const details = {
+                ...context.repo,
+                title: 'Refresh generated reference files and pending catalogs',
+                body: 'Refresh generated reference files and fold pending locale and attribution entries.\n\n' +
+                  'This is a draft, not CI evidence. GITHUB_TOKEN writes do not reliably trigger PR CI. ' +
+                  'An authorized maintainer must review the diff, use ready-for-review, and observe real checks for the current head before merging. ' +
+                  'After any later bot update, a maintainer must trigger validation again.\n\nChanges a default: no',
+              };
+              if (pulls.length) {
+                await github.rest.pulls.update({ ...details, pull_number: pulls[0].number });
+              } else {
+                await github.rest.pulls.create({ ...details, head: 'chore/generated-files', base: 'develop', draft: true });
+              }
+              core.warning('Generated draft staged only: CI is not guaranteed by GITHUB_TOKEN writes. A maintainer must trigger and observe real PR checks before merge.');
+            } catch (error) {
+              core.setFailed(`Generation blocked: repository token could not create or update the draft PR (${error.message}). Request any narrow permission separately from a maintainer; no credential or direct-push fallback is allowed.`);
+            }

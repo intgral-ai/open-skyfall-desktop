@@ -19,8 +19,9 @@
 # them (the UI, docs, packaging) starts no runner at all, and a new area needs no edit here: the
 # plan finds the areas from the folders. Pushes to main and develop on the same paths, merge groups
 # (once the queue is on), the release gate (release-gate.yml, workflow_call) and a run by hand run
-# every area; those pushes also commit the compiler cache (a Blacksmith sticky disk) that every
-# other run mounts read-only.
+# every area. Reusable release validation explicitly forces full selection even
+# when the inherited caller event is a draft PR. Raw results and the existing
+# Rust graders are bound to this checkout; no carried result or success stub.
 name: Kernel rig
 
 on:
@@ -43,6 +44,7 @@ on:
       - "xtask/src/kernel_cases.rs"
       - "xtask/src/kernel_ladder.rs"
       - "scripts/ci/kernel_rig_plan.py"
+      - "scripts/ci/gate.py"
       - "scripts/ci/test_kernel_rig_plan.py"
       - ".github/workflows/kernel-rig.yml"
   push:
@@ -65,29 +67,42 @@ on:
       - "xtask/src/kernel_cases.rs"
       - "xtask/src/kernel_ladder.rs"
       - "scripts/ci/kernel_rig_plan.py"
+      - "scripts/ci/gate.py"
       - "scripts/ci/test_kernel_rig_plan.py"
       - ".github/workflows/kernel-rig.yml"
   merge_group:
   workflow_call:
+    inputs:
+      concurrency_namespace:
+        type: string
+        default: reusable
+      full_validation:
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # A new push to a pull request replaces its old run.
-  group: kernel-rig-${{ github.event_name }}-${{ github.ref }}
+  # Dedup updates within each caller/ref, never cancel direct and reusable runs
+  # of the same PR against one another.
+  group: kernel-rig-${{ inputs.concurrency_namespace || 'direct' }}-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: target/rig
+  SOLIDCRAFT_GPU: software
+  SOLIDCRAFT_REQUIRE_GPU: "1"
+  WGPU_BACKEND: vulkan
 
 jobs:
   plan:
     name: Select the rig areas
-    # Draft pull requests run no CI, as in ci.yml.
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: inputs.full_validation || github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       # The shard matrix (JSON list of areas and the ladder; [] when nothing is selected).
@@ -97,142 +112,180 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A pull request's diff needs its base's history.
-          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Selection self-test
         run: python3 -I scripts/ci/test_kernel_rig_plan.py
       - id: plan
         name: Map the changed files to areas
         env:
           EVENT_NAME: ${{ github.event_name }}
+          FULL_VALIDATION: ${{ inputs.full_validation || false }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Pull requests run the areas their diff reaches; pushes, merge groups, the release
-          # gate and a run by hand run every area.
-          if [ "$EVENT_NAME" = pull_request ]; then
-            git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/rig-paths"
-            git diff --no-renames "$BASE_SHA...$HEAD_SHA" -- Cargo.toml Cargo.lock > "$RUNNER_TEMP/rig-pin.diff"
-            python3 -I scripts/ci/kernel_rig_plan.py --paths "$RUNNER_TEMP/rig-paths" --pin-diff "$RUNNER_TEMP/rig-pin.diff" \
-              --github-output "$GITHUB_OUTPUT"
+          # Release calls force all areas + ladder regardless of PR/draft.
+          # Unavailable comparisons select full, never an empty successful diff.
+          if [ "$FULL_VALIDATION" = true ] || [ "$EVENT_NAME" != pull_request ]; then
+            set -- --all
+          elif git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/rig-paths" &&
+               git diff --no-renames "$BASE_SHA...$HEAD_SHA" -- Cargo.toml Cargo.lock > "$RUNNER_TEMP/rig-pin.diff"; then
+            set -- --paths "$RUNNER_TEMP/rig-paths" --pin-diff "$RUNNER_TEMP/rig-pin.diff"
           else
-            python3 -I scripts/ci/kernel_rig_plan.py --all --github-output "$GITHUB_OUTPUT"
+            set -- --all
           fi
+          python3 -I scripts/ci/kernel_rig_plan.py "$@" --root . --expected-revision "$GITHUB_SHA" \
+            --out rig-plan/plan.json --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-rig-plan-${{ github.sha }}
+          path: rig-plan/plan.json
+          if-no-files-found: error
 
   build:
     name: Build the CLI
     needs: plan
     if: needs.plan.outputs.build == 'true'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
-      SCCACHE_CACHE_SIZE: 10G
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: kernel-rig-plan-${{ github.sha }}
+          path: rig-plan
       - name: Size parallel compiles to the job's memory
         run: scripts/ci/build-jobs.sh
+      - name: Native build dependencies and software Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev libxkbcommon-dev libvulkan1 mesa-vulkan-drivers
       - uses: dtolnay/rust-toolchain@stable
-      # Only pushes to main and develop commit the cache; pull requests, merge groups and forks
-      # mount a clone and never write back.
-      - name: Mount the compiler cache
-        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
-        continue-on-error: true
-        with:
-          key: ${{ github.repository }}-sccache-kernel-rig
-          path: /home/runner/.cache/sccache
-          commit: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') && 'on-change' || 'false' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: kernel-rig
+          workspaces: . -> target/rig
+          cache-workspace-crates: false
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') }}
-      - name: Set up compiler cache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.16.0
-      - name: Build the CLI (release) and the rig's runner
+      - name: Runner image and available resources (not a capacity certification)
         run: |
-          cargo build --release --locked -p solidcraft-cli
-          cargo build --locked -p xtask
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          free -h
+          df -h .
+      - name: Build the CLI and rig runner; check command coverage; bind actual binary bytes
+        run: python3 -I scripts/ci/kernel_rig_plan.py build --plan rig-plan/plan.json --expected-revision "$GITHUB_SHA" --out rig-build
       # A tar keeps the executable bits, which an artifact drops. xtask finds the repository from
       # the path it was built in (CARGO_MANIFEST_DIR), which is the same checkout path in every
       # job of this workflow.
-      # Every registry command is used by a case or listed in tests/kernel-cases/EXEMPT.
-      - name: Every command has a case
-        run: target/debug/xtask kernel-cases --coverage --cli target/release/solidcraft-cli
-      # A coverage-only run (the registry or the cases changed, no area selected) runs no shard.
+      # Coverage-only builds also carry their binaries to the aggregate so their
+      # physical byte identities are checked, even when no shard was selected.
       - name: Pack the binaries
-        if: needs.plan.outputs.shards != '[]'
-        run: tar -cf "$RUNNER_TEMP/kernel-rig-bin.tar" -C target release/solidcraft-cli debug/xtask
+        run: tar -cf "$RUNNER_TEMP/kernel-rig-bin.tar" target/rig/release/solidcraft-cli target/rig/debug/xtask rig-build/build.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: needs.plan.outputs.shards != '[]'
         with:
-          name: kernel-rig-bin
+          name: kernel-rig-bin-${{ github.sha }}
           path: ${{ runner.temp }}/kernel-rig-bin.tar
           retention-days: 1
-      - name: Compiler cache statistics
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
-        run: sccache --show-stats
+        with:
+          name: kernel-rig-build-${{ github.sha }}
+          path: rig-build/build.json
+          if-no-files-found: error
 
   shard:
     name: Kernel rig (${{ matrix.shard }})
     needs: [plan, build]
     if: needs.plan.outputs.shards != '[]'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        # The areas of tests/kernel-cases/ the plan selected, and the ladder. On the build box
-        # (aarch64, 4 cases at a time) the slowest areas took about 1 minute (booleans, 212 s of
-        # cases with one of 84 s; threads, 161 s) and the ladder, one case at a time, 92 s: no area
-        # needs splitting.
+        # Bounded existing area partitions. Actual hosted memory/time limits still
+        # need measured Actions evidence; do not infer capacity from this label.
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: kernel-rig-bin
+          name: kernel-rig-plan-${{ github.sha }}
+          path: rig-plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: kernel-rig-bin-${{ github.sha }}
           path: ${{ runner.temp }}
       - name: Unpack the binaries
-        run: mkdir -p target && tar -xf "$RUNNER_TEMP/kernel-rig-bin.tar" -C target
+        run: tar -xf "$RUNNER_TEMP/kernel-rig-bin.tar"
+      - name: Runtime libraries and software Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2t64 libudev1 libxkbcommon0 libvulkan1 mesa-vulkan-drivers
       - name: Run the cases against the known-failing list (the ladder against its golden)
         env:
           SHARD: ${{ matrix.shard }}
-        run: |
-          if [ "$SHARD" = ladder ]; then
-            set -- --ladder --gate
-          else
-            set -- --area "$SHARD" --known-failing "tests/kernel-cases/$SHARD/KNOWN_FAILING"
-          fi
-          target/debug/xtask kernel-cases "$@" --cli target/release/solidcraft-cli --out "$RUNNER_TEMP/kernel-rig"
+        run: python3 -I scripts/ci/kernel_rig_plan.py shard --plan rig-plan/plan.json --expected-revision "$GITHUB_SHA" --shard "$SHARD" --out "rig-results/$SHARD"
       - name: Keep the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: kernel-rig-results-${{ matrix.shard }}
-          path: ${{ runner.temp }}/kernel-rig/**/results.json
-          if-no-files-found: ignore
+          name: kernel-rig-results-${{ matrix.shard }}-${{ github.sha }}
+          path: rig-results/
+          if-no-files-found: error
 
   # One check for the whole gate, for branch protection and the merge queue.
   kernel-rig:
     name: kernel-rig
     needs: [plan, build, shard]
-    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: always() && (inputs.full_validation || github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-24.04
     steps:
-      # A skipped build or shard counts as passed only when the plan selected none.
-      - name: Every selected job passed
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        with:
+          name: kernel-rig-plan-${{ github.sha }}
+          path: rig-plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always() && needs.build.result == 'success'
+        with:
+          name: kernel-rig-bin-${{ github.sha }}
+          path: ${{ runner.temp }}
+      - name: Unpack the same-run verified binary handoff
+        if: always() && needs.build.result == 'success'
+        run: tar -xf "$RUNNER_TEMP/kernel-rig-bin.tar"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always() && needs.plan.result == 'success' && needs.plan.outputs.shards != '[]'
+        with:
+          pattern: kernel-rig-results-*-${{ github.sha }}
+          path: rig-results
+          merge-multiple: true
+      # The adapter checks actual raw identities/outcomes and command exits, not
+      # a producer-supplied pass flag. Only unselected jobs may be skipped.
+      - name: Verify actual needs, same-source binaries, complete raw reports and graders
+        if: always()
         env:
-          PLAN: ${{ needs.plan.result }}
-          WANT_BUILD: ${{ needs.plan.outputs.build }}
-          WANT_SHARDS: ${{ needs.plan.outputs.shards }}
-          BUILD: ${{ needs.build.result }}
-          SHARDS: ${{ needs.shard.result }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          FULL_VALIDATION: ${{ inputs.full_validation || false }}
         run: |
-          echo "plan=$PLAN build=$BUILD shards=$SHARDS selected=$WANT_SHARDS"
-          test "$PLAN" = success
-          if [ "$WANT_BUILD" = true ]; then test "$BUILD" = success; else test "$BUILD" = skipped; fi
-          if [ "$WANT_SHARDS" != '[]' ]; then test "$SHARDS" = success; else test "$SHARDS" = skipped; fi
+          printf '%s\n' "$NEEDS_JSON" >rig-needs.json
+          set --
+          if [ "$FULL_VALIDATION" = true ]; then set -- --require-full; fi
+          python3 -I scripts/ci/kernel_rig_plan.py verify --plan rig-plan/plan.json --expected-revision "$GITHUB_SHA" \
+            --needs rig-needs.json --evidence . --handoff rig-handoff "$@"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-rig-handoff-${{ github.sha }}
+          path: rig-handoff/
+          if-no-files-found: error

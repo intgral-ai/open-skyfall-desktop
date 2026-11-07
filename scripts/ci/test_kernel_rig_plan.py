@@ -6,6 +6,9 @@ Uses a small synthetic tests/kernel-cases/, then the real one: every area has it
 KNOWN_FAILING, every glob names files that exist, and the workflow's trigger paths cover them all.
 """
 import os
+import hashlib
+import json
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -64,7 +67,7 @@ class Synthetic(unittest.TestCase):
         self.assertEqual(self.select("tests/kernel-cases/ladder/golden.json"), (["ladder"], True))
 
     def test_the_shared_core_runs_every_area(self):
-        for p in ["crates/geom/src/brep.rs", ".github/workflows/kernel-rig.yml"]:
+        for p in ["crates/geom/src/brep.rs", ".github/workflows/kernel-rig.yml", "scripts/ci/gate.py"]:
             self.assertEqual(self.select("docs/a.md", p), (["fillets", "shell", "ladder"], True), p)
 
     def test_unrelated_changes_run_nothing(self):
@@ -172,6 +175,254 @@ class Real(unittest.TestCase):
 
     def test_a_ui_change_runs_nothing(self):
         self.assertEqual(plan.select(ROOT, ["crates/ui-egui/src/app.rs", "docs/kernel-cases.md", "README.md"]), ([], False))
+
+
+class WorkflowEvidence(unittest.TestCase):
+    """Real adapter/subprocess boundaries; fixture binaries are not CAD evidence."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix=".rig-adapter-test-", dir=ROOT)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for name in ("fillets", "shell"):
+            write(self.root, f"tests/kernel-cases/{name}/PATHS", f"crates/kernel/src/{name}.rs\n")
+            write(self.root, f"tests/kernel-cases/{name}/KNOWN_FAILING")
+            write(self.root, f"tests/kernel-cases/{name}/one/recipe.json", "{}")
+            write(self.root, f"tests/kernel-cases/{name}/one/expected.json", "{}")
+        write(self.root, "tests/kernel-cases/PATHS-ALL", ".github/workflows/kernel-rig.yml\n")
+        write(self.root, "tests/kernel-cases/ladder/tier/two/recipe.json", "{}")
+        write(self.root, "tests/kernel-cases/ladder/tier/two/expected.json", "{}")
+        write(self.root, "tests/kernel-cases/ladder/ladder.json", json.dumps({"tiers": [
+            {"tier": "tier", "what": "fixture", "cases": ["fillets/one", "ladder/tier/two"]}]}))
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "tests"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-q", "-m", "rig source"], check=True)
+        self.sha = subprocess.check_output(["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).strip()
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts/ci").symlink_to(Path(ROOT) / "scripts/ci", target_is_directory=True)
+        self.env = dict(os.environ, GITHUB_SHA=self.sha, EVENT_NAME="pull_request", FULL_VALIDATION="true",
+                        BASE_SHA=self.sha, HEAD_SHA=self.sha, RUNNER_TEMP=str(self.root),
+                        GITHUB_OUTPUT=str(self.root / "outputs"))
+        self.tools = self.root / "fixture-tools"
+        self.tools.mkdir()
+        # Replace the expensive native compiler/runner boundary only. Actual
+        # Python adapter, git, raw files, hashes and child exit codes stay real.
+        runner = '''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args=sys.argv[1:]
+if args[:2] != ['kernel-cases', '--coverage'] and '--out' not in args:
+    sys.exit('unexpected fixture runner invocation')
+if '--coverage' in args:
+    sys.exit(1 if os.environ.get('RIG_FIXTURE_MODE') == 'coverage-fail' else 0)
+base=Path('tests/kernel-cases')
+if '--ladder' in args:
+    if '--gate' not in args: sys.exit('missing real ladder grader flag')
+    paths=['fillets/one', 'ladder/tier/two']
+else:
+    area=args[args.index('--area')+1]
+    if args[args.index('--known-failing')+1] != f'tests/kernel-cases/{area}/KNOWN_FAILING':
+        sys.exit('wrong reviewed grader')
+    paths=[f'{area}/one']
+rows=[dict(path=p, case=p.split('/')[-1], area=p.split('/')[0], status='pass') for p in paths]
+mode=os.environ.get('RIG_FIXTURE_MODE')
+if mode == 'empty': rows=[]
+if mode == 'partial': rows=rows[:-1]
+if mode == 'duplicate': rows+=rows[:1]
+if mode == 'skipped': rows[0]['status']='skipped'
+if mode == 'failed': rows[0]['status']='fail'
+out=Path(args[args.index('--out')+1]); out.mkdir(parents=True,exist_ok=True)
+(out/'results.json').write_text(json.dumps(rows))
+sys.exit(1 if mode == 'failed' else 0)
+'''
+        cargo = self.tools / "cargo"
+        cargo.write_text("#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\n"
+            "args=sys.argv[1:]\n"
+            "if args not in (['build','--release','--locked','-p','solidcraft-cli'], ['build','--locked','-p','xtask']): sys.exit('unexpected cargo args')\n"
+            "base=Path('target/rig'); (base/'release').mkdir(parents=True,exist_ok=True); (base/'debug').mkdir(parents=True,exist_ok=True)\n"
+            "for path,body in ((base/'release/solidcraft-cli', '#!/bin/sh\\nexit 0\\n'), (base/'debug/xtask', " + repr(runner) + ")):\n"
+            "    path.write_text(body); path.chmod(0o755)\n")
+        cargo.chmod(0o755)
+        self.env["PATH"] = str(self.tools) + os.pathsep + os.environ["PATH"]
+
+    def cli(self, *args, mode=None):
+        return subprocess.run([sys.executable, "-I", str(Path(ROOT) / "scripts/ci/kernel_rig_plan.py"), *map(str, args),
+                               "--root", str(self.root)], cwd=self.root,
+                              env={**self.env, **({"RIG_FIXTURE_MODE": mode} if mode else {})}, capture_output=True, text=True)
+
+    def select_workflow(self, full=True):
+        text = Path(WORKFLOW).read_text()
+        block = text.split("      - id: plan\n", 1)[1].split("\n  build:", 1)[0]
+        script = block.split("        run: |\n", 1)[1].split("\n      -", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], cwd=self.root,
+            env={**self.env, "FULL_VALIDATION": "true" if full else "false"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return dict(line.split("=", 1) for line in (self.root / "outputs").read_text().splitlines())
+
+    def prepared(self):
+        self.select_workflow()
+        path = self.root / "rig-plan/plan.json"
+        self.assertTrue(path.is_file(), "selected rig needs a source-bound execution plan")
+        build = self.cli("build", "--plan", path, "--expected-revision", self.sha, "--out", "rig-build")
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        return path
+
+    def complete(self):
+        path = self.prepared()
+        for shard in ("fillets", "shell", "ladder"):
+            result = self.cli("shard", "--plan", path, "--expected-revision", self.sha,
+                              "--shard", shard, "--out", "rig-results/" + shard)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (self.root / "needs.json").write_text(json.dumps({job: {"result": "success"} for job in ("plan", "build", "shard")}))
+        return path
+
+    def verify(self, path, *, handoff=None):
+        return self.cli("verify", "--plan", path, "--expected-revision", self.sha, "--needs", "needs.json",
+                        "--evidence", ".", "--require-full", *(["--handoff", handoff] if handoff else []))
+
+    def test_full_release_call_overrides_empty_pr_diff_and_draft_skip(self):
+        values = self.select_workflow()
+        self.assertEqual(json.loads(values["shards"]), ["fillets", "shell", "ladder"])
+        data = json.loads((self.root / "rig-plan/plan.json").read_text())
+        self.assertEqual(data["sourceRevision"], self.sha)
+        self.assertTrue(data["full"])
+        text = Path(WORKFLOW).read_text()
+        self.assertRegex(text, r"(?m)^    if: inputs.full_validation \|\| github.event_name != 'pull_request'")
+
+    def test_ordinary_unaffected_pr_keeps_explicit_empty_selection(self):
+        values = self.select_workflow(full=False)
+        self.assertEqual(json.loads(values["shards"]), [])
+        self.assertEqual(values["build"], "false")
+        path = self.root / "rig-plan/plan.json"
+        self.assertTrue(path.is_file(), "even an empty selection needs its source-bound plan")
+        self.assertEqual(json.loads(path.read_text())["sourceRevision"], self.sha)
+        (self.root / "needs.json").write_text(json.dumps({"plan": {"result": "success"},
+            "build": {"result": "skipped"}, "shard": {"result": "skipped"}}))
+        result = self.cli("verify", "--plan", path, "--expected-revision", self.sha,
+                          "--needs", "needs.json", "--evidence", ".")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not_applicable", result.stdout)
+        self.assertNotIn("graders satisfied", result.stdout)
+
+    def test_unavailable_pr_comparison_selects_full_instead_of_empty_success(self):
+        self.env["BASE_SHA"] = "0" * 40
+        values = self.select_workflow(full=False)
+        self.assertEqual(json.loads(values["shards"]), ["fillets", "shell", "ladder"])
+        self.assertTrue(json.loads((self.root / "rig-plan/plan.json").read_text())["full"])
+
+    def test_ordinary_registry_change_runs_coverage_even_without_shards(self):
+        write(self.root, "crates/engine/src/cmd/new.rs", "// fixture command\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "crates"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-q", "-m", "registry fixture"], check=True)
+        self.sha = subprocess.check_output(["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).strip()
+        self.env.update(GITHUB_SHA=self.sha, HEAD_SHA=self.sha)
+        values = self.select_workflow(full=False)
+        self.assertEqual(json.loads(values["shards"]), [])
+        self.assertEqual(values["build"], "true")
+        path = self.root / "rig-plan/plan.json"
+        build = self.cli("build", "--plan", path, "--expected-revision", self.sha, "--out", "rig-build")
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        (self.root / "needs.json").write_text(json.dumps({"plan": {"result": "success"},
+            "build": {"result": "success"}, "shard": {"result": "skipped"}}))
+        result = self.cli("verify", "--plan", path, "--expected-revision", self.sha,
+                          "--needs", "needs.json", "--evidence", ".")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("coverage command", result.stdout)
+        self.assertNotIn("area/ladder graders satisfied", result.stdout)
+        result = self.verify(path)
+        self.assertNotEqual(result.returncode, 0, "coverage-only evidence is never a full release rig")
+
+    def test_complete_actual_reports_and_build_bind_one_source_and_handoff(self):
+        path = self.complete()
+        result = self.verify(path, handoff="rig-handoff")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        verify = self.cli("verify-handoff", "--handoff", "rig-handoff", "--expected-revision", self.sha)
+        self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+        self.assertIn("4 case outcomes", verify.stdout)
+        build = json.loads((self.root / "rig-build/build.json").read_text())
+        self.assertEqual(build["sourceRevision"], self.sha)
+        self.assertEqual(build["planDigest"], hashlib.sha256(path.read_bytes()).hexdigest())
+
+    def test_empty_partial_skipped_duplicate_and_failed_raw_results_cannot_pass(self):
+        path = self.prepared()
+        for mode in ("empty", "partial", "skipped", "duplicate", "failed"):
+            with self.subTest(mode=mode):
+                result = self.cli("shard", "--plan", path, "--expected-revision", self.sha,
+                                  "--shard", "ladder", "--out", "bad-" + mode, mode=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("unrecognized arguments", result.stderr)
+
+    def test_missing_partial_stale_or_tampered_handoff_cannot_satisfy_full_gate(self):
+        path = self.complete()
+        for kind in ("missing", "partial", "stale", "stale-shard", "tampered", "wrong-plan", "empty-rehashed", "failed-command"):
+            with self.subTest(kind=kind):
+                result = self.verify(path, handoff="handoff-" + kind)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                directory = self.root / ("handoff-" + kind)
+                if kind == "missing":
+                    (directory / "rig-results/ladder/receipt.json").unlink()
+                elif kind == "partial":
+                    (directory / "rig-results/shell/results.json").write_text("[]")
+                elif kind == "stale":
+                    file = directory / "rig-build/build.json"
+                    value = json.loads(file.read_text()); value["sourceRevision"] = "0" * 40
+                    file.write_text(json.dumps(value))
+                elif kind == "wrong-plan":
+                    file = directory / "plan.json"
+                    value = json.loads(file.read_text()); value["shards"] = ["ladder"]
+                    file.write_text(json.dumps(value))
+                elif kind in ("stale-shard", "failed-command", "empty-rehashed"):
+                    file = directory / "rig-results/ladder/receipt.json"
+                    value = json.loads(file.read_text())
+                    if kind == "stale-shard": value["sourceRevision"] = "0" * 40
+                    elif kind == "failed-command": value["commands"][0]["exitCode"] = 1
+                    else:
+                        report = directory / "rig-results/ladder/results.json"
+                        report.write_text("[]")
+                        value["resultsDigest"] = hashlib.sha256(report.read_bytes()).hexdigest()
+                    file.write_text(json.dumps(value))
+                else:
+                    (directory / "rig-results/ladder/results.json").write_text("[{\"path\":\"invented\",\"status\":\"pass\"}]")
+                result = self.cli("verify-handoff", "--handoff", directory, "--expected-revision", self.sha)
+                self.assertNotEqual(result.returncode, 0, kind)
+
+    def test_failed_cancelled_skipped_missing_real_needs_and_wrong_binary_fail(self):
+        path = self.complete()
+        for job in ("plan", "build", "shard"):
+            for status in ("failure", "cancelled", "skipped", "missing"):
+                with self.subTest(job=job, status=status):
+                    needs = {name: {"result": "success"} for name in ("plan", "build", "shard")}
+                    if status == "missing": del needs[job]
+                    else: needs[job]["result"] = status
+                    (self.root / "needs.json").write_text(json.dumps(needs))
+                    result = self.verify(path)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("real job result", result.stdout + result.stderr)
+        (self.root / "needs.json").write_text(json.dumps({job: {"result": "success"} for job in ("plan", "build", "shard")}))
+        (self.root / "target/rig/debug/xtask").write_text("tampered")
+        result = self.verify(path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("binary", result.stdout + result.stderr)
+
+    def test_coverage_failure_and_old_checkout_do_not_produce_successful_builds(self):
+        path = self.prepared()
+        result = self.cli("build", "--plan", path, "--expected-revision", self.sha, "--out", "bad-build", mode="coverage-fail")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("unrecognized arguments", result.stderr)
+        result = self.cli("build", "--plan", path, "--expected-revision", "0" * 40, "--out", "old-build")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sourceRevision", result.stdout + result.stderr)
+
+    def test_rig_has_only_hosted_read_only_bounded_build_paths(self):
+        text = Path(WORKFLOW).read_text()
+        for forbidden in ("blacksmith", "stickydisk", "sccache", "continue-on-error", "secrets."):
+            self.assertNotIn(forbidden, text.lower())
+        self.assertNotRegex(text, r"(?m)^\s+[\w-]+: write\s*$")
+        self.assertIn("runs-on: ubuntu-24.04", text)
+        self.assertIn("persist-credentials: false", text)
 
 
 if __name__ == "__main__":

@@ -1,26 +1,14 @@
 # The documentation site on GitHub Pages: the book (docs/book) at https://docs.solidcraft.io/
-# and the web app at /app/ (the latest release), /app-rc/ (the newest release candidate) and
-# /app-edge/ (this commit). Needs Settings → Pages → Source = GitHub Actions; skipped while the
-# repository is private.
+# and the web app. Fork build/offline checks only; no deployment or inherited release downloads.
 name: Pages
 
 on:
-  push:
-    branches: [main]
-    # The site is the book and the web app: test data and the GitHub bots' scripts change neither.
-    paths-ignore: ["tests/**", "scripts/claim/**", "scripts/triage/**"]
+  pull_request:
+    paths: ["docs/**", "apps/solidcraft-web/**", "packaging/web/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Published release for Flatpak (empty: latest stable release)"
-        type: string
-        required: false
-        default: ""
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -33,15 +21,18 @@ env:
 
 jobs:
   build:
-    if: ${{ !github.event.repository.private }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
       - name: Install mdbook and trunk
         run: |
           mkdir -p "$HOME/.local/bin"
@@ -67,32 +58,17 @@ jobs:
           mkdir -p site
           cp -r target/book/. site/
           bash docs/book/seo.sh site  # canonical links, robots.txt, sitemap.xml
-      - name: Add the web app channels (stable and release candidate from their releases, edge from this build)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash packaging/web-channels.sh site dist/web
-      - uses: actions/configure-pages@v5
-        id: pages
-      - name: Install Flatpak repository tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak ostree
-      - name: Include the published Flatpak repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag || '' }}
-          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
-        run: bash packaging/flatpak-site.sh site
-      - uses: actions/upload-pages-artifact@v3
+      - name: Include only this checkout's web app
+        run: mkdir -p site/app-edge && cp -r dist/web/. site/app-edge/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          name: site-build-${{ github.sha }}
           path: site
+          if-no-files-found: error
 
   deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    name: Pages deployment disabled (not release evidence)
+    if: ${{ false && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - run: echo 'BLOCKED - Pages domains, transfer destinations and deployment require separate approval'

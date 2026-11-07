@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "nightly.sh"
+ROOT = SCRIPT.parent.parent
 
 
 def release(tag, published, *, draft=False, prerelease=False):
@@ -99,6 +101,71 @@ print(refs[args[2]])
         result, output, _, _ = self.run_decision([[release("missing", "2026-01-01T00:00:00Z")]])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(output, "")
+
+
+class ForkWorkflowSafety(unittest.TestCase):
+    """Catch executable publication paths, not the presence of old helper tests."""
+
+    WORKFLOWS = ("release", "release-gate", "docker", "pages", "flatpak-pages", "snap-store", "winget")
+
+    def workflow(self, name):
+        return (ROOT / ".github/workflows" / (name + ".yml")).read_text()
+
+    def test_no_event_or_manual_input_can_reactivate_a_publisher(self):
+        for name in self.WORKFLOWS:
+            with self.subTest(workflow=name):
+                text = self.workflow(name)
+                events = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+                self.assertNotRegex(events, r"(?m)^  (release|schedule|push):")
+                self.assertNotRegex(events, r"(?m)^      (draft|signpath_signing_policy|packages_only):")
+                self.assertNotRegex(text, r"gh release (create|edit|upload|delete)|snapcraft (upload|promote)|--submit\b|gh workflow run")
+
+    def test_builds_never_receive_signing_or_publication_credentials(self):
+        for name in self.WORKFLOWS:
+            with self.subTest(workflow=name):
+                text = self.workflow(name)
+                self.assertNotIn("secrets.", text)
+                self.assertNotRegex(text, r"(?m)^\s+[\w-]+: write\s*$")
+                self.assertNotRegex(text, r"signpath/github-action|docker/login-action|actions/deploy-pages|signing.sh|--sign\b")
+                self.assertNotRegex(text, r"(?m)^\s+push: true\s*$")
+
+    def test_disabled_publishers_are_separate_from_build_jobs(self):
+        for name, job in (("docker", "publish"), ("pages", "deploy"),
+                          ("flatpak-pages", "publish"), ("snap-store", "promote"), ("winget", "submit")):
+            with self.subTest(workflow=name):
+                block = re.search(r"(?ms)^  " + job + r":\n(.*?)(?=^  [\w-]+:|\Z)", self.workflow(name))
+                self.assertIsNotNone(block, "retain an explicit quarantined publisher job")
+                self.assertRegex(block[1], r"(?m)^    if: \$\{\{ false && github.event_name == 'workflow_dispatch' \}\}$")
+                gate = self.workflow("release-gate")
+                self.assertNotRegex(gate, r"needs:.*\b" + re.escape(name) + r"\b")
+
+    def test_package_failures_cannot_be_allowed_or_nightly_filtered(self):
+        text = self.workflow("release")
+        self.assertNotIn("continue-on-error", text)
+        self.assertNotIn("packaging/nightly.sh", text)
+        self.assertNotIn("needs.version.outputs.build", text)
+        self.assertNotRegex(text, r"(?m)^  release:")
+        # Keep actual platform packages and safe, nonpublishing checks.
+        for job in ("linux", "flatpak", "arch", "snap", "freebsd", "macos-build", "macos", "windows", "web"):
+            self.assertRegex(text, r"(?m)^  " + job + r":")
+        self.assertIn("packaging/docker/smoke-test.sh", self.workflow("docker"))
+        self.assertIn("cargo xtask web-offline-test --site dist/web", self.workflow("pages"))
+
+    def test_package_smokes_do_not_start_network_enabled_desktop(self):
+        text = self.workflow("release")
+        self.assertNotIn("python3 packaging/linux/snap-smoke.py", text)
+        self.assertIn("solidcraft.cli --version", text)
+        # Flatpak's existing sandbox denies network; keep its real desktop smoke.
+        manifest = (ROOT / "packaging/linux/flatpak/io.tangencylabs.solidcraft.bundle.yml").read_text()
+        self.assertNotRegex(manifest, r"(?m)^\s+- --share=network\s*$")
+        self.assertIn("packaging/linux/flatpak-bundle.sh", text)
+
+    def test_build_only_tokens_and_fork_integration_lints_are_read_only(self):
+        for name in ("packaging-lint", "lists"):
+            text = self.workflow(name)
+            self.assertRegex(text, r"branches: \[main, develop\]")
+            self.assertNotRegex(text, r"(?m)^\s+[\w-]+: write\s*$")
+        self.assertIn("scripts/ci/test_gate.py", self.workflow("packaging-lint"))
 
 
 if __name__ == "__main__":
