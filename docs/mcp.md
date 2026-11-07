@@ -377,6 +377,128 @@ Errors: an unknown tool or arguments that don't match the tool's schema are JSON
 (bad command parameters, a feature that fails) is a tool result with `isError: true` and the
 engine's message, which the model can read and correct.
 
+## Guarded execute and batch
+
+Only `execute` and `batch` accept optional outer `expectedDocument` alongside
+their existing tool arguments. Do not put it in CAD `params`, a batch step, or
+an `execute` wrapper inside a step. Omission keeps legacy behavior and result
+shapes; explicit null is invalid. Obtain the stamp using the **existing**
+`execute` command `document.revision`, which still returns the legacy
+`{document_id, revision}` with a native u64 JSON **number**. Preserve the original
+`document_id` as wire `documentId` and stringify the original integer digits.
+Rust `as_u64()`/`to_string()` or Python's JSON integer decoding is lossless;
+JavaScript must use a lossless integer/BigInt JSON decoder on the original
+response. Converting an already-rounded JavaScript Number to a string or BigInt
+cannot recover a revision above 2^53. No new discovery tool is needed.
+
+The wire stamp has exactly `{documentId, revision}`. Its ID matches
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; its revision is an ASCII canonical decimal
+**string**, `"0"` through `"18446744073709551615"`. Non-string revisions,
+leading zeros, signs, fractions, exponents, whitespace, non-ASCII digits,
+overflow and missing/extra stamp fields are rejected. This does not change the
+native Engine `DocumentStamp {document_id: String, revision: u64}` or the legacy
+numeric revision response.
+
+The guarded command subset and host behavior are defined in
+[Guarded document execution](control-protocol.md#guarded-document-execution).
+Supported namespaces are `appearance`, `assembly`, `body`, `component`, `config`,
+`construct`, `contact`, `explode`, `expr`, `face`, `joint`, `material`, `mesh`,
+`model`, `occurrence`, `parameters`, `plastic`, `sheet`, `sketch`, `solid`,
+`surface`, `timeline`, plus the exact inspection/history/visibility commands
+listed there. Exclusions take priority: file/import/export/save/library operations,
+file-shaped top-level CAD parameters, in-place component editing/link updates,
+timeline playback and appearance favorites. File/open/new/recovery, script,
+tab-switch, panel/layout and render-job routes are unsupported. Tool aliases in
+a batch are mapped before this policy check; a forbidden step rejects the whole
+batch before effects. Unknown commands keep their native diagnostics.
+`document.snapshot.capture` (#11) is **not implemented**: there is no frozen
+snapshot or isolated workspace guarantee.
+
+The bridge checks `control.capabilities.result.guardedExecution` on the **same
+connection**: `{version:"1.0",execute:true,batch:true}` advertises this subset.
+Absent capabilities refuse before the original operation is sent. Non-off
+parameter checking also requires the requested level capability and reply echo.
+A new connection cannot borrow an old capability cache. Guarded batch never
+falls back to per-step Backend calls, and guarded operations are never
+automatically resent after transmission failure. The native limit stays 10 000
+steps. Remote checks the actual serialized guarded batch JSON text, including
+scope/authentication and parameter-check fields, against the existing 16 MiB
+budget before writing; the existing single framing LF is separate. This is not
+a claim that every application reader rejects every oversized input.
+
+Guarded execute's structured body is `{result:<native JSON>,documentStamp}`,
+including primitive, array and null native results. Guarded batch keeps its
+existing result fields and adds `documentStamp`; `verbose:false` compacts only
+the native payload, not stamp/error/effect metadata. `structuredContent` agrees
+with the readable JSON content block. Protocol rejections have `isError:true`
+and body `{error:<Error object>,message:<string>}`; ordinary command errors
+remain command errors. `STALE_DOCUMENT` includes `{expected,current}`, with
+`current:null` for a closed/missing host target. Stale refusal writes nothing
+and changes no undo/checkpoint state; it is not evidence of a rollback.
+
+The batch base is checked once at application. Guarded rollback true/default
+requires checkpoint establishment before the first step. Failure reports
+`completed:0`, `results:[]`, `undone:0`, `rolled_back:false`, all steps in
+`not_run`, `failed.index:null`, `failed.command:"edit.checkpoint"` and
+`failed.stage:"checkpoint"`. Explicit `rollback:false` needs no checkpoint and
+can leave partial success applied. Later restore failure keeps the actual
+`rolled_back:false` and effect facts; do not infer atomic success from a request
+for rollback. Failed batch bodies are tool errors even when control's outer
+carrier was `ok:true`.
+
+The host checks the original guard again before final application/delivery,
+including reads made on a copy. Leaving a tab invalidates admitted work;
+returning to it cannot resurrect it. Stop closes trusted turn authority
+immediately, independent of version matching, without undoing earlier edits.
+A command-chip Stop only cancels that command. JSON turn/active fields cannot
+create trusted authority.
+
+Same-connection pending is different from disconnected **unknown**. Use the
+existing `pending` tool to retrieve the original result, never resend it.
+`pending:true` is not a failed CAD operation; `outcomeUnknown:true` means the
+effect cannot be established from the connection. `notSent:true` is a distinct
+pre-send refusal, not an unknown result. Missing/invalid success stamps or a
+required parameter-check echo are unknown after sending. Do not silently retry
+with a refreshed stamp, reconnect-and-replay, or fall back to individual steps.
+
+`expect` measures with a guard using the **applied result stamp**, not the
+original base or an unrelated current state. Mismatch sets `isError:true` but
+retains the write and stamp. If that measurement is stale/unverifiable, the
+expectation cannot certify the write; it still does not erase it. Pending
+results retain the original effect facts with `expectation:null` and a note:
+tool-level expectations were not executed and are not deferred to another state.
+
+### Checked guarded examples
+
+Each entry below names the tool and its arguments (the `params` of a normal
+JSON-RPC `tools/call` carries `{name:<tool>,arguments:<arguments>}`). `reply` is
+the tool's **structured body**, not an entire JSON-RPC response; `isError` is the
+tool-result flag. These examples are not captured app logs. Tests map real
+before/after native stamps to `doc-A`/`"9007199254740993"` and
+`doc-A`/`"9007199254740994"`; these are template states, not assumed counter
+increments. Closed, primitive and pending entries are Task7 protocol fixtures
+run through the real Remote/tools path, not proof that `parameters.list` returns
+7 or that Headless closes GUI tabs. Other entries use actual Headless/tool/native
+paths. Both thin-parser tests also consume the identical literal UTF-8
+`envelope-vectors` in [control-protocol.md](control-protocol.md#checked-guarded-examples).
+#5 owns the authoritative corpus/types/manifest, still pending delivery; these
+tests do not establish TypeScript compatibility or owner adoption.
+
+<!-- guarded-examples -->
+```json
+[
+  {"label":"matching-execute","tool":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"result":{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}},
+  {"label":"matching-batch","tool":"batch","arguments":{"commands":[{"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},{"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}],"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"ok":true,"completed":2,"results":[{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},{"name":"width","expression":"30 mm","value":30.0,"display_value":30.0,"recomputed":0,"restored":0,"errors":[]}],"undone":0,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}},
+  {"label":"stale","tool":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"error":{"code":"STALE_DOCUMENT","message":"The document changed before this write could apply.","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":{"documentId":"doc-A","revision":"9007199254740994"}}},"message":"The document changed before this write could apply."}},
+  {"label":"closed","tool":"execute","arguments":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"error":{"code":"STALE_DOCUMENT","message":"stale","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}},"message":"stale"}},
+  {"label":"unsupported","tool":"execute","arguments":{"command":"file.new","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"error":{"code":"UNSUPPORTED_CAPABILITY","message":"This execution path does not support guarded requests.","retry":"never","details":{"capability":"file.new"}},"message":"This execution path does not support guarded requests."}},
+  {"label":"primitive-wrapper","tool":"execute","arguments":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}},
+  {"label":"pending","tool":"execute","arguments":{"command":"parameters.list","expect":{"bodies":0},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"pending":"`engine.execute` (parameters.list)","done":true,"result":{"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}},"expectation":null,"note":"Tool-level expectation checks were not executed for this pending request; the original effect facts are retained."}},
+  {"label":"expectation-failed","tool":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expect":{"bodies":1},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"result":{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"},"expectation":{"ok":false,"measured":{"volume_mm3":0.0,"bodies":0,"bbox":null},"expected":{"bodies":1},"mismatch":["bodies: measured 0, expected 1"]}}}
+]
+```
+<!-- /guarded-examples -->
+
 ### Long-running requests
 
 The app answers a control request that runs longer than 60 seconds (a big fillet, say) with

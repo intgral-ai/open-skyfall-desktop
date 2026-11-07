@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_setup;
+pub mod batch;
 pub mod batch_params;
 pub mod batch_preflight;
 pub mod capture;
@@ -124,6 +125,20 @@ impl From<solidcraft_io::IoError> for EngineError {
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
+
+/// The identity and current design revision of a live session (not its view revision).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentStamp {
+    pub document_id: String,
+    pub revision: u64,
+}
+
+/// A document precondition mismatch, or the original error from a permitted command.
+#[derive(Debug)]
+pub enum ConditionedError {
+    Changed { expected: DocumentStamp, current: DocumentStamp },
+    Command(EngineError),
+}
 
 /// Something selected in the model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1628,6 +1643,31 @@ impl Session {
             self.model.adopt_solved_sketches(Arc::make_mut(&mut self.doc));
         }
         Ok(())
+    }
+
+    /// The open design's identity and actual revision, as reported by `document.revision`.
+    pub fn document_stamp(&mut self) -> DocumentStamp {
+        let revision = self.design_revision();
+        DocumentStamp { document_id: self.document_id.clone(), revision }
+    }
+
+    /// Refuse a different or changed design before a caller applies its work.
+    pub fn check_document_stamp(&mut self, expected: &DocumentStamp) -> std::result::Result<(), ConditionedError> {
+        let current = self.document_stamp();
+        if current == *expected { Ok(()) } else { Err(ConditionedError::Changed { expected: expected.clone(), current }) }
+    }
+
+    /// Check the live design, run the existing command path, then report its resulting stamp.
+    pub fn execute_if_current(
+        &mut self,
+        id: &str,
+        params: &Value,
+        expected: &DocumentStamp,
+    ) -> std::result::Result<(Value, DocumentStamp), ConditionedError> {
+        self.check_document_stamp(expected)?;
+        let result = self.execute(id, params).map_err(ConditionedError::Command)?;
+        let stamp = self.document_stamp();
+        Ok((result, stamp))
     }
 
     /// Run a command with JSON parameters (no dialogs). Undoable commands record an undo step

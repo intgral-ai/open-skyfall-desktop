@@ -217,6 +217,7 @@ fn put_view(app: &mut SolveApp, v: DocView) {
 
 /// Put `slot` into the app and return what was there.
 fn swap_in(app: &mut SolveApp, mut slot: DocSlot) -> DocSlot {
+    crate::execution_guard::invalidate_context(app);
     let reveals = crate::browser::take_reveals(app);
     crate::semantic_content::leave_document(app);
     if crate::render_workspace::active(app) {
@@ -465,6 +466,7 @@ pub fn active_is_blank(app: &SolveApp) -> bool {
 pub fn adopt(app: &mut SolveApp, session: Session) {
     if active_is_blank(app) {
         let rev = app.session.revision;
+        crate::execution_guard::invalidate_context(app);
         crate::browser::discard_reveals(app);
         crate::semantic_content::leave_document(app);
         crate::dialogs::cancel(app);
@@ -597,6 +599,7 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
     }
     app.docs.closing = None;
     if n <= 1 {
+        crate::execution_guard::invalidate_context(app);
         crate::browser::discard_reveals(app);
         crate::semantic_content::leave_document(app);
         // The last design: a blank one takes its place.

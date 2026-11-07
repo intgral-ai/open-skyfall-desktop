@@ -166,23 +166,19 @@ fn read_line(r: &mut impl BufRead, max: usize) -> std::io::Result<Option<Vec<u8>
             if available.is_empty() {
                 return Ok((!line.is_empty()).then_some(line));
             }
-            match available.iter().position(|b| *b == b'\n') {
-                Some(i) => {
-                    line.extend_from_slice(available.get(..i).unwrap_or(&[]));
-                    (true, i + 1)
-                }
-                None => {
-                    line.extend_from_slice(available);
-                    (false, available.len())
-                }
+            let newline = available.iter().position(|b| *b == b'\n');
+            let bytes = newline.unwrap_or(available.len());
+            // Bound JSON bytes before appending or returning, including the final LF block.
+            // The delimiter itself does not consume the request's JSON byte budget.
+            if bytes > max.saturating_sub(line.len()) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "request too large"));
             }
+            line.extend_from_slice(available.get(..bytes).unwrap_or(&[]));
+            (newline.is_some(), bytes + usize::from(newline.is_some()))
         };
         r.consume(used);
         if done {
             return Ok(Some(line));
-        }
-        if line.len() > max {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "request too large"));
         }
     }
 }
@@ -552,7 +548,8 @@ fn send_events(design: &DesignWatch, lines: &Lines, stop: &AtomicBool, mut seen:
 /// method"). `param_check`: the levels `engine.execute`, `engine.batch` and `engine.script` take
 /// as a request's own parameter check (#9184).
 fn capabilities() -> Value {
-    json!({"param_check": solidcraft_engine::schema::ParamCheck::ALL.map(|l| l.name())})
+    json!({"param_check": solidcraft_engine::schema::ParamCheck::ALL.map(|l| l.name()),
+        "guardedExecution":{"version":"1.0","execute":true,"batch":true}})
 }
 
 /// Write `reply` on the connection: through its subscription once it has one.
@@ -721,6 +718,82 @@ fn serve_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Uses the real server and UI control handler; the owner gate makes the stale result late.
+    #[test]
+    fn guarded_control_capability_is_additive_and_pending_preserves_metadata() {
+        use solidcraft_ui_egui::{Services, SolveApp, control};
+        static RUNNING: Running = Running::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = channel::<ControlRequest>();
+        let (base_tx, base_rx) = channel();
+        let (gate_tx, gate_rx) = channel();
+        let owner = std::thread::spawn(move || {
+            let mut app = SolveApp::new(solidcraft_engine::Session::default(), Services::default());
+            let ctx = egui::Context::default();
+            let stamp = app.session.document_stamp();
+            base_tx.send(json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()})).unwrap();
+            for req in rx {
+                if req.params["command"] == "parameters.list" {
+                    gate_rx.recv().unwrap();
+                }
+                let control::Outcome::Done(reply) = control::handle(&mut app, &ctx, &req) else { panic!("synchronous test command") };
+                req.reply.send(reply).unwrap();
+            }
+            assert_eq!(app.session.doc.param("width").unwrap().expr, "30 mm");
+        });
+        let waits = Waits { short: Duration::from_millis(100), long: Duration::from_secs(10), token: TOKEN_WAIT };
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_with(stream, "test-guard-token", tx, egui::Context::default(), false, waits, &RUNNING, &DESIGN_WATCH);
+        });
+        let mut out = TcpStream::connect(addr).unwrap();
+        out.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut lines = BufReader::new(out.try_clone().unwrap());
+        let mut ask = |method: &str, params: Value| -> Value {
+            send(&mut out, &json!({"id":1,"method":method,"params":params,"token":"test-guard-token"})).unwrap();
+            let mut line = String::new();
+            lines.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        };
+        let base = base_rx.recv().unwrap();
+        let capability = ask("control.capabilities", json!({}));
+        assert_eq!(capability["result"]["guardedExecution"], json!({"version":"1.0","execute":true,"batch":true}));
+        assert_eq!(capability["result"]["param_check"], json!(["off", "warn", "strict"]));
+        let write =
+            ask("engine.execute", json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":base}));
+        assert_eq!(write["ok"], true);
+        assert_eq!(write["result"]["value"], 20.0);
+        assert_ne!(write["documentStamp"], base);
+        let batch = ask(
+            "engine.batch",
+            json!({"expectedDocument":write["documentStamp"],"commands":[{"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}]}),
+        );
+        assert_eq!(batch["result"]["completed"], 1);
+        assert_ne!(batch["documentStamp"], write["documentStamp"]);
+        let late = ask("engine.execute", json!({"command":"parameters.list","expectedDocument":base}));
+        assert_eq!(late["running"], true);
+        assert_eq!(ask("control.capabilities", json!({}))["result"], capability["result"], "query while pending is not busy");
+        gate_tx.send(()).unwrap();
+        // The watch removes the ticket only after putting the original reply in its receiver.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask("control.running", json!({}))["result"]["running"].as_array().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+        }
+        assert_eq!(ask("control.capabilities", json!({}))["result"], capability["result"], "query must not consume a completed pending reply");
+        let pending = ask("control.pending", json!({}));
+        assert_eq!(pending["result"]["method"], "engine.execute");
+        assert_eq!(pending["result"]["done"], true);
+        let stale = &pending["result"]["reply"];
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["errorDetails"]["code"], "STALE_DOCUMENT");
+        assert_eq!(stale["errorDetails"]["details"], json!({"expected":base,"current":batch["documentStamp"]}));
+        drop(lines);
+        drop(out);
+        server.join().unwrap();
+        owner.join().unwrap();
+    }
 
     /// A connection that doesn't show the token in time is closed without a word, however it fills
     /// the time. One that does keeps working when it idles for longer than that.
@@ -1208,6 +1281,69 @@ mod tests {
         let e = read_line(&mut r, MAX_LINE).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
         assert!(e.to_string().contains("request too large"), "{e}");
+    }
+
+    #[test]
+    fn lines_cap_excludes_lf_in_every_final_buffer() {
+        let max = 1000;
+        for capacity in [64, 2048] {
+            for len in [max - 1, max, max + 1] {
+                for newline in [true, false] {
+                    let mut bytes = vec![b' '; len];
+                    if newline {
+                        bytes.push(b'\n');
+                    }
+                    let mut reader = BufReader::with_capacity(capacity, bytes.as_slice());
+                    let got = read_line(&mut reader, max);
+                    if len <= max {
+                        assert_eq!(got.unwrap(), Some(vec![b' '; len]));
+                        assert!(read_line(&mut reader, max).unwrap().is_none());
+                    } else {
+                        assert!(got.is_err(), "{len} bytes, capacity={capacity}, LF={newline}: {got:?}");
+                        let error = got.unwrap_err();
+                        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                        assert_eq!(error.to_string(), "request too large");
+                    }
+                }
+            }
+            let mut reader = BufReader::with_capacity(capacity, b"\n".as_slice());
+            assert_eq!(read_line(&mut reader, 0).unwrap(), Some(vec![]));
+            assert_eq!(read_line(&mut reader, 0).unwrap(), None);
+            let mut reader = BufReader::with_capacity(capacity, b"".as_slice());
+            assert_eq!(read_line(&mut reader, max).unwrap(), None);
+        }
+    }
+
+    // Valid authenticated JSON with an overlong whitespace tail must be rejected by the real
+    // reader before auth/dispatch, not just by the no-LF flood or invalid-token branches.
+    #[test]
+    fn serve_refuses_overlong_valid_json_with_lf_before_ui_queue() {
+        use std::io::Read;
+        static RUNNING: Running = Running::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = channel::<ControlRequest>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let waits = Waits { short: Duration::from_millis(100), long: Duration::from_secs(10), token: TOKEN_WAIT };
+            serve_with(stream, "test-line-token", tx, egui::Context::default(), false, waits, &RUNNING, &DESIGN_WATCH);
+        });
+        let mut bytes = serde_json::to_vec(&json!({"id":1,"method":"engine.execute","token":"test-line-token",
+            "params":{"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}}))
+        .unwrap();
+        bytes.resize(MAX_LINE + 1, b' ');
+        assert!(serde_json::from_slice::<Value>(&bytes).is_ok(), "not an auth or bad-JSON fixture");
+        bytes.push(b'\n');
+        let mut socket = TcpStream::connect(addr).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        socket.write_all(&bytes).unwrap();
+        socket.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut replies = String::new();
+        socket.read_to_string(&mut replies).unwrap();
+        server.join().unwrap();
+        assert_eq!(rx.try_iter().count(), 0, "no request entered the UI queue");
+        let replies: Vec<Value> = replies.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(replies, vec![json!({"ok":false,"error":"request too large"})], "one refusal, then EOF");
     }
 
     /// Ordinary framing: lines split on newlines, blank lines kept, no trailing newline needed.

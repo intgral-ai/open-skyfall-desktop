@@ -4,10 +4,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Value, json};
+use solidcraft_engine::DocumentStamp;
 use solidcraft_engine::io::vfs;
 use solidcraft_engine::timing;
 
 use crate::backend::{Backend, STILL_RUNNING};
+use crate::document_guard::{self, GuardedCallError, check_nested_stamps, check_supported, parse_expected_document, stamp_json};
 
 /// Most commands in one `batch` call.
 const MAX_BATCH: usize = 10_000;
@@ -62,6 +64,27 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, effect: Effect) -> V
 
 fn string(desc: &str) -> Value {
     json!({"type": "string", "description": desc})
+}
+
+fn document_stamp_schema() -> Value {
+    // Canonical 1–19 digits, or a 20-digit decimal no greater than u64::MAX.
+    // The end assertion also rejects trailing LF (which `$` alone can accept).
+    let revision_pattern = concat!(
+        "^(?:0|[1-9][0-9]{0,18}|",
+        "1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|",
+        "18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|",
+        "184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|",
+        "1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|",
+        "18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|",
+        "1844674407370955161[0-5])(?![\\s\\S])"
+    );
+    json!({
+        "type":"object", "additionalProperties":false, "required":["documentId","revision"],
+        "properties":{
+            "documentId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])"},
+            "revision":{"type":"string","maxLength":20,"pattern":revision_pattern,"description":"Canonical decimal u64, at most 18446744073709551615"}
+        }
+    })
 }
 
 /// The `expect` argument of `execute` and `batch`: what the design should measure once the
@@ -153,6 +176,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "params": {"type": "object", "description": "The command's parameters"},
                     "verbose": {"type": "boolean", "description": "false: omit the full feature body list and sketch ids repeated outside `created`; keep created_bodies, changed_bodies and removed_bodies (default true)"},
                     "expect": expect_schema(),
+                    "expectedDocument": document_stamp_schema(),
                 }),
                 &["command"],
             ),
@@ -187,6 +211,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "profile": {"type": "boolean", "description": "Like timings, and each step's `profile`: {boolean_ms, tessellate_ms, other_ms}, its time in kernel booleans, in tessellation and the rest (default false)"},
                     "verbose": {"type": "boolean", "description": "false: a compact reply. Feature steps leave out the full body list (created_bodies, changed_bodies and removed_bodies stay), sketch steps the ids they repeat outside `created` (default true)"},
                     "expect": expect_schema(),
+                    "expectedDocument": document_stamp_schema(),
                 }),
                 &["commands"],
             ),
@@ -486,6 +511,10 @@ fn type_matches(t: &str, v: &Value) -> bool {
 /// Validates `args` against the tool's schema (top level): unknown tool, missing required
 /// arguments, unknown arguments, type and enum mismatches.
 pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
+    tool_guard(name, args).map_err(|error| match error {
+        GuardedCallError::Rejected { message, .. } => message,
+        _ => "invalid document condition".into(),
+    })?;
     let defs = tool_definitions();
     let def = defs.iter().find(|d| d["name"] == name).ok_or_else(|| format!("unknown tool `{name}`"))?;
     let schema = &def["inputSchema"];
@@ -546,9 +575,21 @@ fn text_result(v: &Value, is_error: bool) -> Value {
 /// Run a tool. Failures are tool results with `isError: true` (the model sees the message);
 /// nothing here panics on hostile arguments.
 pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> Value {
+    let expected = match tool_guard(name, args) {
+        Ok(expected) => expected,
+        Err(error) => return guarded_error(error),
+    };
     let empty = Map::new();
     let a = args.as_object().unwrap_or(&empty);
+    if let Some(expected) = expected {
+        return match name {
+            "execute" => guarded_execute(b, a, &expected),
+            "batch" => guarded_batch(b, a, &expected),
+            _ => guarded_error(document_guard::unsupported("guarded tool")),
+        };
+    }
     let r = match name {
+        "pending" => return pending_tool(b),
         "screenshot" => return screenshot(b, a),
         "compare_picture" => return compare_picture(b, a),
         "batch" => return batch(b, a),
@@ -559,6 +600,127 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> Value {
     match r {
         Ok(v) => text_result(&v, false),
         Err(e) => text_result(&Value::String(e), true),
+    }
+}
+
+/// Shared by Server's argument validation and the direct public tool entry, before expect.
+fn tool_guard(name: &str, args: &Value) -> Result<Option<DocumentStamp>, GuardedCallError> {
+    let expected = parse_expected_document(args)?;
+    match name {
+        "execute" => check_nested_stamps("engine.execute", args)?,
+        "batch" => check_nested_stamps("engine.batch", args)?,
+        _ if expected.is_some() => {
+            return Err(document_guard::invalid("expectedDocument", "expectedDocument is only supported by execute and batch"));
+        }
+        _ => {}
+    }
+    Ok(expected)
+}
+
+fn guarded_text(body: &Value, is_error: bool) -> Value {
+    let mut reply = text_result(body, is_error);
+    reply["structuredContent"] = body.clone();
+    reply
+}
+
+fn guarded_error(error: GuardedCallError) -> Value {
+    let body = match error {
+        GuardedCallError::Rejected { message, error_details } => json!({"error":error_details,"message":message}),
+        GuardedCallError::CommandFailed(message) => json!({"error":message}),
+        GuardedCallError::Pending(message) => json!({"error":message,"pending":true,"expectation":null,
+            "note":"Tool-level expectation checks were not executed for this pending request. Retrieve its original result with pending; do not resend it."}),
+        GuardedCallError::OutcomeUnknown(message) => json!({"error":message,"outcomeUnknown":true}),
+        GuardedCallError::NotSent(message) => json!({"error":message,"notSent":true}),
+    };
+    guarded_text(&body, true)
+}
+
+fn guarded_execute(b: &mut dyn Backend, args: &Map<String, Value>, expected: &DocumentStamp) -> Value {
+    let expect = match Expect::parse(args) {
+        Ok(expect) => expect,
+        Err(error) => return text_result(&json!(error), true),
+    };
+    let mut params = Value::Object(args.clone());
+    if let Some(object) = params.as_object_mut() {
+        object.remove("expect");
+    }
+    params["expectedDocument"] = stamp_json(expected);
+    if let Err(error) = check_supported("engine.execute", &params) {
+        return guarded_error(error);
+    }
+    match b.call_guarded("engine.execute", params) {
+        Ok(reply) => {
+            let native = if args.get("verbose").and_then(Value::as_bool).unwrap_or(true) { reply.result } else { compact(reply.result) };
+            let body = json!({"result":native,"documentStamp":stamp_json(&reply.document_stamp)});
+            with_guarded_expectation(b, body, expect, &reply.document_stamp)
+        }
+        Err(error) => guarded_error(error),
+    }
+}
+
+fn guarded_batch(b: &mut dyn Backend, args: &Map<String, Value>, expected: &DocumentStamp) -> Value {
+    let expect = match Expect::parse(args) {
+        Ok(expect) => expect,
+        Err(error) => return text_result(&json!(error), true),
+    };
+    let Some(steps) = args.get("commands").and_then(Value::as_array) else {
+        return guarded_error(document_guard::invalid("commands", "commands must be an array of {command, params}"));
+    };
+    if steps.len() > MAX_BATCH {
+        return guarded_error(document_guard::invalid("commands", "batch exceeds the 10000 step limit"));
+    }
+    let mut mapped = Vec::with_capacity(steps.len());
+    let mut narrows = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        match batch_step(step) {
+            Ok((command, _, _)) if command.is_empty() => mapped.push(step.clone()),
+            Ok((command, params, narrow)) => {
+                if let Some(narrow) = narrow {
+                    narrows.push((i, narrow));
+                }
+                mapped.push(json!({"command":command,"params":params}));
+            }
+            Err(error) if error == "missing `command`" => mapped.push(step.clone()),
+            Err(error) => return guarded_error(document_guard::invalid("commands", &error)),
+        }
+    }
+    let mut params = Value::Object(args.clone());
+    if let Some(object) = params.as_object_mut() {
+        object.remove("expect");
+    }
+    params["commands"] = json!(mapped);
+    params["expectedDocument"] = stamp_json(expected);
+    if let Err(error) = check_supported("engine.batch", &params) {
+        return guarded_error(error);
+    }
+    // A cheap lower bound only; Remote checks its actual scoped/authenticated batch line.
+    if params.to_string().len() > solidcraft_engine::MAX_LINE {
+        return guarded_error(GuardedCallError::NotSent(
+            "The guarded batch exceeds the transport size limit; nothing was sent. It cannot run step by step.".into(),
+        ));
+    }
+    match b.call_guarded("engine.batch", params) {
+        Ok(reply) => {
+            let mut body = reply.result;
+            if !body.is_object() {
+                return guarded_error(GuardedCallError::OutcomeUnknown("The guarded batch did not return a batch object; do not resend it.".into()));
+            }
+            body["documentStamp"] = stamp_json(&reply.document_stamp);
+            let narrow = |i, value| match narrows.iter().find(|(index, _)| *index == i) {
+                Some((_, n)) => n.apply(value),
+                None => value,
+            };
+            let (body, failed) = batch_reply(
+                &body,
+                steps.len(),
+                args.get("rollback").and_then(Value::as_bool).unwrap_or(true),
+                args.get("verbose").and_then(Value::as_bool).unwrap_or(true),
+                &narrow,
+                true,
+            );
+            if failed { guarded_text(&body, true) } else { with_guarded_expectation(b, body, expect, &reply.document_stamp) }
+        }
+        Err(error) => guarded_error(error),
     }
 }
 
@@ -665,6 +827,10 @@ impl Expect {
     /// (`ok`, `measured`, `expected`, `mismatch`).
     fn check(&self, b: &mut dyn Backend) -> Result<Value, String> {
         let m = exec(b, "inspect.measure", json!({}))?;
+        Ok(self.compare(m))
+    }
+
+    fn compare(&self, m: Value) -> Value {
         let bodies = m["body_count"].as_u64().unwrap_or(0);
         let volume = m["total"]["volume_mm3"].as_f64();
         let bbox = m["bodies"].as_array().into_iter().flatten().filter_map(|body| corners(&body["bbox"])).reduce(|(lo, hi), (min, max)| {
@@ -713,12 +879,12 @@ impl Expect {
                 None => mismatch.push(format!("bbox: no body to measure, expected {expected}")),
             }
         }
-        Ok(json!({
+        json!({
             "ok": mismatch.is_empty(),
             "measured": {"volume_mm3": volume, "bodies": bodies, "bbox": bbox.map(|(min, max)| json!({"min": min, "max": max}))},
             "expected": self.expected(),
             "mismatch": mismatch,
-        }))
+        })
     }
 }
 
@@ -767,6 +933,40 @@ fn with_expectation(b: &mut dyn Backend, mut reply: Value, expect: Option<Expect
         content.insert(0, json!({"type": "text", "text": note}));
     }
     r
+}
+
+/// Failure to verify a measurement never erases or renames the already completed write.
+fn with_guarded_expectation(b: &mut dyn Backend, mut body: Value, expect: Option<Expect>, applied: &DocumentStamp) -> Value {
+    let Some(expect) = expect else { return guarded_text(&body, false) };
+    let expectation = match b.call_guarded("engine.execute", json!({"command":"inspect.measure","params":{},"expectedDocument":stamp_json(applied)}))
+    {
+        Ok(reply) if reply.document_stamp == *applied => expect.compare(reply.result),
+        Ok(reply) => json!({"ok":false,"verified":false,"expected":expect.expected(),
+            "measurementDocumentStamp":stamp_json(&reply.document_stamp),
+            "mismatch":["measurement returned another document state; the committed state was not verified"]}),
+        Err(error) => {
+            let mut failure = guarded_error(error)["structuredContent"].clone();
+            failure["ok"] = json!(false);
+            failure["verified"] = json!(false);
+            failure["expected"] = expect.expected();
+            failure["mismatch"] = json!(["the committed document state could not be measured and verified"]);
+            failure
+        }
+    };
+    let failed = expectation["ok"] != true;
+    let unverified = expectation.get("verified") == Some(&Value::Bool(false));
+    let mismatches: Vec<&str> = expectation["mismatch"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let note = format!(
+        "expectation {}: {}. The completed command's result and document stamp are retained; no rollback was attempted.",
+        if unverified { "not verified" } else { "not met" },
+        mismatches.join("; ")
+    );
+    body["expectation"] = expectation;
+    let mut reply = guarded_text(&body, failed);
+    if failed && let Some(content) = reply["content"].as_array_mut() {
+        content.insert(0, json!({"type":"text","text":note}));
+    }
+    reply
 }
 
 fn exec(b: &mut dyn Backend, command: &str, params: Value) -> Result<Value, String> {
@@ -1060,6 +1260,10 @@ impl CommandQuery {
 /// headless session runs every request to its end).
 fn pending(b: &mut dyn Backend) -> Result<Value, String> {
     let p = b.call("control.pending", json!({}))?;
+    pending_legacy(p)
+}
+
+fn pending_legacy(p: Value) -> Result<Value, String> {
     let what = p.get("pending").cloned().unwrap_or(Value::Null);
     if what.is_null() {
         return Ok(json!({"pending": null, "note": "nothing is running"}));
@@ -1079,6 +1283,66 @@ fn pending(b: &mut dyn Backend) -> Result<Value, String> {
         };
     }
     Ok(json!({"pending": what, "done": false, "running_s": p.get("running_s"), "note": "still running: call pending again to keep waiting"}))
+}
+
+fn pending_tool(b: &mut dyn Backend) -> Value {
+    let status = match b.call("control.pending", json!({})) {
+        Ok(status) => status,
+        Err(error) => return text_result(&json!(error), true),
+    };
+    if status.get("guarded") != Some(&Value::Bool(true)) {
+        return match pending_legacy(status) {
+            Ok(body) => text_result(&body, false),
+            Err(error) => text_result(&json!(error), true),
+        };
+    }
+    guarded_pending(status)
+}
+
+/// Never measure the current model here: this is only the original reply on its connection.
+fn guarded_pending(mut status: Value) -> Value {
+    status["expectation"] = Value::Null;
+    status["note"] = json!("Tool-level expectation checks were not executed for this pending request; the original effect facts are retained.");
+    if status.get("lost") == Some(&Value::Bool(true)) {
+        status["outcomeUnknown"] = json!(true);
+        return guarded_text(&status, true);
+    }
+    if status.get("done") != Some(&Value::Bool(true)) {
+        return guarded_text(&status, false);
+    }
+    let (body, failed) = match document_guard::decode_guarded_reply(&status["reply"]) {
+        Ok(reply) => {
+            let verbose = status.get("verbose").and_then(Value::as_bool).unwrap_or(true);
+            match status.get("method").and_then(Value::as_str) {
+                Some("engine.execute") => (
+                    json!({"result":if verbose {reply.result} else {compact(reply.result)},"documentStamp":stamp_json(&reply.document_stamp)}),
+                    false,
+                ),
+                Some("engine.batch") => {
+                    let Some(len) = status.get("steps").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()) else {
+                        return guarded_error(GuardedCallError::OutcomeUnknown(
+                            "The original guarded batch step count was lost; do not resend it.".into(),
+                        ));
+                    };
+                    let mut body = reply.result;
+                    if !body.is_object() {
+                        return guarded_error(GuardedCallError::OutcomeUnknown(
+                            "The original guarded batch reply was not an object; do not resend it.".into(),
+                        ));
+                    }
+                    body["documentStamp"] = stamp_json(&reply.document_stamp);
+                    batch_reply(&body, len, status.get("rollback").and_then(Value::as_bool).unwrap_or(true), verbose, &|_, v| v, true)
+                }
+                _ => return guarded_error(GuardedCallError::OutcomeUnknown("The original guarded method was lost; do not resend it.".into())),
+            }
+        }
+        Err(error) => (guarded_error(error)["structuredContent"].clone(), true),
+    };
+    let mut result = json!({"pending":status["pending"],"done":true,"result":body,"expectation":null,"note":status["note"]});
+    if let Some(error) = body.get("error") {
+        result["error"] = error.clone();
+    }
+    guarded_text(&result, failed)
 }
 
 /// How a tool step's result is cut down to what the tool itself would reply.
@@ -1406,7 +1670,7 @@ fn batch_run(b: &mut dyn Backend, a: &Map<String, Value>) -> (Value, bool) {
                         failed.insert("error".into(), Value::String(error));
                     }
                 }
-                return batch_reply(&r, steps.len(), rollback, verbose, &narrow);
+                return batch_reply(&r, steps.len(), rollback, verbose, &narrow, false);
             }
             // Older apps and the headless session, or the app wants the steps one by one.
             Err(e) if e.starts_with("unknown method") || e.starts_with("engine.batch unavailable") => {}
@@ -1523,7 +1787,7 @@ fn with_timings(mut reply: Value, timed: bool, rows: Vec<Value>, total_ms: f64) 
 }
 
 /// The `batch` reply from the app's `engine.batch` answer, shaped as the per-step path shapes it.
-fn batch_reply(r: &Value, len: usize, rollback: bool, verbose: bool, narrow: &dyn Fn(usize, Value) -> Value) -> (Value, bool) {
+fn batch_reply(r: &Value, len: usize, rollback: bool, verbose: bool, narrow: &dyn Fn(usize, Value) -> Value, guarded: bool) -> (Value, bool) {
     let results: Vec<Value> = r["results"]
         .as_array()
         .cloned()
@@ -1533,6 +1797,34 @@ fn batch_reply(r: &Value, len: usize, rollback: bool, verbose: bool, narrow: &dy
         .map(|(i, v)| narrow(i, v))
         .map(|v| if verbose { v } else { compact(v) })
         .collect();
+    // Guarded replies carry actual native facts. Do not reconstruct them using legacy
+    // rollback inference (in particular, index:null is checkpoint establishment, not step 0).
+    if guarded {
+        let mut reply = r.clone();
+        let failed = r.get("failed").is_some_and(|f| !f.is_null()) || r.get("ok") == Some(&Value::Bool(false));
+        reply["results"] = json!(results);
+        if let Some(object) = reply.as_object_mut() {
+            object.entry("ok").or_insert(json!(!failed));
+        }
+        if failed {
+            let completed = r.get("completed").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(0).min(len);
+            if r.get("applied").is_none() {
+                match r.get("rolled_back").and_then(Value::as_bool) {
+                    Some(true) => reply["applied"] = json!([]),
+                    Some(false) => reply["applied"] = json!((0..completed).collect::<Vec<_>>()),
+                    None => {}
+                }
+            }
+            if r.get("not_run").is_none() {
+                if r["failed"]["stage"] == "checkpoint" {
+                    reply["not_run"] = json!((0..len).collect::<Vec<_>>());
+                } else if let Some(index) = r["failed"]["index"].as_u64().and_then(|n| usize::try_from(n).ok()) {
+                    reply["not_run"] = json!((index.saturating_add(1).min(len)..len).collect::<Vec<_>>());
+                }
+            }
+        }
+        return (reply, failed);
+    }
     let (mut reply, error) = match r.get("failed").filter(|f| !f.is_null()) {
         None => (json!({"ok": true, "completed": results.len(), "results": results}), false),
         Some(failed) => {

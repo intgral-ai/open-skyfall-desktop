@@ -50,10 +50,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use solidcraft_engine::batch::{CheckpointPolicy, run_document_steps};
 use solidcraft_engine::io::vfs;
 use solidcraft_engine::render::{Camera, StandardView};
 use solidcraft_engine::schema::ParamCheck;
-use solidcraft_engine::{batch_params, timing};
 
 use crate::SolveApp;
 
@@ -68,17 +68,19 @@ pub struct ControlRequest {
     /// Chat requests already admitted by the gate may outlive a tab switch. This turn's
     /// validity follows them through queues, computation and cursor animation.
     pub(crate) chat_turn: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Original document precondition and tab context, pinned at first host admission.
+    pub(crate) guarded: Option<crate::execution_guard::GuardedAdmission>,
 }
 
 impl ControlRequest {
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx, started: Default::default(), chat_turn: None }, rx)
+        (Self { method: method.into(), params, reply: tx, started: Default::default(), chat_turn: None, guarded: None }, rx)
     }
 
     pub(crate) fn refuse_cancelled_chat(&self) -> bool {
         if chat_turn_cancelled(self.chat_turn.as_deref()) {
-            let _ = self.reply.send(cancelled_chat_response());
+            let _ = self.reply.send(cancelled_request_response(&self.method, &self.params, self.guarded.is_some()));
             true
         } else {
             false
@@ -92,6 +94,24 @@ pub(crate) fn chat_turn_cancelled(turn: Option<&std::sync::atomic::AtomicBool>) 
 
 pub(crate) fn cancelled_chat_response() -> Value {
     json!({"ok": false, "error": "not run: the agent chat turn ended or its document tab was left"})
+}
+
+pub(crate) fn cancelled_request_response(method: &str, params: &Value, admitted: bool) -> Value {
+    if admitted || params.get("expectedDocument").is_some() {
+        crate::execution_guard::refusal_json(&crate::execution_guard::cancelled(method))
+    } else {
+        cancelled_chat_response()
+    }
+}
+
+pub(crate) fn stopped_command_response(method: &str, params: &Value, admitted: bool, label: &str) -> Value {
+    let mut reply = cancelled_request_response(method, params, admitted);
+    reply["stopped"] = json!(true);
+    reply["error"] = json!(format!("stopped: the person at the app stopped `{label}` while it computed; nothing was applied"));
+    if reply.get("errorDetails").is_some() {
+        reply["errorDetails"]["message"] = reply["error"].clone();
+    }
+    reply
 }
 
 /// The active design's id and revision for control connections that sent `control.subscribe`
@@ -344,6 +364,12 @@ fn command(step: &Value) -> Option<&str> {
     step.get("command").or_else(|| step.get("id")).and_then(Value::as_str)
 }
 
+/// Execute falls back to a string id when command is not a string. Batch intentionally
+/// selects the first present value instead; its resolver above must keep that old behaviour.
+pub(crate) fn execute_command(envelope: &Value) -> Option<&str> {
+    envelope.get("command").and_then(Value::as_str).or_else(|| envelope.get("id").and_then(Value::as_str))
+}
+
 /// Most steps in one `engine.batch` (as in the MCP `batch` tool).
 const MAX_BATCH: usize = 10_000;
 
@@ -388,7 +414,7 @@ pub(crate) fn batch_step_command(step: &Value) -> Option<&str> {
 /// `rollback` (the default), the design goes back to its checkpoint. Step failures are part of
 /// the reply; refusals (`engine.batch unavailable: …`) come before anything runs, so the client
 /// can send the steps one by one instead.
-fn batch(app: &mut SolveApp, p: &Value) -> Outcome {
+fn batch(app: &mut SolveApp, p: &Value, guarded: bool) -> Outcome {
     let Some(steps) = p.get("commands").and_then(Value::as_array).filter(|s| s.len() <= MAX_BATCH) else {
         return err(format!("engine.batch: commands must be an array of at most {MAX_BATCH} steps"));
     };
@@ -433,67 +459,8 @@ fn batch(app: &mut SolveApp, p: &Value) -> Outcome {
     if let Some(refusal) = solidcraft_engine::batch_preflight::check(steps, app.session.param_check, &["view.pick"]) {
         return ok(refusal.reply(steps.len()));
     }
-    let rollback = p.get("rollback").and_then(Value::as_bool).unwrap_or(true);
-    let profile = p.get("profile").and_then(Value::as_bool).unwrap_or(false);
-    let timed = profile || p.get("timings").and_then(Value::as_bool).unwrap_or(false);
-    let mut rows = Vec::new();
-    let clock = timing::Clock::start();
-    let checkpoint = if rollback { app.run("edit.checkpoint", json!({})).ok().and_then(|v| v["checkpoint"].as_u64()) } else { None };
-    let mut results = Vec::with_capacity(steps.len());
-    // With `coalesce_parameters`, each run of plain parameter edits rebuilds once (#5822); a run
-    // whose combined edit is refused goes step by step, so a refused edit is named by its step.
-    let coalesce = p.get("coalesce_parameters").and_then(Value::as_bool).unwrap_or(false);
-    for run in batch_params::plan(steps, coalesce) {
-        let singles = match run {
-            batch_params::BatchRun::Step(i) => vec![i],
-            batch_params::BatchRun::Params { steps: indices, changes } => {
-                let (r, took) = timing::time(profile, || execute(app, "parameters.change", batch_params::combined_params(&changes)));
-                match r {
-                    Ok(v) => {
-                        if timed {
-                            rows.push(took.to_json(indices.first().copied().unwrap_or(0), "parameters.change"));
-                        }
-                        results.extend(batch_params::step_results(steps, &indices, &v));
-                        continue;
-                    }
-                    Err(_) => indices,
-                }
-            }
-        };
-        for i in singles {
-            let Some(step) = steps.get(i) else { continue };
-            let (r, took) = timing::time(profile, || match command(step) {
-                Some(id) => execute(app, id, step.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}))),
-                None => Err("missing `command`".to_string()),
-            });
-            if timed {
-                rows.push(took.to_json(i, command(step).unwrap_or_default()));
-            }
-            match r {
-                Ok(v) => results.push(v),
-                Err(e) => {
-                    let restored = checkpoint.is_some_and(|id| app.run("edit.restore_checkpoint", json!({"checkpoint": id})).is_ok());
-                    let failed = json!({"index": i, "command": command(step), "error": e});
-                    // `rolled_back`: the design really is back at its checkpoint.
-                    let reply = json!({"completed": i, "results": results, "failed": failed, "undone": if restored { i } else { 0 }, "rolled_back": restored});
-                    return ok(with_timings(reply, timed, rows, clock.ms()));
-                }
-            }
-        }
-    }
-    if let Some(id) = checkpoint {
-        let _ = app.run("edit.restore_checkpoint", json!({"checkpoint": id, "forget": true}));
-    }
-    ok(with_timings(json!({"completed": results.len(), "results": results, "undone": 0}), timed, rows, clock.ms()))
-}
-
-/// A batch reply with `timings` and `total_ms` when they were asked for.
-fn with_timings(mut reply: Value, timed: bool, rows: Vec<Value>, total_ms: f64) -> Value {
-    if timed && let Some(o) = reply.as_object_mut() {
-        o.insert("timings".into(), Value::Array(rows));
-        o.insert("total_ms".into(), json!(timing::round_ms(total_ms)));
-    }
-    reply
+    let checkpoint_policy = if guarded { CheckpointPolicy::Required } else { CheckpointPolicy::BestEffort };
+    ok(run_document_steps(app, steps, p, execute, SolveApp::run, checkpoint_policy))
 }
 
 /// A request from an MCP server carries the folders its agent may use (`allow_paths`); every
@@ -564,10 +531,22 @@ pub fn view_png(app: &SolveApp, w: u32, h: u32) -> Result<Vec<u8>, String> {
 }
 
 pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    if chat_turn_cancelled(req.chat_turn.as_deref()) {
+        return Outcome::Done(cancelled_request_response(&req.method, &req.params, req.guarded.is_some()));
+    }
     crate::agent_chat::with_tool_request(app, req.chat_turn.as_ref(), |app| handle_request(app, ctx, req))
 }
 
 fn handle_request(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    let guarded = match crate::execution_guard::check_application(app, req) {
+        Ok(stamp) => stamp.is_some(),
+        Err(error) => return Outcome::Done(crate::execution_guard::refusal_json(&error)),
+    };
+    let out = dispatch_request(app, ctx, req, guarded);
+    if guarded { crate::execution_guard::stamp_outcome(app, out) } else { out }
+}
+
+fn dispatch_request(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest, guarded: bool) -> Outcome {
     let level = match request_param_check(&req.method, &req.params) {
         Ok(level) => level,
         Err(e) => return err(e),
@@ -576,18 +555,19 @@ fn handle_request(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest)
         Ok(scope) => scope,
         Err(e) => return err(e),
     };
-    if scope.is_none() && level.is_none() {
-        return dispatch(app, ctx, &req.method, &req.params);
+    if scope.is_none() && level.is_none() && !guarded {
+        return dispatch(app, ctx, &req.method, &req.params, false);
     }
     let mut p = req.params.clone();
     if let Some(o) = p.as_object_mut() {
         o.remove("allow_paths");
         o.remove("design_folders");
         o.remove("param_check");
+        o.remove("expectedDocument");
     }
     let run = |app: &mut SolveApp| match level {
-        Some(level) => dispatch_checked(app, ctx, &req.method, &p, level),
-        None => dispatch(app, ctx, &req.method, &p),
+        Some(level) => dispatch_checked(app, ctx, &req.method, &p, level, guarded),
+        None => dispatch(app, ctx, &req.method, &p, guarded),
     };
     match scope {
         Some(scope) => vfs::scoped(Some(scope), || run(app)),
@@ -611,13 +591,13 @@ pub(crate) fn request_param_check(method: &str, params: &Value) -> Result<Option
 /// `dispatch` of an `engine.execute`, `engine.batch` or `engine.script` with its commands checked
 /// at `level`, echoed in the reply as `param_check`, so a client can tell an app that checked
 /// from an older one that ignored the field. The session goes back to its own level afterwards.
-fn dispatch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value, level: ParamCheck) -> Outcome {
+fn dispatch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value, level: ParamCheck, guarded: bool) -> Outcome {
     let mut out = if switches_design(p).is_some() {
-        switch_checked(app, ctx, method, p, level)
+        switch_checked(app, ctx, method, p, level, guarded)
     } else {
         let own = app.session.param_check;
         app.session.param_check = level;
-        let out = dispatch(app, ctx, method, p);
+        let out = dispatch(app, ctx, method, p, guarded);
         app.session.param_check = own;
         out
     };
@@ -629,7 +609,7 @@ fn dispatch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &V
 
 /// A command that switches to another design, checked at `level` before it runs: it runs at the
 /// app's own level, since the session it leaves and the one it brings in each keep theirs.
-fn switch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value, level: ParamCheck) -> Outcome {
+fn switch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value, level: ParamCheck, guarded: bool) -> Outcome {
     let id = command(p).unwrap_or_default();
     let issues: Vec<String> = solidcraft_engine::schema::issues(id, p.get("params").unwrap_or(&Value::Null)).into_iter().map(|i| i.message).collect();
     if level == ParamCheck::Strict
@@ -637,7 +617,7 @@ fn switch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Val
     {
         return err(solidcraft_engine::params::bad(id, first.as_str()));
     }
-    let mut out = dispatch(app, ctx, method, p);
+    let mut out = dispatch(app, ctx, method, p, guarded);
     if level == ParamCheck::Warn
         && !issues.is_empty()
         && let Outcome::Done(v) = &mut out
@@ -648,7 +628,7 @@ fn switch_checked(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Val
     out
 }
 
-fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) -> Outcome {
+fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value, guarded: bool) -> Outcome {
     crate::render_workspace::sync_backend(app);
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let f = |k: &str| p.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
@@ -756,10 +736,10 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             ok(json!({"workspace":if crate::render_workspace::active(app) {"render"} else {"design"}}))
         }
         "engine.execute" | "command" => {
-            let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
+            let Some(id) = execute_command(p) else { return err("missing `command`") };
             wrap(execute(app, id, p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}))))
         }
-        "engine.batch" => batch(app, p),
+        "engine.batch" => batch(app, p, guarded),
         "ui.agent_cursor" => {
             let s = &mut app.ui.agent_cursor;
             if let Some(v) = p.get("show").and_then(Value::as_bool) {
@@ -1591,6 +1571,488 @@ pub(crate) fn write_screenshot(image: &egui::ColorImage, path: &str) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    fn guard_stamp(app: &mut SolveApp) -> Value {
+        let stamp = app.session.document_stamp();
+        json!({"documentId": stamp.document_id, "revision": stamp.revision.to_string()})
+    }
+
+    fn guard_change(expected: &Value, expression: &str) -> Value {
+        json!({"command":"parameters.change", "params":{"name":"width","expression":expression}, "expectedDocument":expected})
+    }
+
+    fn guard_app() -> SolveApp {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        app.run("parameters.add", json!({"name":"width","expression":"10 mm"})).unwrap();
+        app.run("parameters.change", json!({"name":"width","expression":"20 mm"})).unwrap();
+        app.run("edit.undo", json!({})).unwrap();
+        app
+    }
+
+    fn guard_resolver_call(app: &mut SolveApp, method: &str, params: Value, queued: bool) -> Value {
+        if !queued {
+            return panel_control(app, method, params);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.control_rx = Some(rx);
+        let (req, reply) = ControlRequest::new(method, params);
+        tx.send(req).unwrap();
+        app.drain_control(&egui::Context::default());
+        reply.try_recv().expect("synchronous request must answer without a worker")
+    }
+
+    fn assert_guard_history(actual: &[solidcraft_engine::Snapshot], expected: &[solidcraft_engine::Snapshot]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(std::sync::Arc::ptr_eq(&actual.doc, &expected.doc));
+            assert_eq!(actual.label, expected.label);
+            assert_eq!(actual.active_sketch, expected.active_sketch);
+            assert_eq!(actual.pending_moves, expected.pending_moves);
+            assert_eq!(actual.visibility, expected.visibility);
+        }
+    }
+
+    // A reserved guard at a known inner envelope position must not silently become legacy CAD.
+    fn guard_nested_cases(queued: bool) {
+        let mut cases = 0;
+        for outer in [false, true] {
+            for nested in [Value::Null, json!({"documentId":"doc-A","revision":"0"}), json!({"revision":7})] {
+                let change = json!({"command":"parameters.change","params":{"name":"width","expression":"30 mm"}});
+                let mut step_guard = change.clone();
+                step_guard["expectedDocument"] = nested.clone();
+                let mut param_guard = change.clone();
+                param_guard["params"]["expectedDocument"] = nested.clone();
+                for (method, mut params) in [
+                    ("engine.execute", param_guard.clone()),
+                    ("command", param_guard.clone()),
+                    ("engine.batch", json!({"commands":[step_guard.clone()]})),
+                    ("engine.batch", json!({"commands":[change.clone(),step_guard]})),
+                    ("engine.batch", json!({"commands":[change.clone(),param_guard.clone()]})),
+                    ("engine.batch", json!({"commands":[change.clone(),{"command":"execute","params":param_guard}]})),
+                    (
+                        "engine.batch",
+                        json!({"commands":[change.clone(),{"command":"execute","params":{"command":"parameters.change","params":{"name":"width","expression":"30 mm"},"expectedDocument":nested}}]}),
+                    ),
+                    (
+                        "engine.execute",
+                        json!({"command":"engine.batch","params":{"commands":[change.clone(),{"command":"execute","params":{"command":"parameters.list","params":{"expectedDocument":nested}}}]}}),
+                    ),
+                    (
+                        "engine.execute",
+                        json!({"command":"doc.open","params":{"path":"/tmp/opencode/nested-never-opened.sc","expectedDocument":nested}}),
+                    ),
+                ] {
+                    let mut app = guard_app();
+                    let stamp = guard_stamp(&mut app);
+                    if outer {
+                        params["expectedDocument"] = stamp.clone();
+                    }
+                    let doc = app.session.doc.clone();
+                    let (undo, redo) = (app.session.undo.clone(), app.session.redo.clone());
+                    let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+                    let reply = guard_resolver_call(&mut app, method, params.clone(), queued);
+                    assert_eq!(reply["errorDetails"]["code"], "INVALID_REQUEST", "{method} {params}: {reply}");
+                    assert_eq!(guard_stamp(&mut app), stamp);
+                    assert!(std::sync::Arc::ptr_eq(&app.session.doc, &doc));
+                    assert_eq!(app.session.doc.param("width").unwrap().expr, "10 mm");
+                    assert_guard_history(&app.session.undo, &undo);
+                    assert_guard_history(&app.session.redo, &redo);
+                    assert!(!app.file_load.busy());
+                    assert!(app.control_job.is_none() && app.control_held.is_empty());
+                    assert_eq!(app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64(), Some(checkpoint + 1));
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 54);
+        // Do not deep-walk arbitrary business JSON or change an ordinary legacy reply.
+        let mut app = guard_app();
+        let reply = guard_resolver_call(
+            &mut app,
+            "engine.execute",
+            json!({"command":"parameters.change",
+            "params":{"name":"width","expression":"30 mm","business":{"expectedDocument":null}}}),
+            queued,
+        );
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["result"]["value"], 30.0);
+        assert!(reply.get("documentStamp").is_none());
+        // Trusted cancellation wins even when the reserved field is malformed.
+        for outer in [false, true] {
+            let mut params = json!({"command":"parameters.change","params":{"expectedDocument":null}});
+            if outer {
+                params["expectedDocument"] = Value::Null;
+            }
+            let (mut req, rx) = ControlRequest::new("engine.execute", params);
+            req.chat_turn = Some(std::sync::Arc::new(AtomicBool::new(false)));
+            let reply = if queued {
+                let (tx, queue) = std::sync::mpsc::channel();
+                app.control_rx = Some(queue);
+                tx.send(req).unwrap();
+                app.drain_control(&egui::Context::default());
+                rx.try_recv().unwrap()
+            } else {
+                let Outcome::Done(reply) = handle(&mut app, &egui::Context::default(), &req) else { panic!("synchronous refusal") };
+                reply
+            };
+            assert_eq!(reply["ok"], false);
+            if outer {
+                assert_eq!(reply["errorDetails"]["code"], "CANCELLED");
+            } else {
+                assert_eq!(reply, cancelled_chat_response());
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_control_nested_stamps_refused_direct() {
+        guard_nested_cases(false);
+    }
+
+    #[test]
+    fn guarded_control_nested_stamps_refused_queued() {
+        guard_nested_cases(true);
+    }
+
+    #[test]
+    fn guarded_control_document_id_schema_agreement() {
+        let cases = [
+            (json!("a"), true),
+            (json!("0"), true),
+            (json!("A0._:-z"), true),
+            (json!("x".repeat(128)), true),
+            (json!("x".repeat(129)), false),
+            (json!(""), false),
+            (json!("_bad"), false),
+            (json!("-bad"), false),
+            (json!("a/b"), false),
+            (json!("中文"), false),
+            (json!("é"), false),
+            (json!("a\n"), false),
+            (json!("a\r"), false),
+            (json!("a\r\n"), false),
+            (json!("a\nb"), false),
+            (json!(null), false),
+            (json!(7), false),
+            (json!(true), false),
+            (json!([]), false),
+            (json!({}), false),
+        ];
+        let mut outcomes = Vec::new();
+        for (id, expected) in cases {
+            let accepted = crate::execution_guard::parse_expected_document(&json!({"expectedDocument":{"documentId":id,"revision":"0"}})).is_ok();
+            assert_eq!(accepted, expected, "{id}");
+            outcomes.push(json!({"value":id,"accepted":accepted}));
+        }
+        println!("DOCUMENT_ID_UI_WAVE {}", json!(outcomes));
+    }
+
+    // Catches checking a hidden command while execute actually uses its string id fallback.
+    fn guard_resolver_cases(queued: bool) {
+        for method in ["engine.execute", "command"] {
+            for command in [Value::Null, json!(0), json!({})] {
+                for (id, params) in [
+                    ("file.new", json!({})),
+                    ("DOC.OPEN", json!({"path":"/tmp/opencode/guarded-route-never-opened.sc"})),
+                    ("PARAMETERS.CHANGE", json!({"name":"width","expression":"30 mm","path":"not-a-file"})),
+                ] {
+                    let mut app = guard_app();
+                    let expected = guard_stamp(&mut app);
+                    let identity = app.session.document_id.clone();
+                    let doc = app.session.doc.clone();
+                    let (undo, redo) = (app.session.undo.clone(), app.session.redo.clone());
+                    let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+                    let response =
+                        guard_resolver_call(&mut app, method, json!({"command":command,"id":id,"params":params,"expectedDocument":expected}), queued);
+                    assert_eq!(response["errorDetails"]["code"], "UNSUPPORTED_CAPABILITY", "{method} command={command} id={id}: {response}");
+                    assert_eq!(app.session.document_id, identity);
+                    assert!(std::sync::Arc::ptr_eq(&app.session.doc, &doc));
+                    assert_eq!(app.session.doc.param("width").unwrap().expr, "10 mm");
+                    assert_guard_history(&app.session.undo, &undo);
+                    assert_guard_history(&app.session.redo, &redo);
+                    assert!(!app.file_load.busy());
+                    assert!(app.control_job.is_none() && app.control_held.is_empty());
+                    let next = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+                    assert_eq!(next, checkpoint + 1, "rejection must not allocate a checkpoint");
+                }
+
+                // A supported fallback really executes; a string command still wins over id.
+                for (first, id, allowed) in [
+                    (command.clone(), "PARAMETERS.CHANGE", true),
+                    (json!("parameters.change"), "file.new", true),
+                    (json!("file.new"), "parameters.change", false),
+                ] {
+                    let mut app = guard_app();
+                    let expected = guard_stamp(&mut app);
+                    let identity = app.session.document_id.clone();
+                    let response = guard_resolver_call(
+                        &mut app,
+                        method,
+                        json!({"command":first,"id":id,"params":{"name":"width","expression":"30 mm"},"expectedDocument":expected}),
+                        queued,
+                    );
+                    assert_eq!(app.session.document_id, identity);
+                    if allowed {
+                        assert_eq!(response["ok"], true, "{response}");
+                        assert_eq!(response["result"]["value"], 30.0);
+                        assert_eq!(response["documentStamp"], guard_stamp(&mut app));
+                        assert_eq!(app.session.doc.param("width").unwrap().expr, "30 mm");
+                    } else {
+                        assert_eq!(response["errorDetails"]["code"], "UNSUPPORTED_CAPABILITY", "{response}");
+                        assert_eq!(app.session.doc.param("width").unwrap().expr, "10 mm");
+                    }
+                }
+            }
+        }
+        // Batch retains its different old fallback: a present non-string command masks id.
+        for command in [Value::Null, json!(0), json!({})] {
+            for guarded in [false, true] {
+                let mut app = guard_app();
+                let doc = app.session.doc.clone();
+                let identity = app.session.document_id.clone();
+                let (undo, redo) = (app.session.undo.clone(), app.session.redo.clone());
+                let mut params = json!({"rollback":false,"commands":[{"command":command,"id":"file.new"}]});
+                if guarded {
+                    params["expectedDocument"] = guard_stamp(&mut app);
+                }
+                let response = guard_resolver_call(&mut app, "engine.batch", params, queued);
+                assert_eq!(response["ok"], true, "{response}");
+                assert_eq!(response["result"]["completed"], 0);
+                assert_eq!(response["result"]["failed"]["index"], 0);
+                assert!(response.get("errorDetails").is_none(), "batch does not execute the hidden id: {response}");
+                assert_eq!(app.session.document_id, identity);
+                assert!(std::sync::Arc::ptr_eq(&app.session.doc, &doc));
+                assert_guard_history(&app.session.undo, &undo);
+                assert_guard_history(&app.session.redo, &redo);
+                assert!(!app.file_load.busy());
+            }
+        }
+        // No guard keeps execute's old fallback and permission to replace a document.
+        let mut app = guard_app();
+        let identity = app.session.document_id.clone();
+        let response = guard_resolver_call(&mut app, "engine.execute", json!({"command":null,"id":"file.new"}), queued);
+        assert_eq!(response["ok"], true, "{response}");
+        assert!(response.get("documentStamp").is_none());
+        assert_ne!(app.session.document_id, identity);
+    }
+
+    #[test]
+    fn guarded_control_execute_fallback_cannot_bypass_policy_direct() {
+        guard_resolver_cases(false);
+    }
+
+    #[test]
+    fn guarded_control_execute_fallback_cannot_bypass_policy_queued() {
+        guard_resolver_cases(true);
+    }
+
+    // Catches identity-by-name/Arc, admission rebinding, premature invalidation and closed-target fallback.
+    #[test]
+    fn guarded_control_identity_closed_and_shared_arc() {
+        let mut app = guard_app();
+        let expected = guard_stamp(&mut app);
+        let doc = app.session.doc.clone();
+        let history = (app.session.undo.len(), app.session.redo.len());
+        let mut other = solidcraft_engine::Session::default();
+        other.doc = doc.clone();
+        let other_id = other.document_id.clone();
+        crate::documents::open_tab(&mut app, other).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&app.session.doc, &doc));
+        let other_stamp = guard_stamp(&mut app);
+        let response = panel_control(&mut app, "engine.execute", guard_change(&expected, "30 mm"));
+        assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT", "{response}");
+        assert_eq!(response["errorDetails"]["details"], json!({"expected":expected,"current":other_stamp}));
+        assert_eq!(app.session.document_id, other_id);
+        assert!(app.session.undo.is_empty() && app.session.redo.is_empty());
+        crate::documents::switch(&mut app, 0);
+        assert_eq!((app.session.undo.len(), app.session.redo.len()), history);
+        assert!(std::sync::Arc::ptr_eq(&app.session.doc, &doc));
+
+        // Admission happens while waiting for the picker, before the request enters held state.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app = app.with_control(rx);
+        app.services.pick_open = Some(Box::new(|_| Box::pin(std::future::pending())));
+        app.pick_open(|_, _| {});
+        let (req, reply) = ControlRequest::new("engine.execute", guard_change(&expected, "30 mm"));
+        tx.send(req).unwrap();
+        app.drain_control(&egui::Context::default());
+        assert_eq!(app.control_held.len(), 1);
+        // Neither an out-of-range switch nor a switch refused by the picker closes this context.
+        crate::documents::switch(&mut app, usize::MAX);
+        crate::documents::switch(&mut app, 1);
+        app.file_picker = None;
+        let held = app.control_held.pop_front().unwrap();
+        app.run_control(&egui::Context::default(), held);
+        assert_eq!(reply.try_recv().unwrap()["ok"], true);
+
+        let expected = guard_stamp(&mut app);
+        let (req, reply) = ControlRequest::new("engine.execute", guard_change(&expected, "40 mm"));
+        app.pick_open(|_, _| {});
+        tx.send(req).unwrap();
+        app.drain_control(&egui::Context::default());
+        app.file_picker = None;
+        crate::documents::switch(&mut app, 1);
+        crate::documents::switch(&mut app, 0);
+        let held = app.control_held.pop_front().unwrap();
+        app.run_control(&egui::Context::default(), held);
+        let response = reply.try_recv().unwrap();
+        assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT", "{response}");
+        assert_eq!(response["errorDetails"]["details"]["expected"], expected);
+        assert_eq!(app.session.doc.param("width").unwrap().expr, "30 mm");
+        crate::documents::close(&mut app, 0, true);
+        let response = panel_control(&mut app, "engine.execute", guard_change(&expected, "50 mm"));
+        assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT");
+        assert_eq!(response["errorDetails"]["details"]["current"], Value::Null);
+        assert!(std::sync::Arc::ptr_eq(&app.session.doc, &doc));
+    }
+
+    // Catches writes/checkpoint allocation before final checking and guard loss in consuming routes.
+    #[test]
+    fn guarded_control_checks_before_checkpoint_and_consuming_routes() {
+        let mut app = guard_app();
+        let expected = guard_stamp(&mut app);
+        let response = panel_control(&mut app, "engine.execute", guard_change(&expected, "20 mm"));
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["result"]["value"], 20.0);
+        assert_eq!(response["documentStamp"], guard_stamp(&mut app));
+        let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        let steps = json!([
+            {"command":"parameters.change","params":{"name":"width","expression":"30 mm"}},
+            {"command":"parameters.change","params":{"name":"width","expression":"40 mm"}}
+        ]);
+        let response = panel_control(&mut app, "engine.batch", json!({"commands":steps,"expectedDocument":expected}));
+        assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT");
+        assert_eq!(response["errorDetails"]["details"]["expected"], expected);
+        let next = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        assert_eq!(next, checkpoint + 1);
+        let expected = guard_stamp(&mut app);
+        let response = panel_control(&mut app, "engine.batch", json!({"commands":steps,"expectedDocument":expected}));
+        assert_eq!(response["result"]["completed"], 2, "{response}");
+        assert_eq!(response["documentStamp"], guard_stamp(&mut app));
+        let expected = guard_stamp(&mut app);
+        let doc = app.session.doc.clone();
+        let history = (app.session.undo.len(), app.session.redo.len());
+        let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        let unsupported = [
+            ("engine.script", json!({"commands":steps})),
+            ("document.import", json!({"text":"{}"})),
+            ("document.saved", json!({"revision":app.session.design_revision()})),
+            ("ui.documents", json!({"action":"new"})),
+            ("ui.file", json!({"action":"open"})),
+            ("engine.execute", json!({"command":"doc.open","params":{"path":"/not-opened.sc"}})),
+            ("engine.execute", json!({"command":"file.insert_step","params":{"path":"/not-opened.step"}})),
+            ("engine.execute", json!({"command":"file.export_view_dxf","params":{"path":"/not-written.dxf"}})),
+            ("engine.execute", json!({"command":"FILE.NEW"})),
+            ("engine.execute", json!({"command":"component.edit_in_place"})),
+            ("engine.execute", json!({"command":"component.finish_edit"})),
+            ("engine.execute", json!({"command":"component.update_links"})),
+            ("engine.execute", json!({"command":"view.next_tab"})),
+            ("engine.execute", json!({"command":"timeline.play"})),
+            ("engine.execute", json!({"command":"appearance.favorite"})),
+            ("engine.execute", json!({"command":"panel.open"})),
+            ("engine.execute", json!({"command":"layout.get"})),
+            ("engine.execute", json!({"command":"document.snapshot.capture"})),
+            ("engine.execute", json!({"command":"parameters.change","params":{"path":"secret","name":"width","expression":"50 mm"}})),
+            ("engine.batch", json!({"commands":[steps[0].clone(),{"command":"timeline.play"}]})),
+        ];
+        for (method, mut params) in unsupported {
+            params["expectedDocument"] = expected.clone();
+            let response = panel_control(&mut app, method, params.clone());
+            assert_eq!(response["errorDetails"]["code"], "UNSUPPORTED_CAPABILITY", "{method} {params}: {response}");
+            assert!(std::sync::Arc::ptr_eq(&doc, &app.session.doc));
+            assert_eq!((app.session.undo.len(), app.session.redo.len()), history);
+            let (req, reply) = ControlRequest::new(method, params);
+            let _ = crate::file_load::control(&mut app, req);
+            assert_eq!(reply.try_recv().unwrap()["errorDetails"]["code"], "UNSUPPORTED_CAPABILITY");
+            assert!(!app.file_load.busy());
+        }
+        for key in ["path", "paths", "file", "files", "dir", "folder", "url", "out"] {
+            let mut params = json!({"name":"width","expression":"50 mm"});
+            params[key] = Value::Null;
+            let response =
+                panel_control(&mut app, "engine.execute", json!({"command":"PARAMETERS.CHANGE","params":params,"expectedDocument":expected}));
+            assert_eq!(response["errorDetails"]["code"], "UNSUPPORTED_CAPABILITY", "{key}: {response}");
+            assert!(std::sync::Arc::ptr_eq(&doc, &app.session.doc));
+        }
+        let next = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        assert_eq!(next, checkpoint + 1);
+        let response = panel_control(
+            &mut app,
+            "engine.batch",
+            json!({"expectedDocument":expected,"rollback":false,"commands":[steps[0].clone(),{"command":"solid.extrude","params":{"distance":"bogus +"}}]}),
+        );
+        assert_eq!(response["ok"], true);
+        assert!(response["result"]["failed"].is_object(), "{response}");
+        assert_eq!(response["result"]["failed"]["index"], 1);
+        assert_eq!(response["result"]["completed"], 1);
+        assert_eq!(app.session.doc.param("width").unwrap().expr, "30 mm");
+        assert_eq!(response["documentStamp"], guard_stamp(&mut app));
+        let expected = guard_stamp(&mut app);
+        let response = panel_control(&mut app, "engine.execute", json!({"command":"unknown.guard","expectedDocument":expected}));
+        assert!(response.get("errorDetails").is_none(), "unknown commands retain native diagnostics: {response}");
+        let legacy = panel_control(&mut app, "engine.execute", json!({"command":"parameters.list"}));
+        assert_eq!(legacy["ok"], true);
+        assert!(legacy.get("documentStamp").is_none());
+    }
+
+    // Catches lossy numeric conversion, nullable/absent conflation, unknown fields and loose Id parsing.
+    #[test]
+    fn guarded_control_envelope_validation_is_integration_owned() {
+        let mut app = guard_app();
+        let id = app.session.document_id.clone();
+        for revision in ["0", "9007199254740993", "18446744073709551615"] {
+            let expected = json!({"documentId":id,"revision":revision});
+            let response = panel_control(&mut app, "engine.execute", guard_change(&expected, "20 mm"));
+            assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT", "{response}");
+            assert_eq!(response["errorDetails"]["details"]["expected"], expected);
+        }
+        let mut invalid =
+            vec![Value::Null, json!({}), json!({"documentId":id}), json!({"revision":"0"}), json!({"documentId":id,"revision":"0","extra":true})];
+        for revision in
+            [json!(0), Value::Null, json!("01"), json!("-1"), json!("1e3"), json!("18446744073709551616"), json!(" 1"), json!("1 "), json!("")]
+        {
+            invalid.push(json!({"documentId":id,"revision":revision}));
+        }
+        for id in [json!(""), json!("-bad"), json!("a/b"), json!("é"), json!("x".repeat(129)), Value::Null, json!(1)] {
+            invalid.push(json!({"documentId":id,"revision":"0"}));
+        }
+        let doc = app.session.doc.clone();
+        for expected in invalid {
+            let response = panel_control(&mut app, "engine.execute", guard_change(&expected, "20 mm"));
+            assert_eq!(response["errorDetails"]["code"], "INVALID_REQUEST", "{expected}: {response}");
+            assert_eq!(response["errorDetails"]["retry"], "never");
+            assert!(response["error"].as_str().is_some_and(|text| text.len() <= 2048));
+            assert!(std::sync::Arc::ptr_eq(&doc, &app.session.doc));
+        }
+        for id in ["a".to_string(), "A0._:-z".to_string(), "x".repeat(128)] {
+            let expected = json!({"documentId":id,"revision":"0"});
+            let response = panel_control(&mut app, "engine.execute", guard_change(&expected, "20 mm"));
+            assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT");
+            assert_eq!(response["errorDetails"]["details"]["expected"], expected);
+        }
+        // Same literal UTF-8 vectors as MCP's guarded_documented_examples_match_actual_shapes.
+        // Product tests intentionally do not depend on the ignored SDD corpus proposal.
+        let text = include_str!("../../../docs/control-protocol.md");
+        let section = text.split_once("<!-- guarded-examples -->").unwrap().1.split_once("<!-- /guarded-examples -->").unwrap().0;
+        let examples: Vec<Value> = serde_json::from_str(section.trim().strip_prefix("```json\n").unwrap().strip_suffix("```").unwrap()).unwrap();
+        let vectors = examples.iter().find(|e| e["label"] == "envelope-vectors").unwrap()["vectors"].as_array().unwrap();
+        for vector in vectors {
+            let input = vector["utf8"].as_str().unwrap();
+            let envelope: Value = serde_json::from_slice(input.as_bytes()).unwrap();
+            let parsed = crate::execution_guard::parse_expected_document(&envelope);
+            if vector["accept"] == true {
+                let native = parsed.ok().unwrap().unwrap();
+                assert_eq!(native.revision.to_string(), vector["revision"]);
+                assert_eq!(crate::execution_guard::stamp_json(&native), envelope["expectedDocument"]);
+            } else {
+                let refusal = match parsed {
+                    Err(error) => crate::execution_guard::refusal_json(&error),
+                    Ok(_) => panic!("accepted {input}"),
+                };
+                assert_eq!(refusal["errorDetails"]["code"], "INVALID_REQUEST", "{input}");
+            }
+        }
+    }
+
     fn panel_command_app() -> crate::SolveApp {
         use crate::panel_runtime::*;
         let h = PanelMountHarness::new(false).unwrap();
@@ -2310,6 +2772,253 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         assert!(h.app.session.cached_world_state().is_none(), "the step placed the components again");
         assert_eq!(crate::open_meshing::session_world(&h.app.session).bodies.len(), 3);
+    }
+
+    // Catches losing BestEffort continuation, claiming a failed restore succeeded, or sending
+    // history through the step adapter. The host check observes/refuses real Session commands.
+    #[test]
+    fn batch_reuse_characterizes_checkpoint_and_restore_failures() {
+        for refused in [None, Some("edit.checkpoint"), Some("edit.restore_checkpoint")] {
+            let mut app = guard_app();
+            let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = trace.clone();
+            app.session.set_command_check(Some(std::sync::Arc::new(move |id, params, _| {
+                observed.lock().unwrap().push((id.to_string(), params.clone()));
+                if Some(id) == refused { Err("injected history refusal".into()) } else { Ok(()) }
+            })));
+            let reply = panel_control(
+                &mut app,
+                "engine.batch",
+                json!({"commands":[
+                    {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},
+                    {"command":"parameters.change","params":{"name":"width","expression":"1 +"}},
+                    {"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}
+                ]}),
+            );
+            let body = &reply["result"];
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert_eq!(body["completed"], 1);
+            assert_eq!(body["results"].as_array().map(Vec::len), Some(1));
+            assert_eq!(body["failed"]["index"], 1);
+            let restored = refused.is_none();
+            assert_eq!(body["rolled_back"], restored);
+            assert_eq!(body["undone"], usize::from(restored));
+            assert_eq!(app.session.doc.param("width").unwrap().expr, if restored { "10 mm" } else { "20 mm" });
+            assert!(body.get("timings").is_none() && body.get("total_ms").is_none());
+            let trace = trace.lock().unwrap();
+            assert_eq!(trace[0], ("edit.checkpoint".into(), json!({})));
+            assert_eq!(trace[1].0, "parameters.change");
+            assert_eq!(trace[2].0, "parameters.change");
+            if refused == Some("edit.checkpoint") {
+                assert_eq!(trace.len(), 3, "no invalid restore after checkpoint Err");
+            } else {
+                assert_eq!(trace.len(), 4);
+                assert_eq!(trace[3], ("edit.restore_checkpoint".into(), json!({"checkpoint":1})));
+            }
+        }
+    }
+
+    // Catches changing coalesced result cardinality, exposing failed-merge timing, dropping
+    // null normalization, or skipping empty-batch checkpoint/forget history.
+    #[test]
+    fn batch_reuse_characterizes_coalescing_null_and_timing() {
+        for refuse_merge in [false, true] {
+            let mut app = guard_app();
+            app.run("parameters.add", json!({"name":"depth","expression":"5 mm"})).unwrap();
+            let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = trace.clone();
+            app.session.set_command_check(Some(std::sync::Arc::new(move |id, params, _| {
+                observed.lock().unwrap().push((id.to_string(), params.clone()));
+                if refuse_merge && id == "parameters.change" && params.get("changes").is_some() {
+                    Err("combined edit refused".into())
+                } else {
+                    Ok(())
+                }
+            })));
+            let reply = panel_control(
+                &mut app,
+                "engine.batch",
+                json!({"profile":true,"coalesce_parameters":true,"commands":[
+                    {"id":"parameters.list","params":null},
+                    {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},
+                    {"command":"parameters.change","params":{"name":"depth","expression":"30 mm"}}
+                ]}),
+            );
+            let body = &reply["result"];
+            assert_eq!(body["completed"], 3, "{reply}");
+            assert!(body.get("rolled_back").is_none());
+            assert_eq!(body["results"].as_array().map(Vec::len), Some(3));
+            let rows = body["timings"].as_array().unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r["index"].clone()).collect::<Vec<_>>(),
+                if refuse_merge { vec![json!(0), json!(1), json!(2)] } else { vec![json!(0), json!(1)] }
+            );
+            for row in rows {
+                assert!(row["ms"].as_f64().is_some_and(|ms| ms.is_finite() && ms >= 0.0));
+                assert!(row["profile"].is_object());
+            }
+            assert!(body["total_ms"].as_f64().is_some_and(|ms| ms.is_finite() && ms >= 0.0));
+            if !refuse_merge {
+                assert_eq!(body["results"][1]["coalesced"], 2);
+                assert_eq!(body["results"][2]["value"], 30.0);
+            }
+            let trace = trace.lock().unwrap();
+            assert_eq!(trace[0], ("edit.checkpoint".into(), json!({})));
+            assert_eq!(trace[1], ("parameters.list".into(), json!({})));
+            assert_eq!(trace[2], ("parameters.change".into(), json!({"changes":{"depth":"30 mm","width":"20 mm"}})));
+            assert_eq!(trace.last().unwrap(), &("edit.restore_checkpoint".into(), json!({"checkpoint":1,"forget":true})));
+            assert_eq!(trace.len(), if refuse_merge { 6 } else { 4 });
+        }
+        let mut app = guard_app();
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = trace.clone();
+        app.session.set_command_check(Some(std::sync::Arc::new(move |id, params, _| {
+            observed.lock().unwrap().push((id.to_string(), params.clone()));
+            Ok(())
+        })));
+        let reply = panel_control(&mut app, "engine.batch", json!({"commands":[]}));
+        assert_eq!(reply["result"], json!({"completed":0,"results":[],"undone":0}));
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec![("edit.checkpoint".into(), json!({})), ("edit.restore_checkpoint".into(), json!({"checkpoint":1,"forget":true}))]
+        );
+        trace.lock().unwrap().clear();
+        let reply = panel_control(&mut app, "engine.batch", json!({"rollback":false,"commands":[{"command":"parameters.list","params":null}]}));
+        assert!(reply["result"].get("timings").is_none());
+        assert_eq!(*trace.lock().unwrap(), vec![("parameters.list".into(), json!({}))]);
+    }
+
+    // Cross-host body parity: the UI keeps its two adapters, native uses execute_session for
+    // both. Excludes actual time only; no invented geometry or wire fixture supplies results.
+    #[test]
+    fn batch_reuse_native_body_matches_ui_document_batch() {
+        for (rollback, coalesce, bad) in [(true, false, false), (true, true, false), (true, true, true), (false, true, true)] {
+            let mut app = guard_app();
+            let steps = vec![
+                json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}),
+                json!({"command":"parameters.change","params":{"name":"width","expression":if bad {"1 +"} else {"30 mm"}}}),
+            ];
+            let options = json!({"rollback":rollback,"coalesce_parameters":coalesce,"commands":steps});
+            let mut native = app.session.scratch();
+            let initial_undo = app.session.undo.len();
+            let base = native.document_stamp();
+            let (expected, stamp) = native.batch_if_current(&steps, &options, &base).unwrap();
+            let actual = panel_control(&mut app, "engine.batch", options);
+            assert_eq!(actual["ok"], true, "{actual}");
+            assert_eq!(actual["result"], expected);
+            assert_eq!(app.session.doc.param("width").unwrap().expr, native.doc.param("width").unwrap().expr);
+            assert_eq!(app.session.undo.len(), native.undo.len() + initial_undo);
+            assert_eq!(native.document_stamp(), stamp);
+        }
+    }
+
+    fn guarded_checkpoint_refusal(rollback: Option<bool>) {
+        let mut app = guard_app();
+        let expected = guard_stamp(&mut app);
+        let doc = app.session.doc.clone();
+        let undo = app.session.undo.len();
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = trace.clone();
+        app.session.set_command_check(Some(std::sync::Arc::new(move |id, params, _| {
+            observed.lock().unwrap().push((id.to_string(), params.clone()));
+            if id == "edit.checkpoint" { Err("checkpoint refused".into()) } else { Ok(()) }
+        })));
+        let mut request = json!({"expectedDocument":expected,"coalesce_parameters":true,"commands":[
+            {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},
+            {"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}
+        ]});
+        if let Some(rollback) = rollback {
+            request["rollback"] = json!(rollback);
+        }
+        let reply = panel_control(&mut app, "engine.batch", request);
+        let body = &reply["result"];
+        assert_eq!(body["completed"], 0, "{reply}");
+        assert_eq!(body["results"], json!([]));
+        assert_eq!(body["not_run"], json!([0, 1]));
+        assert_eq!(body["failed"]["stage"], "checkpoint");
+        assert_eq!(body["failed"]["command"], "edit.checkpoint");
+        assert_eq!(body["failed"]["index"], Value::Null);
+        assert_eq!(body["rolled_back"], false);
+        assert_eq!(body["undone"], 0);
+        assert!(std::sync::Arc::ptr_eq(&doc, &app.session.doc));
+        assert_eq!(app.session.undo.len(), undo);
+        assert_eq!(guard_stamp(&mut app), expected);
+        assert_eq!(reply["documentStamp"], expected);
+        assert_eq!(*trace.lock().unwrap(), vec![("edit.checkpoint".into(), json!({}))]);
+    }
+
+    // Catches guarded requests inheriting BestEffort or accepting a JSON policy override.
+    #[test]
+    fn guarded_batch_checkpoint_true_refuses_before_steps() {
+        guarded_checkpoint_refusal(Some(true));
+    }
+
+    #[test]
+    fn guarded_batch_checkpoint_default_refuses_before_steps() {
+        guarded_checkpoint_refusal(None);
+    }
+
+    // The outer command is not a batch step. Its spelling must not route an admitted guarded
+    // batch through the legacy switch_checked branch with BestEffort history policy.
+    #[test]
+    fn guarded_batch_checkpoint_policy_is_not_overridden_by_outer_dispatch_fields() {
+        for level in ["off", "warn", "strict"] {
+            let mut app = guard_app();
+            let expected = guard_stamp(&mut app);
+            let doc = app.session.doc.clone();
+            let undo = app.session.undo.len();
+            let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = trace.clone();
+            app.session.set_command_check(Some(std::sync::Arc::new(move |id, _, _| {
+                observed.lock().unwrap().push(id.to_string());
+                if id == "edit.checkpoint" { Err("checkpoint refused".into()) } else { Ok(()) }
+            })));
+            let reply = panel_control(
+                &mut app,
+                "engine.batch",
+                json!({"expectedDocument":expected,
+                "command":"view.next_tab","param_check":level,"commands":[
+                {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}]}),
+            );
+            assert_eq!(reply["result"]["completed"], 0, "{level}: {reply}");
+            assert_eq!(reply["result"]["failed"]["stage"], "checkpoint");
+            assert_eq!(reply["result"]["not_run"], json!([0]));
+            assert_eq!(*trace.lock().unwrap(), ["edit.checkpoint"]);
+            assert!(std::sync::Arc::ptr_eq(&doc, &app.session.doc));
+            assert_eq!(app.session.undo.len(), undo);
+            assert_eq!(guard_stamp(&mut app), expected);
+        }
+    }
+
+    #[test]
+    fn guarded_batch_checkpoint_false_runs_without_checkpoint() {
+        let mut app = guard_app();
+        let expected = guard_stamp(&mut app);
+        let undo = app.session.undo.len();
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = trace.clone();
+        app.session.set_command_check(Some(std::sync::Arc::new(move |id, _, _| {
+            observed.lock().unwrap().push(id.to_string());
+            if id == "edit.checkpoint" { Err("checkpoint refused".into()) } else { Ok(()) }
+        })));
+        let reply = panel_control(
+            &mut app,
+            "engine.batch",
+            json!({"expectedDocument":expected,"rollback":false,"commands":[
+                {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},
+                {"command":"parameters.change","params":{"name":"width","expression":"1 +"}},
+                {"command":"parameters.list"}
+            ]}),
+        );
+        assert_eq!(reply["result"]["completed"], 1, "{reply}");
+        assert_eq!(reply["result"]["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(reply["result"]["failed"]["index"], 1);
+        assert_eq!(reply["result"]["rolled_back"], false);
+        assert_eq!(reply["result"]["undone"], 0);
+        assert_eq!(app.session.doc.param("width").unwrap().expr, "20 mm");
+        assert_eq!(app.session.undo.len(), undo + 1);
+        assert_eq!(*trace.lock().unwrap(), ["parameters.change", "parameters.change"]);
+        assert_eq!(reply["documentStamp"], guard_stamp(&mut app));
     }
 
     /// #743: a batch is one request through the app's queue, answered within a frame, however

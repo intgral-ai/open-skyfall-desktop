@@ -136,6 +136,7 @@ pub struct Job {
     /// Screen position and registry label, kept together even when several commands share a panel.
     stops: VecDeque<(Pos2, &'static str)>,
     chat_turn: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    guarded: Option<crate::execution_guard::GuardedAdmission>,
     /// Seconds per glide and per click for this request (within [`TIME_BUDGET`] in all).
     glide: f64,
     click: f64,
@@ -186,10 +187,12 @@ impl AgentCursor {
     }
 
     /// Stop the request the pointer waits on: answered as stopped, nothing of it applied.
-    pub(crate) fn stop(&mut self) -> Option<(Sender<ControlResponse>, String)> {
+    pub(crate) fn stop(&mut self) -> Option<(Sender<ControlResponse>, Value)> {
         self.computing()?;
         let job = self.job.take()?;
-        Some((job.reply, job.ahead.map(|a| a.label).unwrap_or_default()))
+        let label = job.ahead.map(|a| a.label).unwrap_or_default();
+        let response = crate::control::stopped_command_response(&job.method, &job.params, job.guarded.is_some(), &label);
+        Some((job.reply, response))
     }
 }
 
@@ -374,6 +377,7 @@ pub fn intercept(app: &mut SolveApp, req: &crate::control::ControlRequest) -> bo
         params: params.clone(),
         reply: reply.clone(),
         chat_turn: req.chat_turn.clone(),
+        guarded: req.guarded.clone(),
         stops,
         glide,
         click,
@@ -407,7 +411,7 @@ pub fn step(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(job) = app.agent.job.as_mut() else { return };
     if crate::control::chat_turn_cancelled(job.chat_turn.as_deref()) {
         if let Some(job) = app.agent.job.take() {
-            let _ = job.reply.send(crate::control::cancelled_chat_response());
+            let _ = job.reply.send(crate::control::cancelled_request_response(&job.method, &job.params, job.guarded.is_some()));
         }
         return;
     }
@@ -445,19 +449,26 @@ pub fn step(app: &mut SolveApp, ctx: &egui::Context) {
 fn finish(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(job) = app.agent.job.take() else { return };
     if crate::control::chat_turn_cancelled(job.chat_turn.as_deref()) {
-        let _ = job.reply.send(crate::control::cancelled_chat_response());
+        let _ = job.reply.send(crate::control::cancelled_request_response(&job.method, &job.params, job.guarded.is_some()));
         return;
     }
     let mut params = job.params;
     params["animate"] = json!(false);
     let cmd = params.get("command").or(params.get("id")).and_then(Value::as_str).unwrap_or_default().to_string();
     let id = solidcraft_engine::find_command(&cmd).map_or(cmd.clone(), |c| c.id.to_string());
+    let (mut req, _rx) = crate::control::ControlRequest::new(job.method, params);
+    req.chat_turn = job.chat_turn;
+    req.guarded = job.guarded;
+    // Check before installing kept results or changing followed camera bookkeeping. Returning
+    // to the same tab/stamp must not re-admit a request whose original context is dead.
+    if let Err(error) = crate::execution_guard::check_application(app, &req) {
+        let _ = job.reply.send(crate::execution_guard::refusal_json(&error));
+        return;
+    }
     let follow = app.ui.agent_cursor.follow_camera;
     if follow && id == "sketch.create" {
         app.agent.saved_view = Some(app.cam);
     }
-    let (mut req, _rx) = crate::control::ControlRequest::new(job.method, params);
-    req.chat_turn = job.chat_turn;
     // What was computed ahead while the pointer glided is found rather than computed again here.
     let out = app.run_with_kept(job.ahead.map(|a| a.kept), |app| match crate::control::handle(app, ctx, &req) {
         crate::control::Outcome::Done(v) => v,

@@ -13,12 +13,21 @@ use solidcraft_engine::render::StandardView;
 use solidcraft_engine::schema::ParamCheck;
 use solidcraft_engine::view::Guides;
 
+pub(crate) use crate::document_guard::decode_guarded_reply;
+use crate::document_guard::{
+    GuardedCallError, GuardedReply, check_supported, invalid, parse_expected_document, stamp_json, unsupported, validate_request,
+};
+
 /// Something that answers control-channel methods: `engine.execute`, `engine.commands`,
 /// `document.inspect`, `ui.view`, `ui.render`, `ui.screenshot`, `control.running`, and
 /// `control.pending` (the result of a request that was still running when its call returned:
 /// `{pending: what | null, done?, reply?, lost?, running_s?}`).
 pub trait Backend {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
+    /// Guarded calls never fall back to the legacy entry point.
+    fn call_guarded(&mut self, _method: &str, _params: Value) -> Result<GuardedReply, GuardedCallError> {
+        Err(unsupported("guarded backend"))
+    }
     /// True when a real window is attached (`ui.screenshot` can capture it).
     fn has_ui(&self) -> bool;
     fn describe(&self) -> String;
@@ -74,8 +83,15 @@ pub(crate) const STILL_RUNNING: &str = "still running:";
 
 /// A request the app said is still running (#1618). Its reply will come on this connection,
 /// through `control.pending`, so the connection is kept for it.
+#[derive(Clone)]
 struct Outstanding {
     what: String,
+    method: String,
+    guarded: bool,
+    steps: Option<usize>,
+    rollback: bool,
+    verbose: bool,
+    level: ParamCheck,
     /// What it does when it finishes; `None`: not known (a request this bridge did not send).
     effect: Option<control_pending::Effect>,
     since: Instant,
@@ -90,8 +106,8 @@ impl Outstanding {
 /// What became of a request still running when its call returned, once a later call waited it
 /// out: kept for the `pending` tool.
 enum Settled {
-    Finished { what: String, reply: Value },
-    Lost { what: String },
+    Finished { request: Outstanding, reply: Value },
+    Lost { request: Outstanding, reply: Option<Value> },
 }
 
 /// The end of a wait for an outstanding request.
@@ -102,6 +118,42 @@ enum Waited {
     Nothing,
     /// Still running when the wait ran out.
     Running,
+}
+
+fn pending_metadata(mut status: Value, request: &Outstanding) -> Value {
+    if request.guarded
+        && let Some(object) = status.as_object_mut()
+    {
+        object.insert("method".into(), json!(request.method));
+        object.insert("guarded".into(), json!(true));
+        object.insert("steps".into(), json!(request.steps));
+        object.insert("rollback".into(), json!(request.rollback));
+        object.insert("verbose".into(), json!(request.verbose));
+    }
+    status
+}
+
+fn settled_status(settled: Settled) -> Value {
+    match settled {
+        Settled::Finished { request, reply } => pending_metadata(json!({"pending":request.what,"done":true,"reply":reply}), &request),
+        Settled::Lost { request, reply } => {
+            let mut status = json!({"pending":request.what,"lost":true});
+            if let Some(reply) = reply
+                && let Some(object) = status.as_object_mut()
+            {
+                object.insert("reply".into(), reply);
+            }
+            pending_metadata(status, &request)
+        }
+    }
+}
+
+fn refuse_legacy_guard(params: &Value) -> Result<(), String> {
+    if params.get("expectedDocument").is_some() {
+        Err("expectedDocument requires call_guarded; the legacy call was not sent or executed".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// How long to wait for a request still running (tests shorten them).
@@ -151,6 +203,11 @@ pub struct Remote {
     app_checks: Option<bool>,
     /// The level the app said it checked the last reply at (`param_check` beside `ok`).
     echoed: Option<ParamCheck>,
+    /// Negotiated on `conn` only. Legacy reconnection also invalidates this cache.
+    guarded_capabilities: Option<Value>,
+    /// Uncertain writes survive connection loss, reconnect and consuming pending status.
+    /// Only explicitly reconstructing this Remote after reconciliation starts afresh.
+    guarded_unknown: Option<String>,
 }
 
 /// How a tool error starts when no app listens at the bridged address. The agent reads it, and
@@ -188,6 +245,8 @@ impl Remote {
             param_check: ParamCheck::Off,
             app_checks: None,
             echoed: None,
+            guarded_capabilities: None,
+            guarded_unknown: None,
         }
     }
 
@@ -204,13 +263,22 @@ impl Remote {
         self.waits = waits;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_next_id(&mut self, id: u64) {
+        self.next_id = id;
+    }
+
     /// Close the connection. A request still running loses its reply with it.
     fn drop_conn(&mut self) {
         self.conn = None;
         // The next connection may reach another app (restarted, another version).
         self.app_checks = None;
+        self.guarded_capabilities = None;
         if let Some(o) = self.outstanding.take() {
-            self.settled = Some(Settled::Lost { what: o.what });
+            if o.guarded {
+                self.unknown("The connection holding a guarded pending reply was lost; reconcile the document before further guarded writes.");
+            }
+            self.settled = Some(Settled::Lost { request: o, reply: None });
         }
     }
 
@@ -264,7 +332,12 @@ impl Remote {
         if self.conn.is_none() {
             self.reconnect()?;
         }
-        let Some((reader, writer)) = self.conn.as_mut() else { return Err(std::io::Error::other("not connected")) };
+        self.roundtrip_connected(line)
+    }
+
+    /// One exchange on the current connection. Never connect or retry here.
+    pub(crate) fn roundtrip_connected(&mut self, line: &str) -> std::io::Result<String> {
+        let Some((reader, writer)) = self.conn.as_mut() else { return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected")) };
         // One write: a request that loses its newline still reaches the app as a request.
         let sent = writer.write_all(format!("{line}\n").as_bytes()).and_then(|()| writer.flush());
         if let Err(e) = sent {
@@ -335,7 +408,7 @@ impl Remote {
             return Err("the connection to the app was lost".into());
         }
         let line = self.request_line("control.pending", json!({}));
-        let reply = self.roundtrip(&line).map_err(|e| self.explain(&e))?;
+        let reply = self.roundtrip_connected(&line).map_err(|e| self.explain(&e))?;
         let v: Value = serde_json::from_str(&reply).map_err(|e| format!("bad reply from the app: {e}"))?;
         outcome(&v).inspect_err(|_| self.drop_conn())
     }
@@ -347,15 +420,44 @@ impl Remote {
         let mut told = start;
         loop {
             let Some(o) = &self.outstanding else { return Ok(Waited::Nothing) };
-            let what = o.what.clone();
-            let r = self.ask_pending()?;
+            let request = o.clone();
+            let what = request.what.clone();
+            let r = match self.ask_pending() {
+                Ok(r) => r,
+                Err(error) => {
+                    if request.guarded {
+                        self.unknown(
+                            "The original guarded pending reply could not be retrieved; reconcile the document before further guarded writes.",
+                        );
+                        self.drop_conn();
+                    }
+                    return Err(error);
+                }
+            };
             if r.get("pending").is_none_or(Value::is_null) {
                 self.outstanding = None;
+                if request.guarded {
+                    self.unknown("The app kept no original guarded reply; an empty pending slot cannot establish its effect.");
+                    self.settled = Some(Settled::Lost { request, reply: None });
+                    return Err("the guarded pending result was lost".into());
+                }
                 return Ok(Waited::Nothing);
             }
             if r.get("done").and_then(Value::as_bool) == Some(true) {
                 self.outstanding = None;
-                return Ok(Waited::Done(r.get("reply").cloned().unwrap_or(Value::Null)));
+                let reply = r.get("reply").cloned().unwrap_or(Value::Null);
+                if request.guarded
+                    && let Err(GuardedCallError::OutcomeUnknown(message)) = self.finish_guarded_reply(&request.method, &reply, request.level)
+                {
+                    self.settled = Some(Settled::Lost { request, reply: Some(reply) });
+                    return Err(message);
+                }
+                return Ok(Waited::Done(reply));
+            }
+            if request.guarded && (r.get("lost") == Some(&Value::Bool(true)) || r.get("done") != Some(&Value::Bool(false))) {
+                self.unknown("The app did not return a recognizable guarded pending status.");
+                self.drop_conn();
+                return Err("the guarded pending status was invalid".into());
             }
             let waited = start.elapsed();
             if waited >= limit {
@@ -395,9 +497,9 @@ impl Remote {
     /// Before a new request: wait for one still running from an earlier call, keeping its end for
     /// `pending`. Still running after the wait: the new request is not sent.
     fn settle_earlier(&mut self) -> Result<(), String> {
-        let Some(what) = self.outstanding.as_ref().map(|o| o.what.clone()) else { return Ok(()) };
+        let Some(request) = self.outstanding.clone() else { return Ok(()) };
         match self.wait_outstanding(self.waits.settle) {
-            Ok(Waited::Done(reply)) => self.settled = Some(Settled::Finished { what, reply }),
+            Ok(Waited::Done(reply)) => self.settled = Some(Settled::Finished { request, reply }),
             Ok(Waited::Nothing) => {}
             Ok(Waited::Running) => return Err(self.still_running(true)),
             // The connection was lost, and the earlier reply with it (`pending` says so): the new
@@ -412,21 +514,17 @@ impl Remote {
     /// nothing pending.
     fn pending_status(&mut self) -> Result<Value, String> {
         if let Some(s) = self.settled.take() {
-            return Ok(match s {
-                Settled::Finished { what, reply } => json!({"pending": what, "done": true, "reply": reply}),
-                Settled::Lost { what } => json!({"pending": what, "lost": true}),
-            });
+            return Ok(settled_status(s));
         }
-        let Some(what) = self.outstanding.as_ref().map(|o| o.what.clone()) else { return Ok(json!({"pending": null})) };
-        match self.wait_outstanding(self.waits.settle) {
+        let Some(request) = self.outstanding.clone() else { return Ok(json!({"pending": null})) };
+        let what = &request.what;
+        let status: Result<Value, String> = match self.wait_outstanding(self.waits.settle) {
             Ok(Waited::Done(reply)) => Ok(json!({"pending": what, "done": true, "reply": reply})),
             Ok(Waited::Nothing) => Ok(json!({"pending": null})),
             Ok(Waited::Running) => Ok(json!({"pending": what, "done": false, "running_s": self.outstanding.as_ref().map_or(0, Outstanding::secs)})),
-            Err(_) => {
-                self.settled = None;
-                Ok(json!({"pending": what, "lost": true}))
-            }
-        }
+            Err(_) => Ok(self.settled.take().map(settled_status).unwrap_or_else(|| json!({"pending": what, "lost": true}))),
+        };
+        Ok(pending_metadata(status?, &request))
     }
 
     fn call_once(&mut self, method: &str, params: Value, retry_busy: bool) -> Result<Value, String> {
@@ -456,7 +554,17 @@ impl Remote {
         self.echoed = echoed(&v);
         // Timed out in the app, still running (#1618): wait for its result on this connection.
         if v.get("running").and_then(Value::as_bool) == Some(true) {
-            self.outstanding = Some(Outstanding { what: what.clone(), effect: Some(effect), since: sent });
+            self.outstanding = Some(Outstanding {
+                what: what.clone(),
+                method: method.into(),
+                guarded: false,
+                steps: None,
+                rollback: true,
+                verbose: true,
+                level: self.param_check,
+                effect: Some(effect),
+                since: sent,
+            });
             solidcraft_engine::note!(
                 "solidcraft-mcp: {what} is still running in the app after {} s; waiting up to {} s more for it",
                 sent.elapsed().as_secs(),
@@ -478,7 +586,17 @@ impl Remote {
         if v.get("busy").and_then(Value::as_bool) == Some(true)
             && let Some(params) = again
         {
-            self.outstanding = Some(Outstanding { what: "an earlier request".into(), effect: None, since: Instant::now() });
+            self.outstanding = Some(Outstanding {
+                what: "an earlier request".into(),
+                method: String::new(),
+                guarded: false,
+                steps: None,
+                rollback: true,
+                verbose: true,
+                level: self.param_check,
+                effect: None,
+                since: Instant::now(),
+            });
             self.settle_earlier()?;
             return self.call_once(method, params, false);
         }
@@ -507,6 +625,167 @@ fn add_param_warnings(reply: &mut Value, issues: Vec<String>) {
 }
 
 impl Remote {
+    fn unknown(&mut self, message: &str) -> GuardedCallError {
+        let reason = self.guarded_unknown.get_or_insert_with(|| message.to_owned());
+        GuardedCallError::OutcomeUnknown(reason.clone())
+    }
+
+    fn check_unknown(&self) -> Result<(), GuardedCallError> {
+        match &self.guarded_unknown {
+            Some(reason) => Err(GuardedCallError::OutcomeUnknown(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn guarded_method_capability(&self, method: &str) -> Result<(), GuardedCallError> {
+        let field = match method {
+            "engine.execute" => "execute",
+            "engine.batch" => "batch",
+            _ => return Err(unsupported("guarded control method")),
+        };
+        let guard = self.guarded_capabilities.as_ref().and_then(|c| c.get("guardedExecution"));
+        if guard.is_some_and(|g| g.get("version").and_then(Value::as_str) == Some("1.0") && g.get(field).and_then(Value::as_bool) == Some(true)) {
+            Ok(())
+        } else {
+            Err(unsupported("guardedExecution"))
+        }
+    }
+
+    /// Negotiation may establish a connection, but the exchange itself never reconnects.
+    /// Even at param-check off a guarded mutation requires this connection's capability.
+    pub(crate) fn ensure_guarded_capability(&mut self, method: &str) -> Result<(), GuardedCallError> {
+        self.check_unknown()?;
+        if !matches!(method, "engine.execute" | "engine.batch") {
+            return Err(unsupported("guarded control method"));
+        }
+        if self.conn.is_none() {
+            self.reconnect().map_err(|_| GuardedCallError::NotSent("Could not connect; the guarded request was not sent.".into()))?;
+        }
+        if self.guarded_capabilities.is_none() {
+            let line = self.request_line("control.capabilities", json!({}));
+            let reply = self
+                .roundtrip_connected(&line)
+                .map_err(|_| GuardedCallError::NotSent("Capability negotiation failed; the guarded request was not sent.".into()))?;
+            let value: Value = serde_json::from_str(&reply).map_err(|_| {
+                self.drop_conn();
+                GuardedCallError::NotSent("Invalid capability reply; the guarded request was not sent.".into())
+            })?;
+            if value.get("ok") != Some(&Value::Bool(true)) {
+                return Err(unsupported("guardedExecution"));
+            }
+            self.guarded_capabilities = value.get("result").cloned();
+        }
+        self.guarded_method_capability(method)
+    }
+
+    fn guarded_level(&self, params: &Value) -> Result<ParamCheck, GuardedCallError> {
+        match params.get("param_check") {
+            Some(value) => {
+                value.as_str().and_then(ParamCheck::parse).ok_or_else(|| invalid("param_check", "param_check must be off, warn or strict"))
+            }
+            None => Ok(self.param_check),
+        }
+    }
+
+    fn finish_guarded_reply(&mut self, method: &str, reply: &Value, level: ParamCheck) -> Result<GuardedReply, GuardedCallError> {
+        match decode_guarded_reply(reply) {
+            Ok(decoded) if method == "engine.batch" && !decoded.result.is_object() => {
+                Err(self.unknown("The guarded batch did not return a batch object; reconcile before further guarded writes."))
+            }
+            Ok(_) if level != ParamCheck::Off && echoed(reply) != Some(level) => Err(self
+                .unknown("The app's successful guarded reply did not echo the requested validation level; reconcile before further guarded writes.")),
+            Err(GuardedCallError::OutcomeUnknown(message)) => Err(self.unknown(&message)),
+            other => other,
+        }
+    }
+
+    fn settle_before_guarded(&mut self) -> Result<(), GuardedCallError> {
+        self.check_unknown()?;
+        let Some(request) = self.outstanding.clone() else { return Ok(()) };
+        match self.wait_outstanding(self.waits.settle) {
+            Ok(Waited::Done(reply)) => self.settled = Some(Settled::Finished { request, reply }),
+            Ok(Waited::Nothing) => {}
+            Ok(Waited::Running) => {
+                return Err(GuardedCallError::NotSent(
+                    "An earlier request is still running; this guarded request was not sent. Retrieve the earlier pending reply first.".into(),
+                ));
+            }
+            Err(_) => {
+                self.check_unknown()?;
+                return Err(GuardedCallError::NotSent("The earlier reply was lost; this guarded request was not sent.".into()));
+            }
+        }
+        self.check_unknown()
+    }
+
+    /// Distinct single-send path: no legacy execute retry, fresh-connection send_batch,
+    /// local validation downgrade, recursive busy retry, or outcome() on the actual reply.
+    pub(crate) fn call_guarded_connected(&mut self, method: &str, mut params: Value) -> Result<GuardedReply, GuardedCallError> {
+        self.check_unknown()?;
+        validate_request(method, &params)?;
+        let level = self.guarded_level(&params)?;
+        if self.conn.is_none() || self.guarded_capabilities.is_none() {
+            return Err(GuardedCallError::NotSent("Guarded capability was not verified on a live connection; the request was not sent.".into()));
+        }
+        self.guarded_method_capability(method)?;
+        if level != ParamCheck::Off
+            && !self
+                .guarded_capabilities
+                .as_ref()
+                .and_then(|c| c.get("param_check"))
+                .and_then(Value::as_array)
+                .is_some_and(|levels| levels.iter().any(|l| l.as_str() == Some(level.name())))
+        {
+            return Err(unsupported("param_check"));
+        }
+        if self.outstanding.is_some() {
+            return Err(GuardedCallError::NotSent("An earlier request is still pending; this guarded request was not sent.".into()));
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.insert("param_check".into(), json!(level.name()));
+        }
+        let request = Outstanding {
+            what: control_pending::describe(method, &params),
+            method: method.into(),
+            guarded: true,
+            steps: params.get("commands").and_then(Value::as_array).map(Vec::len),
+            rollback: params.get("rollback").and_then(Value::as_bool).unwrap_or(true),
+            verbose: params.get("verbose").and_then(Value::as_bool).unwrap_or(true),
+            level,
+            effect: Some(control_pending::effect(method, &params)),
+            since: Instant::now(),
+        };
+        let line = self.request_line(method, params);
+        // Check the exact batch JSON after scope, level, id and token serialization. The
+        // channel's line limit excludes the single LF that roundtrip_connected appends.
+        // Keep execute's existing partial-write/unknown seam unchanged.
+        if method == "engine.batch" && line.len() > solidcraft_engine::MAX_LINE {
+            return Err(GuardedCallError::NotSent("The serialized guarded batch exceeds the transport line limit; nothing was sent.".into()));
+        }
+        if method == "engine.batch" {
+            self.set_read_timeout(BATCH_TIMEOUT);
+        }
+        let exchange = self.roundtrip_connected(&line);
+        self.set_read_timeout(READ_TIMEOUT);
+        // Once write_all has been attempted, even a write error cannot prove zero bytes sent.
+        let reply = exchange
+            .map_err(|_| self.unknown("A guarded write or its reply was lost; do not resend it. Reconcile before further guarded writes."))?;
+        let reply: Value = serde_json::from_str(&reply).map_err(|_| {
+            self.drop_conn();
+            self.unknown("The guarded reply was unreadable; do not resend it. Reconcile before further guarded writes.")
+        })?;
+        if reply.get("ok") == Some(&Value::Bool(false)) && reply.get("running") == Some(&Value::Bool(true)) {
+            self.outstanding = Some(request);
+            return match self.wait_outstanding(self.waits.pending) {
+                Ok(Waited::Done(reply)) => self.finish_guarded_reply(method, &reply, level),
+                Ok(Waited::Running) => Err(GuardedCallError::Pending(self.still_running(false))),
+                _ => Err(self.unknown("The original guarded pending reply was lost; reconcile before further guarded writes.")),
+            };
+        }
+        // Busy/unrun is an explicit refusal, not this request's Pending and not a retry signal.
+        self.finish_guarded_reply(method, &reply, level)
+    }
+
     /// Whether the app checks a request's `param_check` itself (#9184): asked once per
     /// connection with `control.capabilities`, which lists the levels it takes; an older app
     /// answers "unknown method". Any other answer (no app, a busy one) is asked again next time.
@@ -619,6 +898,7 @@ impl Remote {
 
 impl Backend for Remote {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        refuse_legacy_guard(&params)?;
         match method {
             "control.pending" => self.pending_status(),
             "engine.execute" if self.param_check != ParamCheck::Off => self.execute_checked(params),
@@ -626,6 +906,14 @@ impl Backend for Remote {
             "engine.script" if self.param_check != ParamCheck::Off => self.call_once(method, self.at_level(params), true),
             _ => self.call_once(method, params, true),
         }
+    }
+    fn call_guarded(&mut self, method: &str, params: Value) -> Result<GuardedReply, GuardedCallError> {
+        self.check_unknown()?;
+        validate_request(method, &params)?;
+        self.guarded_level(&params)?;
+        self.settle_before_guarded()?;
+        self.ensure_guarded_capability(method)?;
+        self.call_guarded_connected(method, params)
     }
     fn param_check(&self) -> ParamCheck {
         self.param_check
@@ -812,6 +1100,7 @@ impl Headless {
 }
 impl Backend for Headless {
     fn call(&mut self, method: &str, p: Value) -> Result<Value, String> {
+        refuse_legacy_guard(&p)?;
         let own = self.session.param_check;
         if matches!(method, "engine.execute" | "command" | "engine.batch" | "engine.script")
             && let Some(value) = p.get("param_check")
@@ -819,6 +1108,55 @@ impl Backend for Headless {
             self.session.param_check = value.as_str().and_then(ParamCheck::parse).ok_or("`param_check` must be off, warn or strict")?;
         }
         let reply = self.call_at_current_level(method, p);
+        self.session.param_check = own;
+        reply
+    }
+    fn call_guarded(&mut self, method: &str, p: Value) -> Result<GuardedReply, GuardedCallError> {
+        let expected = parse_expected_document(&p)?.ok_or_else(|| invalid("expectedDocument", "call_guarded requires expectedDocument"))?;
+        check_supported(method, &p)?;
+        let own = self.session.param_check;
+        let level = match p.get("param_check") {
+            Some(value) => {
+                value.as_str().and_then(ParamCheck::parse).ok_or_else(|| invalid("param_check", "param_check must be off, warn or strict"))?
+            }
+            None => own,
+        };
+        self.session.param_check = level;
+        let reply = (|| {
+            let native = match method {
+                "engine.execute" => {
+                    let id = p
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .or_else(|| p.get("id").and_then(Value::as_str))
+                        .ok_or_else(|| GuardedCallError::CommandFailed("missing `command`".into()))?;
+                    let empty = json!({});
+                    self.session.execute_if_current(id, p.get("params").filter(|v| !v.is_null()).unwrap_or(&empty), &expected)
+                }
+                "engine.batch" => {
+                    let steps = p
+                        .get("commands")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| GuardedCallError::CommandFailed("engine.batch: commands must be an array of at most 10000 steps".into()))?;
+                    self.session.batch_if_current(steps, &p, &expected)
+                }
+                _ => return Err(unsupported("guarded control method")),
+            };
+            match native {
+                Ok((result, document_stamp)) => Ok(GuardedReply { result, document_stamp }),
+                Err(solidcraft_engine::ConditionedError::Command(error)) => Err(GuardedCallError::CommandFailed(error.to_string())),
+                Err(solidcraft_engine::ConditionedError::Changed { expected, current }) => {
+                    let message = "The document changed before this write could apply.";
+                    Err(GuardedCallError::Rejected {
+                        message: message.into(),
+                        error_details: json!({
+                            "code":"STALE_DOCUMENT","message":message,"retry":"never",
+                            "details":{"expected":stamp_json(&expected),"current":stamp_json(&current)}
+                        }),
+                    })
+                }
+            }
+        })();
         self.session.param_check = own;
         reply
     }
@@ -875,6 +1213,7 @@ impl Auto {
 
 impl Backend for Auto {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        refuse_legacy_guard(&params)?;
         if self.remote.is_none() {
             self.look_for_app();
         }
@@ -882,6 +1221,16 @@ impl Backend for Auto {
             (Some(r), _) => r.call(method, params),
             (None, Some(h)) => h.call(method, params),
             (None, None) => Err("no session".into()),
+        }
+    }
+    fn call_guarded(&mut self, method: &str, params: Value) -> Result<GuardedReply, GuardedCallError> {
+        if self.remote.is_none() {
+            self.look_for_app();
+        }
+        match (&mut self.remote, &mut self.headless) {
+            (Some(remote), _) => remote.call_guarded(method, params),
+            (None, Some(headless)) => headless.call_guarded(method, params),
+            (None, None) => Err(GuardedCallError::NotSent("no session".into())),
         }
     }
     fn has_ui(&self) -> bool {

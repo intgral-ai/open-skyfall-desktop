@@ -6,6 +6,980 @@ use serde_json::{Value, json};
 
 use crate::{Headless, PROTOCOL_VERSION, Server, tool_definitions};
 
+fn guarded_headless_stamp(h: &mut Headless) -> Value {
+    let stamp = h.session.document_stamp();
+    json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()})
+}
+
+// These adapters observe the real tools/Headless seam; they do not implement guard behavior.
+#[derive(Default)]
+struct GuardToolBackend {
+    headless: Headless,
+    calls: Vec<(bool, String, Value)>,
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl crate::Backend for GuardToolBackend {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.push((false, method.into(), params.clone()));
+        crate::Backend::call(&mut self.headless, method, params)
+    }
+    fn call_guarded(&mut self, method: &str, params: Value) -> Result<crate::GuardedReply, crate::GuardedCallError> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.push((true, method.into(), params.clone()));
+        crate::Backend::call_guarded(&mut self.headless, method, params)
+    }
+    fn has_ui(&self) -> bool {
+        false
+    }
+    fn describe(&self) -> String {
+        "observed Headless".into()
+    }
+}
+
+fn guarded_tool_body(tool: &Value) -> Value {
+    let body: Value = serde_json::from_str(tool["content"].as_array().unwrap().last().unwrap()["text"].as_str().unwrap()).unwrap();
+    assert_eq!(tool["structuredContent"], body, "readable and structured facts must agree: {tool}");
+    body
+}
+
+// Documentation literals must match the real tool/native paths, not another copy of prose.
+#[test]
+fn guarded_documented_examples_match_actual_shapes() {
+    use crate::Backend;
+    use crate::document_guard::{parse_expected_document, stamp_json};
+    use solidcraft_engine::schema::ParamCheck;
+
+    fn examples(text: &str) -> Vec<Value> {
+        let (_, rest) = text.split_once("<!-- guarded-examples -->").expect("missing guarded-examples opening marker");
+        let (section, _) = rest.split_once("<!-- /guarded-examples -->").expect("missing guarded-examples closing marker");
+        let json = section.trim().strip_prefix("```json\n").unwrap().strip_suffix("```").unwrap();
+        serde_json::from_str(json).unwrap()
+    }
+    fn normalize(value: &mut Value, before: &Value, after: &Value) {
+        if value == before {
+            *value = json!({"documentId":"doc-A","revision":"9007199254740993"});
+        } else if value == after {
+            *value = json!({"documentId":"doc-A","revision":"9007199254740994"});
+        } else {
+            match value {
+                Value::Object(object) => object.values_mut().for_each(|v| normalize(v, before, after)),
+                Value::Array(array) => array.iter_mut().for_each(|v| normalize(v, before, after)),
+                _ => {}
+            }
+        }
+    }
+    let control = examples(include_str!("../../../docs/control-protocol.md"));
+    let mcp = examples(include_str!("../../../docs/mcp.md"));
+    for label in ["matching-execute", "matching-batch", "stale", "closed", "unsupported", "primitive-wrapper", "pending", "expectation-failed"] {
+        for (surface, entries) in [("control", &control), ("mcp", &mcp)] {
+            let entry = entries.iter().find(|e| e["label"] == label).unwrap_or_else(|| panic!("missing {surface} label {label}"));
+            let mut args = entry["arguments"].clone();
+            let tool = entry["tool"].as_str().unwrap();
+            let method = if tool == "batch" { "engine.batch" } else { "engine.execute" };
+            let mut headless = Headless::default();
+            let discovery = headless.call("engine.execute", json!({"command":"document.revision"})).unwrap();
+            let native = headless.session.document_stamp();
+            assert_eq!(discovery["document_id"], native.document_id);
+            assert_eq!(discovery["revision"].as_u64(), Some(native.revision));
+            let template = parse_expected_document(&args).unwrap().unwrap();
+            assert_eq!(template.document_id, "doc-A");
+            assert_eq!(template.revision, 9_007_199_254_740_993u64);
+            let before = guarded_headless_stamp(&mut headless);
+            args["expectedDocument"] = before.clone();
+            if label == "stale" {
+                headless.session.execute("parameters.change", &json!({"name":"width","expression":"30 mm"})).unwrap();
+            }
+            let actual = if matches!(label, "closed" | "primitive-wrapper" | "pending") {
+                // Fixed protocol fixtures from Task7's decode/wrapper/pending tests. This tests
+                // real Remote/tools decoding, not a claim that Headless can close a GUI tab.
+                let original = if label == "closed" {
+                    json!({"ok":false,"error":"stale","errorDetails":{"code":"STALE_DOCUMENT","message":"stale","retry":"never",
+                        "details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}}})
+                } else {
+                    json!({"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}})
+                };
+                let mut polls = 0;
+                let reply = original.clone();
+                let peer = GuardPeer::new(move |_, req| {
+                    GuardAnswer::Reply(match req["method"].as_str() {
+                        Some("control.capabilities") => guard_capabilities(),
+                        Some("control.pending") => {
+                            polls += 1;
+                            if polls == 1 {
+                                json!({"ok":true,"result":{"pending":1,"done":false}})
+                            } else {
+                                json!({"ok":true,"result":{"pending":1,"done":true,"reply":reply}})
+                            }
+                        }
+                        _ if label == "pending" => running(),
+                        _ => reply.clone(),
+                    })
+                });
+                let mut remote = peer.remote(ParamCheck::Off);
+                let initial = crate::call_tool(&mut remote, tool, &entry["arguments"]);
+                let result = if label == "pending" {
+                    assert_eq!(initial["isError"], true);
+                    let body = guarded_tool_body(&initial);
+                    assert_eq!(body["pending"], true);
+                    assert_eq!(body["expectation"], Value::Null);
+                    crate::call_tool(&mut remote, "pending", &json!({}))
+                } else {
+                    initial
+                };
+                let body = guarded_tool_body(&result);
+                assert_eq!(result["isError"] == true, entry["isError"].as_bool().unwrap());
+                assert_eq!(peer.finish(remote).iter().filter(|(_, r)| r["method"] == method).count(), 1);
+                if surface == "control" && label != "pending" { original } else { body }
+            } else if surface == "control" && label != "expectation-failed" {
+                // Same native/guard-to-control carrier construction as Task7's actual peer.
+                match headless.call_guarded(method, args) {
+                    Ok(r) => json!({"ok":true,"result":r.result,"documentStamp":stamp_json(&r.document_stamp)}),
+                    Err(crate::GuardedCallError::Rejected { message, error_details }) => {
+                        json!({"ok":false,"error":message,"errorDetails":error_details})
+                    }
+                    other => panic!("{other:?}"),
+                }
+            } else {
+                let reply = crate::call_tool(&mut headless, tool, &args);
+                assert_eq!(reply["isError"] == true, entry["isError"].as_bool().unwrap());
+                guarded_tool_body(&reply)
+            };
+            let after = guarded_headless_stamp(&mut headless);
+            if label == "expectation-failed" {
+                assert_ne!(before, after, "expectation failure must not erase the successful write");
+                assert_eq!(headless.session.doc.param("width").unwrap().expr, "20 mm");
+            }
+            let mut actual = actual;
+            if !matches!(label, "closed" | "primitive-wrapper" | "pending") {
+                normalize(&mut actual, &before, &after);
+            }
+            assert_eq!(actual, entry["reply"], "{surface}/{label}");
+        }
+    }
+    let vectors = |entries: &[Value]| entries.iter().find(|e| e["label"] == "envelope-vectors").unwrap()["vectors"].clone();
+    // The existing UI control test reads these same UTF-8 strings from the same document.
+    for vector in vectors(&control).as_array().unwrap() {
+        let input = vector["utf8"].as_str().unwrap();
+        let envelope: Value = serde_json::from_slice(input.as_bytes()).unwrap();
+        let parsed = parse_expected_document(&envelope);
+        if vector["accept"] == true {
+            let native = parsed.unwrap().unwrap();
+            assert_eq!(native.revision.to_string(), vector["revision"]);
+            assert_eq!(stamp_json(&native), envelope["expectedDocument"]);
+        } else {
+            assert!(
+                matches!(parsed, Err(crate::GuardedCallError::Rejected { error_details, .. }) if error_details["code"] == "INVALID_REQUEST"),
+                "{input}"
+            );
+        }
+    }
+}
+
+// Actual scoped transport, not just envelope arithmetic: the peer counts even a partial batch.
+#[test]
+fn guarded_mcp_batch_exact_wire_budget_includes_scope_and_framing() {
+    use crate::Backend;
+    use solidcraft_engine::io::vfs::{self, PathScope};
+    use solidcraft_engine::schema::ParamCheck;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::channel,
+    };
+    use std::time::Duration;
+
+    let base = vfs::temp_dir().join(format!("solidcraft-wire-r1-{}", std::process::id()));
+    std::fs::create_dir(&base).unwrap();
+    let roots: Vec<_> = (0..400)
+        .map(|i| {
+            let p = base.join(format!("{i:03}-{}", "r".repeat(180)));
+            std::fs::create_dir(&p).unwrap();
+            p
+        })
+        .collect();
+    let scope = PathScope::new(roots.clone()).with_design_folder(&roots[0]);
+    assert_eq!(scope.roots().len(), 400);
+    assert_eq!(scope.design_roots().len(), 1);
+    let root_json = json!(scope.roots().iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>());
+    assert!(root_json.to_string().len() > 64 * 1024);
+    let mut failures = Vec::new();
+    // MAX_LINE counts the JSON text; the existing transport appends one LF after that text.
+    for (target, blocked, level, steps) in [
+        (0, false, ParamCheck::Strict, 1),
+        (0, false, ParamCheck::Strict, 10_000),
+        (solidcraft_engine::MAX_LINE - 1, false, ParamCheck::Off, 1),
+        (solidcraft_engine::MAX_LINE, false, ParamCheck::Off, 1),
+        (solidcraft_engine::MAX_LINE + 1, true, ParamCheck::Off, 1),
+        (solidcraft_engine::MAX_LINE + 16 * 1024, true, ParamCheck::Warn, 1),
+    ] {
+        let mut h = Headless::default();
+        let stamp = guarded_headless_stamp(&mut h);
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let cp = checkpoints.clone();
+        h.session.set_command_check(Some(Arc::new(move |id, _, _| {
+            if id == "edit.checkpoint" {
+                cp.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+        let token = "fixture\"\\\n\ttoken";
+        let mut args = json!({"commands":[{"command":"parameters.change","params":{"name":"width","expression":"10 mm","padding":""}}],"expectedDocument":stamp});
+        if target == 0 {
+            args["commands"] = json!(vec![json!({"command":"parameters.list"}); steps]);
+        }
+        let expected_envelope = |args: &Value| {
+            let mut params = args.clone();
+            params["param_check"] = json!(level.name());
+            params["allow_paths"] = root_json.clone();
+            params["design_folders"] = json!(scope.design_roots().iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>());
+            json!({"id":u64::MAX-1,"method":"engine.batch","params":params,"token":token})
+        };
+        let overhead = expected_envelope(&args).to_string().len();
+        if target > 0 {
+            args["commands"][0]["params"]["padding"] = json!("x".repeat(target - overhead));
+        }
+        let line_len = expected_envelope(&args).to_string().len();
+        assert_eq!(line_len, if target == 0 { overhead } else { target });
+        assert!(args.to_string().len() + 64 * 1024 <= solidcraft_engine::MAX_LINE, "exercise beyond the old margin, not the early refusal");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (done_tx, done_rx) = channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut cap = String::new();
+            reader.read_line(&mut cap).unwrap();
+            let cap: Value = serde_json::from_str(&cap).unwrap();
+            assert_eq!(cap["method"], "control.capabilities");
+            assert_eq!(cap["id"], u64::MAX - 2);
+            let mut reply = guard_capabilities();
+            reply["id"] = cap["id"].clone();
+            writeln!(stream, "{reply}").unwrap();
+            let mut buf = [0; 8192];
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 || blocked {
+                // Report the first bytes even if no full JSON line ever arrived. Closing is
+                // also the deterministic unblock for the old implementation's partial write.
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                done_tx.send((n, 0, checkpoints.load(Ordering::SeqCst), Value::Null)).unwrap();
+                return;
+            }
+            let mut bytes = buf[..n].to_vec();
+            if !bytes.ends_with(b"\n") {
+                reader.read_until(b'\n', &mut bytes).unwrap();
+            }
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            let request: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            assert_eq!(request["method"], "engine.batch");
+            assert_eq!(request["id"], u64::MAX - 1);
+            assert_eq!(request["token"], token);
+            assert_eq!(request["params"]["param_check"], level.name());
+            let result = h.call_guarded("engine.batch", request["params"].clone()).unwrap();
+            assert!(result.result.get("failed").is_none(), "{}", result.result);
+            if request["params"]["commands"][0]["command"] == "parameters.change" {
+                assert_eq!(h.session.doc.param("width").unwrap().expr, "10 mm");
+            }
+            let reply = json!({"ok":true,"result":result.result,"documentStamp":{"documentId":result.document_stamp.document_id,"revision":result.document_stamp.revision.to_string()},"param_check":level.name()});
+            writeln!(stream, "{reply}").unwrap();
+            done_tx.send((bytes.len(), 1, checkpoints.load(Ordering::SeqCst), request)).unwrap();
+        });
+        let mut remote = crate::Remote::new(&addr, Some(token)).with_param_check(level);
+        remote.set_next_id(u64::MAX - 2);
+        let result = vfs::scoped(Some(scope.clone()), || crate::call_tool(&mut remote, "batch", &args));
+        // NotSent must not publish Outstanding or latch unknown. This query is local and must
+        // not manufacture another original batch or consume a different request.
+        let pending = remote.call("control.pending", json!({})).unwrap();
+        drop(remote);
+        let (bytes, batches, cp, request) = done_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        peer.join().unwrap();
+        println!(
+            "WIRE_BUDGET_R1 {}",
+            json!({"line_bytes":line_len,"params_bytes":args.to_string().len(),"scope_roots_bytes":root_json.to_string().len(),"steps":steps,
+            "raw_batch_bytes":bytes,"native_batches":batches,"checkpoints":cp,"not_sent":result["structuredContent"]["notSent"]==true})
+        );
+        if blocked {
+            if result["structuredContent"]["notSent"] != true || bytes != 0 || batches != 0 || cp != 0 || pending != json!({"pending":null}) {
+                failures.push(format!("target={target}: bytes={bytes}, batches={batches}, checkpoints={cp}, pending={pending}, result={result}"));
+            }
+        } else {
+            assert_ne!(result["isError"], true, "{result}");
+            assert_eq!(bytes, line_len + 1);
+            assert_eq!(batches, 1);
+            assert_eq!(cp, 1);
+            assert_eq!(request["params"]["allow_paths"], root_json);
+            assert_eq!(request["params"]["design_folders"], expected_envelope(&args)["params"]["design_folders"]);
+        }
+    }
+    for p in roots {
+        std::fs::remove_dir(p).unwrap();
+    }
+    std::fs::remove_dir(base).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn guarded_mcp_published_revision_schema_contract() {
+    let defs = tool_definitions();
+    let schemas: Value = ["execute", "batch"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                defs.iter().find(|d| d["name"] == name).unwrap()["inputSchema"]["properties"]["expectedDocument"]["properties"]["revision"].clone(),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    // The adjunct evaluates these actual published schemas, not the runtime stamp parser.
+    println!("REVISION_SCHEMA_R1 {schemas}");
+    let expected_pattern = concat!(
+        "^(?:0|[1-9][0-9]{0,18}|",
+        "1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|",
+        "18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|",
+        "184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|",
+        "1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|",
+        "18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|",
+        "1844674407370955161[0-5])(?![\\s\\S])"
+    );
+    for name in ["execute", "batch"] {
+        assert_eq!(schemas[name]["type"], "string");
+        assert_eq!(schemas[name]["maxLength"], 20);
+        assert_eq!(schemas[name]["pattern"], expected_pattern, "published string range contract");
+    }
+}
+
+#[test]
+fn guarded_mcp_published_document_id_schema_contract() {
+    let defs = tool_definitions();
+    let schemas: Value = ["execute", "batch"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                defs.iter().find(|d| d["name"] == name).unwrap()["inputSchema"]["properties"]["expectedDocument"]["properties"]["documentId"].clone(),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    println!("DOCUMENT_ID_SCHEMA_WAVE {schemas}");
+    let cases = [
+        (json!("a"), true),
+        (json!("0"), true),
+        (json!("A0._:-z"), true),
+        (json!("x".repeat(128)), true),
+        (json!("x".repeat(129)), false),
+        (json!(""), false),
+        (json!("_bad"), false),
+        (json!("-bad"), false),
+        (json!("a/b"), false),
+        (json!("中文"), false),
+        (json!("é"), false),
+        (json!("a\n"), false),
+        (json!("a\r"), false),
+        (json!("a\r\n"), false),
+        (json!("a\nb"), false),
+        (json!(null), false),
+        (json!(7), false),
+        (json!(true), false),
+        (json!([]), false),
+        (json!({}), false),
+    ];
+    let mut outcomes = Vec::new();
+    for (id, expected) in cases {
+        let accepted = crate::document_guard::parse_expected_document(&json!({"expectedDocument":{"documentId":id,"revision":"0"}})).is_ok();
+        assert_eq!(accepted, expected, "{id}");
+        outcomes.push(json!({"value":id,"accepted":accepted}));
+    }
+    println!("DOCUMENT_ID_MCP_WAVE {}", json!(outcomes));
+}
+
+// Missing validation would send a mutation, parse expect, or allocate a checkpoint before refusal.
+#[test]
+fn guarded_mcp_schema_and_direct_tool_validate_before_effects() {
+    let defs = tool_definitions();
+    for name in ["execute", "batch"] {
+        let schema = &defs.iter().find(|d| d["name"] == name).unwrap()["inputSchema"];
+        let stamp = &schema["properties"]["expectedDocument"];
+        assert_eq!(stamp["type"], "object");
+        assert_eq!(stamp["additionalProperties"], false);
+        assert_eq!(stamp["required"], json!(["documentId", "revision"]));
+        assert_eq!(stamp["properties"]["revision"]["type"], "string");
+        assert!(!schema["required"].as_array().unwrap().contains(&json!("expectedDocument")));
+    }
+    let mut bad = vec![Value::Null, json!(7), json!({}), json!({"documentId":"doc-A","revision":"0","extra":0})];
+    for revision in [json!(0), json!(null), json!("01"), json!("18446744073709551616"), json!("-1"), json!("1e3"), json!(" 1")] {
+        bad.push(json!({"documentId":"doc-A","revision":revision}));
+    }
+    for id in ["", "_bad", "x/y", "中文"] {
+        bad.push(json!({"documentId":id,"revision":"0"}));
+    }
+    bad.push(json!({"documentId":"x".repeat(129),"revision":"0"}));
+    for name in ["execute", "batch"] {
+        for expected in &bad {
+            let mut b = GuardToolBackend::default();
+            let mut args = if name == "execute" { json!({"command":"parameters.list"}) } else { json!({"commands":[{"command":"parameters.list"}]}) };
+            args["expectedDocument"] = expected.clone();
+            args["expect"] = json!({"bogus":true});
+            let reply = crate::call_tool(&mut b, name, &args);
+            assert_eq!(reply["isError"], true, "{args}: {reply}");
+            assert_eq!(reply["structuredContent"]["error"]["code"], "INVALID_REQUEST", "guard must precede expect: {reply}");
+            assert!(b.calls.is_empty());
+            let count = b.count.clone();
+            let mut s = Server::new(Box::new(b));
+            assert_eq!(raw_tool(&mut s, name, args)["error"]["code"], -32602);
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+    for step in [
+        json!({"command":"parameters.list","expectedDocument":null}),
+        json!({"command":"parameters.list","params":{"expectedDocument":null}}),
+        json!({"command":"execute","params":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"0"}}}),
+        json!({"command":"execute","params":{"command":"engine.batch","params":{"commands":[{"command":"parameters.list","expectedDocument":null}]}}}),
+    ] {
+        for guarded in [false, true] {
+            let mut b = GuardToolBackend::default();
+            let mut args = json!({"commands":[{"command":"parameters.list"},step]});
+            if guarded {
+                args["expectedDocument"] = guarded_headless_stamp(&mut b.headless);
+            }
+            let reply = crate::call_tool(&mut b, "batch", &args);
+            assert_eq!(reply["structuredContent"]["error"]["code"], "INVALID_REQUEST", "{reply}");
+            assert!(b.calls.is_empty());
+            let count = b.count.clone();
+            assert_eq!(raw_tool(&mut Server::new(Box::new(b)), "batch", args)["error"]["code"], -32602);
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+    let mut b = GuardToolBackend::default();
+    let base = guarded_headless_stamp(&mut b.headless);
+    let reply = crate::call_tool(&mut b, "execute", &json!({"command":null,"id":"PaRaMeTeRs.LiSt","expectedDocument":base}));
+    assert_ne!(reply["isError"], true, "{reply}");
+    assert_eq!(b.calls[0].2["command"], Value::Null);
+    assert_eq!(b.calls[0].2["id"], "PaRaMeTeRs.LiSt");
+    let reply = crate::call_tool(&mut b, "batch", &json!({"commands":[{"command":null,"id":"file.new"}],"expectedDocument":base}));
+    let body = guarded_tool_body(&reply);
+    assert_eq!(body["completed"], 0);
+    assert!(body.get("failed").is_some());
+    assert_eq!(body["failed"]["command"], Value::Null);
+    assert_eq!(b.calls.len(), 2);
+    assert!(b.calls[1].0);
+    assert_eq!(b.calls[1].1, "engine.batch");
+    assert_eq!(b.calls[1].2["commands"], json!([{"command":null,"id":"file.new"}]));
+}
+
+// A primitive must not lose its identity or its real stamp; compact only touches native results.
+#[test]
+fn guarded_mcp_wrapper_keeps_native_json_and_compact_metadata() {
+    use solidcraft_engine::schema::ParamCheck;
+    let stamp = json!({"documentId":"doc-A","revision":"9007199254740994"});
+    for native in [json!({"value":7}), json!([1, "x"]), json!("text"), json!(42), Value::Null] {
+        for verbose in [true, false] {
+            let payload = native.clone();
+            let peer = GuardPeer::new(move |_, req| {
+                GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+                    guard_capabilities()
+                } else {
+                    json!({"ok":true,"result":payload,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}})
+                })
+            });
+            let mut b = peer.remote(ParamCheck::Off);
+            let mut args = guard_request("engine.execute");
+            args["verbose"] = json!(verbose);
+            let reply = crate::call_tool(&mut b, "execute", &args);
+            assert_ne!(reply["isError"], true, "{reply}");
+            assert_eq!(guarded_tool_body(&reply), json!({"result":native,"documentStamp":stamp}));
+            let wire = peer.finish(b);
+            assert_eq!(wire.iter().filter(|(_, r)| r["method"] == "engine.execute").count(), 1);
+        }
+    }
+    let peer = GuardPeer::new(|_, req| {
+        GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+            guard_capabilities()
+        } else {
+            json!({"ok":true,"result":{"created_bodies":["new"],"bodies":["old","new"],"changed_bodies":["old"],"removed_bodies":[],"error":{"facts":"keep"}},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}})
+        })
+    });
+    let mut remote = peer.remote(ParamCheck::Off);
+    let mut args = guard_request("engine.execute");
+    args["verbose"] = json!(false);
+    let body = guarded_tool_body(&crate::call_tool(&mut remote, "execute", &args));
+    assert_eq!(
+        body,
+        json!({"result":{"created_bodies":["new"],"changed_bodies":["old"],"removed_bodies":[],"error":{"facts":"keep"}},"documentStamp":stamp})
+    );
+    assert_eq!(peer.finish(remote).len(), 2);
+    let mut b = GuardToolBackend::default();
+    let base = guarded_headless_stamp(&mut b.headless);
+    let reply = crate::call_tool(&mut b, "batch", &json!({"expectedDocument":base,"commands":[{"command":"parameters.list"}],"verbose":false}));
+    let body = guarded_tool_body(&reply);
+    assert_eq!(body["completed"], 1);
+    assert_eq!(body["documentStamp"], base);
+    assert_eq!(b.calls.len(), 1);
+    assert!(b.calls[0].0);
+    b.calls.clear();
+    let legacy = crate::call_tool(&mut b, "execute", &json!({"command":"parameters.list"}));
+    let legacy: Value = serde_json::from_str(legacy["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(legacy.get("documentStamp").is_none());
+    assert!(legacy.get("result").is_none());
+    assert_eq!(b.calls.len(), 1);
+    assert!(!b.calls[0].0);
+    let base = guarded_headless_stamp(&mut b.headless);
+    b.calls.clear();
+    let reply = crate::call_tool(
+        &mut b,
+        "batch",
+        &json!({"expectedDocument":base,"commands":[
+        {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}],"expect":{"bodies":0}}),
+    );
+    let body = guarded_tool_body(&reply);
+    assert_ne!(reply["isError"], true);
+    assert_eq!(body["expectation"]["ok"], true);
+    assert_eq!(body["completed"], 1);
+    assert_eq!(b.calls.len(), 2);
+    assert!(b.calls.iter().all(|(guarded, _, _)| *guarded));
+    assert_eq!(b.calls[1].2["command"], "inspect.measure");
+    assert_eq!(b.calls[1].2["expectedDocument"], body["documentStamp"]);
+}
+
+// Transport refusals cannot authorize a second send, single steps, or Undo::begin.
+#[test]
+fn guarded_mcp_batch_unavailable_or_oversized_never_falls_back() {
+    use solidcraft_engine::schema::ParamCheck;
+    for message in ["unknown method `engine.batch`", "engine.batch unavailable", "busy: not run"] {
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(if req["method"] == "control.capabilities" { guard_capabilities() } else { json!({"ok":false,"error":message}) })
+        });
+        let mut b = peer.remote(ParamCheck::Off);
+        let r = crate::call_tool(&mut b, "batch", &guard_request("engine.batch"));
+        assert_eq!(r["isError"], true);
+        assert_eq!(r["structuredContent"]["error"], message);
+        let wire = peer.finish(b);
+        assert_eq!(wire.iter().map(|(_, r)| r["method"].as_str().unwrap()).collect::<Vec<_>>(), ["control.capabilities", "engine.batch"]);
+    }
+    let mut b = GuardToolBackend::default();
+    let base = guarded_headless_stamp(&mut b.headless);
+    for commands in [
+        json!([{"command":"parameters.list"},{"command":"file.new"}]),
+        json!([{"command":"parameters.list","params":{"padding":"x".repeat(solidcraft_engine::MAX_LINE)}}]),
+        json!(vec![json!({"command":"parameters.list"}); 10_001]),
+    ] {
+        let r = crate::call_tool(&mut b, "batch", &json!({"expectedDocument":base,"commands":commands}));
+        assert_eq!(r["isError"], true);
+        assert!(b.calls.is_empty(), "no backend/checkpoint calls");
+    }
+    let mut legacy = LayoutFallbackBackend::new();
+    let r = crate::call_tool(&mut legacy, "batch", &guard_request("engine.batch"));
+    assert_eq!(r["structuredContent"]["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert!(legacy.calls.is_empty());
+}
+
+// Raw stale and actual checkpoint/restore failures must survive pending and compact unchanged.
+#[test]
+fn guarded_mcp_pending_and_expectation_preserve_effect_facts() {
+    use solidcraft_engine::schema::ParamCheck;
+    let stale = json!({"code":"STALE_DOCUMENT","message":"stale","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}});
+    for (method, original) in [
+        ("engine.execute", json!({"ok":false,"error":"stale","errorDetails":stale})),
+        ("engine.execute", json!({"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}})),
+        (
+            "engine.execute",
+            json!({"ok":true,"result":{"completed":1,"results":[null],"undone":0},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}),
+        ),
+        (
+            "engine.batch",
+            json!({"ok":true,"result":{"completed":0,"results":[],"undone":0,"rolled_back":false,"not_run":[0,1,2],"failed":{"index":null,"command":"edit.checkpoint","stage":"checkpoint","error":"blocked"}},"documentStamp":{"documentId":"doc-A","revision":"9007199254740993"}}),
+        ),
+        (
+            "engine.batch",
+            json!({"ok":true,"result":{"completed":1,"results":[{"value":20}],"undone":1,"rolled_back":true,"not_run":[2],"failed":{"index":1,"command":"parameters.change","error":"bad"}},"documentStamp":{"documentId":"doc-A","revision":"9007199254740995"}}),
+        ),
+        (
+            "engine.batch",
+            json!({"ok":true,"result":{"completed":1,"results":[{"value":20}],"undone":0,"rolled_back":false,"not_run":[2],"failed":{"index":1,"command":"parameters.change","error":"restore also failed"}},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}),
+        ),
+        (
+            "engine.batch",
+            json!({"ok":true,"result":{"completed":1,"results":[{"value":20}],"undone":0,"rolled_back":false,"failed":{"index":1,"command":"parameters.change","error":"bad"}},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}),
+        ),
+    ] {
+        for deferred in [false, true] {
+            let response = original.clone();
+            let mut polls = 0;
+            let peer = GuardPeer::new(move |_, req| {
+                GuardAnswer::Reply(match req["method"].as_str() {
+                    Some("control.capabilities") => guard_capabilities(),
+                    Some("control.pending") => {
+                        polls += 1;
+                        if polls == 1 {
+                            json!({"ok":true,"result":{"pending":1,"done":false}})
+                        } else {
+                            json!({"ok":true,"result":{"pending":1,"done":true,"reply":response}})
+                        }
+                    }
+                    _ if deferred => running(),
+                    _ => response.clone(),
+                })
+            });
+            let mut b = peer.remote(ParamCheck::Off);
+            let mut args = guard_request(method);
+            args["verbose"] = json!(false);
+            if method == "engine.batch" {
+                args["commands"] = json!([{"command":"parameters.list"},{"command":"parameters.list"},{"command":"parameters.list"}]);
+            }
+            let initial = crate::call_tool(&mut b, if method == "engine.batch" { "batch" } else { "execute" }, &args);
+            let result = if deferred {
+                assert_eq!(initial["isError"], true);
+                crate::call_tool(&mut b, "pending", &json!({}))
+            } else {
+                initial
+            };
+            let body = guarded_tool_body(&result);
+            let body = if deferred { &body["result"] } else { &body };
+            if original["ok"] == false {
+                assert_eq!(result["isError"], true);
+                assert_eq!(body["error"], stale);
+            } else {
+                assert_eq!(body["documentStamp"], original["documentStamp"]);
+                if method == "engine.execute" {
+                    assert_eq!(body["result"], original["result"], "execute stays wrapped even when its native object resembles a batch");
+                } else {
+                    for k in ["completed", "results", "rolled_back", "undone", "not_run", "failed"] {
+                        if k == "not_run" && original["result"].get(k).is_none() {
+                            assert_eq!(body[k], json!([2]), "use the original three steps, not the one returned result");
+                        } else {
+                            assert_eq!(body[k], original["result"][k], "{k}: {body}");
+                        }
+                    }
+                    assert_eq!(result["isError"], true);
+                }
+            }
+            let wire = peer.finish(b);
+            assert_eq!(wire.iter().filter(|(_, r)| r["method"] == method).count(), 1);
+            assert!(wire.iter().all(|(_, r)| r["method"] != "engine.execute" || method == "engine.execute"));
+        }
+    }
+    let mut b = GuardToolBackend::default();
+    b.headless.session.execute("parameters.change", &json!({"name":"width","expression":"10 mm"})).unwrap();
+    let base = guarded_headless_stamp(&mut b.headless);
+    let doc = b.headless.session.doc.clone();
+    let undo = b.headless.session.undo.len();
+    let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = trace.clone();
+    b.headless.session.set_command_check(Some(std::sync::Arc::new(move |id, _, _| {
+        seen.lock().unwrap().push(id.to_string());
+        if id == "edit.checkpoint" { Err("checkpoint blocked".into()) } else { Ok(()) }
+    })));
+    let r = crate::call_tool(
+        &mut b,
+        "batch",
+        &json!({"expectedDocument":base,"verbose":false,"expect":{"bodies":0},"commands":[
+        {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},
+        {"command":"parameters.list"}]}),
+    );
+    let body = guarded_tool_body(&r);
+    assert_eq!(r["isError"], true);
+    assert_eq!(body["failed"]["index"], Value::Null);
+    assert_eq!(body["failed"]["stage"], "checkpoint");
+    assert_eq!(body["completed"], 0);
+    assert_eq!(body["not_run"], json!([0, 1]));
+    assert_eq!(body["rolled_back"], false);
+    assert_eq!(body["undone"], 0);
+    assert_eq!(body["documentStamp"], base);
+    assert!(body.get("expectation").is_none());
+    assert!(std::sync::Arc::ptr_eq(&doc, &b.headless.session.doc));
+    assert_eq!(b.headless.session.undo.len(), undo);
+    assert_eq!(*trace.lock().unwrap(), ["edit.checkpoint"]);
+    assert_eq!(b.calls.len(), 1);
+    assert!(b.calls[0].0);
+}
+
+// Changing the source before measurement must not certify another state or erase the write.
+#[test]
+fn guarded_expectation_uses_applied_stamp_and_never_certifies_other_state() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    use std::sync::{Arc, Mutex, mpsc::channel};
+    for (race, expected_bodies, expected_ok) in [(false, 0, true), (false, 1, false), (true, 0, false)] {
+        let mut headless = Headless::default();
+        let base = guarded_headless_stamp(&mut headless);
+        let state = Arc::new(Mutex::new(headless));
+        let owner = state.clone();
+        let (written_tx, written_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let peer = GuardPeer::new(move |_, req| {
+            if req["method"] == "control.capabilities" {
+                return GuardAnswer::Reply(guard_capabilities());
+            }
+            let is_read = req["params"]["command"] == "inspect.measure";
+            if is_read {
+                written_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            // Let the legacy route really execute too: RED must show the missing guarded
+            // measurement/stamp, not a peer panic or a barrier timeout.
+            if req["params"].get("expectedDocument").is_none() {
+                let reply = owner.lock().unwrap().call("engine.execute", req["params"].clone());
+                return GuardAnswer::Reply(match reply {
+                    Ok(result) => json!({"ok":true,"result":result}),
+                    Err(error) => json!({"ok":false,"error":error}),
+                });
+            }
+            let reply = owner.lock().unwrap().call_guarded("engine.execute", req["params"].clone());
+            GuardAnswer::Reply(match reply {
+                Ok(r) => {
+                    json!({"ok":true,"result":r.result,"documentStamp":{"documentId":r.document_stamp.document_id,"revision":r.document_stamp.revision.to_string()}})
+                }
+                Err(crate::GuardedCallError::Rejected { message, error_details }) => json!({"ok":false,"error":message,"errorDetails":error_details}),
+                other => panic!("{other:?}"),
+            })
+        });
+        let b = peer.remote(ParamCheck::Off);
+        let worker = std::thread::spawn(move || {
+            let mut b = b;
+            let r = crate::call_tool(
+                &mut b,
+                "execute",
+                &json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":base,"expect":{"bodies":expected_bodies}}),
+            );
+            (b, r)
+        });
+        written_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let applied = guarded_headless_stamp(&mut state.lock().unwrap());
+        if race {
+            state.lock().unwrap().session.execute("parameters.change", &json!({"name":"width","expression":"30 mm"})).unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let (b, r) = worker.join().unwrap();
+        let wire = peer.finish(b);
+        assert_eq!(wire.len(), 3);
+        assert_eq!(wire[2].1["params"]["expectedDocument"], applied, "measurement must be guarded by the actual write stamp");
+        let body = guarded_tool_body(&r);
+        assert_eq!(r["isError"] == true, !expected_ok, "{r}");
+        assert_eq!(body["documentStamp"], applied);
+        assert_eq!(body["result"]["value"], 20.0);
+        assert_eq!(body["expectation"]["ok"], expected_ok);
+        assert!(body.get("error").is_none());
+        if race {
+            assert_eq!(body["expectation"]["error"]["code"], "STALE_DOCUMENT");
+            assert_eq!(state.lock().unwrap().session.doc.param("width").unwrap().expr, "30 mm");
+        } else {
+            assert_eq!(state.lock().unwrap().session.doc.param("width").unwrap().expr, "20 mm");
+        }
+    }
+    // A protocol peer returning a different read stamp cannot certify even matching numbers.
+    let peer = GuardPeer::new(|_, req| {
+        GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+            guard_capabilities()
+        } else if req["params"]["command"] == "inspect.measure" {
+            json!({"ok":true,"result":{"body_count":0,"bodies":[],"total":{"volume_mm3":0}},"documentStamp":{"documentId":"doc-A","revision":"9007199254740995"}})
+        } else {
+            json!({"ok":true,"result":{"value":20},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}})
+        })
+    });
+    let mut b = peer.remote(ParamCheck::Off);
+    let mut args = guard_request("engine.execute");
+    args["expect"] = json!({"bodies":0});
+    let r = crate::call_tool(&mut b, "execute", &args);
+    let body = guarded_tool_body(&r);
+    assert_eq!(r["isError"], true);
+    assert_eq!(body["result"]["value"], 20);
+    assert_eq!(body["documentStamp"]["revision"], "9007199254740994");
+    assert_eq!(body["expectation"]["ok"], false);
+    assert_eq!(body["expectation"]["verified"], false);
+    assert!(body["expectation"].get("measured").is_none());
+    assert_eq!(peer.finish(b).len(), 3);
+    // A delayed write is returned as written, never measured against whatever is current later.
+    let mut polls = 0;
+    let peer = GuardPeer::new(move |_, req| {
+        GuardAnswer::Reply(match req["method"].as_str() {
+            Some("control.capabilities") => guard_capabilities(),
+            Some("control.pending") => {
+                polls += 1;
+                if polls == 1 {
+                    json!({"ok":true,"result":{"pending":1,"done":false}})
+                } else {
+                    json!({"ok":true,"result":{"pending":1,"done":true,"reply":{"ok":true,"result":5,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}}})
+                }
+            }
+            _ => running(),
+        })
+    });
+    let mut b = peer.remote(ParamCheck::Off);
+    let mut args = guard_request("engine.execute");
+    args["expect"] = json!({"bodies":0});
+    let initial = crate::call_tool(&mut b, "execute", &args);
+    assert_eq!(initial["isError"], true);
+    let initial = guarded_tool_body(&initial);
+    assert_eq!(initial["expectation"], Value::Null);
+    assert!(initial["note"].as_str().unwrap().contains("not executed"));
+    let r = crate::call_tool(&mut b, "pending", &json!({}));
+    let body = guarded_tool_body(&r);
+    assert_eq!(body["result"]["result"], 5);
+    assert_eq!(body["expectation"], Value::Null);
+    assert!(body["note"].as_str().unwrap().contains("not executed"));
+    let wire = peer.finish(b);
+    assert_eq!(wire.iter().filter(|(_, r)| r["method"] == "engine.execute").count(), 1);
+}
+
+// Catches legacy fallback, per-step stale checks and invented result stamps: all writes run
+// through the real Headless Backend entry and real Session commands, without a protocol peer.
+#[test]
+fn guarded_headless_uses_same_native_core_without_fallback() {
+    use crate::Backend;
+    let mut h = Headless::default();
+    h.session.execute("parameters.add", &json!({"name":"width","expression":"10 mm"})).unwrap();
+    let base = guarded_headless_stamp(&mut h);
+    let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = trace.clone();
+    h.session.set_command_check(Some(std::sync::Arc::new(move |id, p, _| {
+        observed.lock().unwrap().push((id.to_string(), p.clone()));
+        Ok(())
+    })));
+    let reply = h
+        .call_guarded(
+            "engine.execute",
+            json!({"command":null,"id":"PARAMETERS.CHANGE","params":{"name":"width","expression":"20 mm"},"expectedDocument":base}),
+        )
+        .unwrap();
+    assert_eq!(reply.result["value"], 20.0);
+    assert_eq!(reply.document_stamp, h.session.document_stamp());
+    assert_ne!(guarded_headless_stamp(&mut h), base);
+    let current = guarded_headless_stamp(&mut h);
+    trace.lock().unwrap().clear();
+    let stale = h.call_guarded("engine.batch", json!({"commands":[{"command":"parameters.list"}],"expectedDocument":base})).unwrap_err();
+    let crate::GuardedCallError::Rejected { error_details, .. } = stale else { panic!("not a stale refusal: {stale:?}") };
+    assert_eq!(error_details["code"], "STALE_DOCUMENT");
+    assert_eq!(error_details["retry"], "never");
+    assert_eq!(error_details["details"], json!({"expected":base,"current":current}));
+    assert!(trace.lock().unwrap().is_empty());
+    let steps = vec![
+        json!({"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}),
+        json!({"command":"parameters.change","params":{"name":"width","expression":"40 mm"}}),
+    ];
+    let mut native = h.session.scratch();
+    let native_stamp = native.document_stamp();
+    let expected = native.batch_if_current(&steps, &json!({}), &native_stamp).unwrap().0;
+    let reply = h.call_guarded("engine.batch", json!({"commands":steps,"expectedDocument":current})).unwrap();
+    assert_eq!(reply.result, expected);
+    assert_eq!(reply.result["completed"], 2);
+    assert_eq!(reply.document_stamp, h.session.document_stamp());
+    assert_eq!(h.session.doc.param("width").unwrap().expr, "40 mm");
+    let trace = trace.lock().unwrap();
+    // scratch() carries the host check too: first native, then Headless, each one checkpoint.
+    assert_eq!(trace.iter().filter(|(id, _)| id == "edit.checkpoint").count(), 2);
+    assert_eq!(trace.iter().filter(|(id, _)| id == "parameters.change").count(), 4);
+    assert_eq!(trace.last().unwrap(), &("edit.restore_checkpoint".into(), json!({"checkpoint":1,"forget":true})));
+}
+
+#[test]
+fn guarded_headless_refuses_all_unsupported_steps_before_history_and_restores_param_check() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    let mut h = Headless::default();
+    h.session.param_check = ParamCheck::Warn;
+    let base = guarded_headless_stamp(&mut h);
+    let doc = h.session.doc.clone();
+    let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = trace.clone();
+    h.session.set_command_check(Some(std::sync::Arc::new(move |id, _, _| {
+        observed.lock().unwrap().push(id.to_string());
+        Ok(())
+    })));
+    for last in [
+        json!({"command":"DOC.OPEN","params":{"path":"never-opened.sc"}}),
+        json!({"command":"panel.list"}),
+        json!({"command":"parameters.change","params":{"name":"width","expression":"20","path":"forbidden"}}),
+    ] {
+        let request = json!({"expectedDocument":base,"param_check":"strict","commands":[
+            {"command":"parameters.add","params":{"name":"width","expression":"10 mm"}},last]});
+        assert!(
+            matches!(h.call_guarded("engine.batch",request),Err(crate::GuardedCallError::Rejected{error_details,..}) if error_details["code"]=="UNSUPPORTED_CAPABILITY")
+        );
+        assert!(trace.lock().unwrap().is_empty());
+        assert!(std::sync::Arc::ptr_eq(&doc, &h.session.doc));
+        assert_eq!(h.session.undo.len(), 0);
+        assert_eq!(h.session.param_check, ParamCheck::Warn);
+    }
+    for method in ["engine.execute", "engine.batch"] {
+        let step = json!({"command":"solid.box","params":{"lenght":10,"width":10,"height":10}});
+        let mut request = if method == "engine.execute" { step.clone() } else { json!({"commands":[{"command":"parameters.list"},step]}) };
+        request["expectedDocument"] = base.clone();
+        request["param_check"] = json!("strict");
+        match h.call_guarded(method, request) {
+            Err(crate::GuardedCallError::CommandFailed(message)) if method == "engine.execute" => assert!(message.contains("lenght")),
+            Ok(reply) if method == "engine.batch" => {
+                assert_eq!(reply.result["completed"], 0);
+                assert_eq!(reply.result["failed"]["index"], 1);
+                assert_eq!(reply.result["not_run"], json!([0, 1]));
+            }
+            other => panic!("{method}: {other:?}"),
+        }
+        assert_eq!(h.session.param_check, ParamCheck::Warn);
+        assert!(std::sync::Arc::ptr_eq(&doc, &h.session.doc));
+    }
+    trace.lock().unwrap().clear();
+    for (method, request) in [
+        ("engine.execute", json!({"command":"file.new","expectedDocument":base})),
+        ("engine.execute", json!({"command":"parameters.list","expectedDocument":null})),
+        ("engine.execute", json!({"command":"parameters.list","expectedDocument":base,"param_check":"loud"})),
+        ("engine.batch", json!({"commands":vec![json!({"command":"parameters.list"});10_001],"expectedDocument":base})),
+        ("engine.batch", json!({"commands":null,"expectedDocument":base})),
+    ] {
+        assert!(h.call_guarded(method, request).is_err());
+        assert_eq!(h.session.param_check, ParamCheck::Warn);
+        assert!(trace.lock().unwrap().is_empty());
+    }
+    // Batch keeps first-Value semantics; execute's string fallback above must not leak here.
+    let reply = h.call_guarded("engine.batch", json!({"expectedDocument":base,"commands":[{"command":null,"id":"parameters.list"}]})).unwrap();
+    assert_eq!(reply.result["completed"], 0);
+    assert_eq!(reply.result["failed"]["command"], Value::Null);
+    assert!(trace.lock().unwrap().is_empty());
+    assert_eq!(h.session.execute("edit.checkpoint", &json!({})).unwrap()["checkpoint"], 1, "all refusals consumed zero checkpoint ids");
+}
+
+#[test]
+fn guarded_headless_checkpoint_policy_and_native_failure_bodies() {
+    use crate::Backend;
+    for rollback in [None, Some(true), Some(false)] {
+        let mut h = Headless::default();
+        h.session.execute("parameters.add", &json!({"name":"width","expression":"10 mm"})).unwrap();
+        let base = guarded_headless_stamp(&mut h);
+        let doc = h.session.doc.clone();
+        let undo = h.session.undo.len();
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = trace.clone();
+        h.session.set_command_check(Some(std::sync::Arc::new(move |id, _, _| {
+            observed.lock().unwrap().push(id.to_string());
+            if id == "edit.checkpoint" { Err("checkpoint refused".into()) } else { Ok(()) }
+        })));
+        let mut request = json!({"expectedDocument":base,"coalesce_parameters":true,"commands":[
+            {"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},
+            {"command":"parameters.change","params":{"name":"width","expression":"1 +"}}]});
+        if let Some(rollback) = rollback {
+            request["rollback"] = json!(rollback);
+        }
+        let reply = h.call_guarded("engine.batch", request).unwrap();
+        assert_eq!(reply.result["rolled_back"], false);
+        assert_eq!(reply.result["undone"], 0);
+        if rollback != Some(false) {
+            assert_eq!(reply.result["completed"], 0);
+            assert_eq!(reply.result["not_run"], json!([0, 1]));
+            assert_eq!(reply.result["failed"]["stage"], "checkpoint");
+            assert_eq!(*trace.lock().unwrap(), ["edit.checkpoint"]);
+            assert!(std::sync::Arc::ptr_eq(&doc, &h.session.doc));
+            assert_eq!(h.session.undo.len(), undo);
+        } else {
+            assert_eq!(reply.result["completed"], 1);
+            assert_eq!(h.session.doc.param("width").unwrap().expr, "20 mm");
+            assert!(trace.lock().unwrap().iter().all(|id| id != "edit.checkpoint"));
+        }
+        assert_eq!(reply.document_stamp, h.session.document_stamp());
+    }
+}
+
 fn server() -> Server {
     Server::new(Box::new(Headless::default()))
 }
@@ -3030,6 +4004,948 @@ fn remote_engine_batch_is_not_resent_after_a_lost_reply() {
         if !close_first {
             assert_eq!(batches, 1);
         }
+    }
+}
+
+// Catches legacy entry points silently discarding outer guards, including the script route.
+#[test]
+fn guarded_backend_legacy_headless_refuses_before_execute() {
+    use crate::Backend;
+    let mut baseline = Headless::default();
+    baseline.call("engine.execute", json!({"command":"parameters.change","params":{"name":"width","value":"10 mm"}})).unwrap();
+    assert!(!baseline.session.undo.is_empty(), "the unguarded control really edits the document");
+    for method in ["engine.execute", "command", "engine.batch", "engine.script"] {
+        for expected in [Value::Null, json!({"documentId":"doc-A","revision":"0","extra":true})] {
+            let mut backend = Headless::default();
+            let before = backend.session.doc.clone();
+            let request = json!({"command":"parameters.change","params":{"name":"width","value":"10 mm"},
+                "commands":[{"command":"parameters.change","params":{"name":"width","value":"10 mm"}}],
+                "expectedDocument":expected});
+            let result = backend.call(method, request);
+            assert!(result.is_err_and(|e| e.contains("call_guarded")), "{method}: must refuse before executing");
+            assert!(std::sync::Arc::ptr_eq(&before, &backend.session.doc));
+            assert!(backend.session.undo.is_empty());
+        }
+    }
+}
+
+// These are the same inline wire bytes/cases as the frozen UI parser tests, pending #5's corpus.
+// Catches lossy revisions, null-as-absent and unknown stamp fields before a backend can run.
+#[test]
+fn guarded_mcp_native_conversion_roundtrips_and_rejects_bad_envelopes() {
+    use crate::document_guard::{parse_expected_document, stamp_json};
+    assert_eq!(parse_expected_document(&json!({})).unwrap(), None);
+    for (revision, number) in [("0", 0u64), ("9007199254740993", 9_007_199_254_740_993), ("18446744073709551615", u64::MAX)] {
+        for id in ["a".to_string(), "A0._:-z".to_string(), "x".repeat(128)] {
+            let bytes = json!({"expectedDocument":{"documentId":id,"revision":revision}}).to_string();
+            let envelope: Value = serde_json::from_slice(bytes.as_bytes()).unwrap();
+            let native = parse_expected_document(&envelope).unwrap().unwrap();
+            let actual_revision: u64 = native.revision;
+            assert_eq!(actual_revision, number);
+            assert_eq!(native.document_id, id);
+            assert_eq!(stamp_json(&native), json!({"documentId":id,"revision":revision}));
+        }
+    }
+    let id = "doc-A";
+    let mut invalid =
+        vec![Value::Null, json!({}), json!({"documentId":id}), json!({"revision":"0"}), json!({"documentId":id,"revision":"0","extra":true})];
+    for revision in
+        [json!(0), Value::Null, json!("01"), json!("-1"), json!("1e3"), json!("18446744073709551616"), json!(" 1"), json!("1 "), json!("")]
+    {
+        invalid.push(json!({"documentId":id,"revision":revision}));
+    }
+    for id in [json!(""), json!("-bad"), json!("a/b"), json!("é"), json!("x".repeat(129)), Value::Null, json!(1)] {
+        invalid.push(json!({"documentId":id,"revision":"0"}));
+    }
+    for expected in invalid {
+        let bytes = json!({"expectedDocument":expected}).to_string();
+        let envelope: Value = serde_json::from_slice(bytes.as_bytes()).unwrap();
+        assert!(
+            matches!(parse_expected_document(&envelope), Err(crate::GuardedCallError::Rejected { error_details, .. })
+            if error_details["code"] == "INVALID_REQUEST" && error_details["retry"] == "never"),
+            "{bytes}"
+        );
+    }
+}
+
+enum GuardAnswer {
+    Reply(Value),
+    Close,
+    ReplyAndClose(Value),
+}
+
+// Catches successful primitive/null payloads being rewritten, rejection metadata loss, and
+// a malformed/missing success stamp being mistaken for a definite command failure/success.
+#[test]
+fn guarded_mcp_native_reply_decode_preserves_results_and_refusals() {
+    use crate::backend::decode_guarded_reply;
+    for native in [json!({"x":1}), json!([1, 2]), json!("native"), json!(7), Value::Null] {
+        let reply = decode_guarded_reply(&json!({"ok":true,"result":native,
+            "documentStamp":{"documentId":"doc-A","revision":"18446744073709551615"}}))
+        .unwrap();
+        assert_eq!(reply.result, native);
+        assert_eq!(reply.document_stamp.revision, u64::MAX);
+    }
+    for stamp in [
+        Value::Null,
+        json!({"documentId":"doc-A","revision":1}),
+        json!({"documentId":"doc-A","revision":"01"}),
+        json!({"documentId":"doc-A","revision":"0","extra":true}),
+    ] {
+        assert!(matches!(
+            decode_guarded_reply(&json!({"ok":true,"result":null,"documentStamp":stamp})),
+            Err(crate::GuardedCallError::OutcomeUnknown(_))
+        ));
+    }
+    for reply in [json!({"ok":true,"result":null}), json!({"ok":true,"documentStamp":{"documentId":"doc-A","revision":"0"}}), json!({})] {
+        assert!(matches!(decode_guarded_reply(&reply), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+    }
+    let details = json!({"code":"STALE_DOCUMENT","message":"stale","retry":"never","details":{
+        "expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}});
+    assert!(matches!(decode_guarded_reply(&json!({"ok":false,"error":"stale","errorDetails":details})),
+        Err(crate::GuardedCallError::Rejected { message, error_details }) if message == "stale" && error_details == details));
+    assert!(matches!(decode_guarded_reply(&json!({"ok":false,"error":"native command failed"})),
+        Err(crate::GuardedCallError::CommandFailed(message)) if message == "native command failed"));
+}
+
+// Catches thin validation being bypassed in the actual network backend. Invalid envelopes and
+// unsupported routes must not even open a socket or touch legacy script/step dispatch.
+#[test]
+fn guarded_remote_validation_refuses_before_connection() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    let peer = GuardPeer::new(|_, _| GuardAnswer::Reply(guard_success()));
+    let mut remote = peer.remote(ParamCheck::Off);
+    for expected in [Value::Null, json!({"documentId":"doc-A","revision":"0","extra":true}), json!({"documentId":"doc-A","revision":0})] {
+        let mut request = guard_request("engine.execute");
+        request["expectedDocument"] = expected;
+        assert!(
+            matches!(remote.call_guarded("engine.execute", request), Err(crate::GuardedCallError::Rejected { error_details, .. }) if error_details["code"] == "INVALID_REQUEST")
+        );
+    }
+    assert!(matches!(remote.call_guarded("engine.execute", json!({"command":"parameters.change"})), Err(crate::GuardedCallError::Rejected { .. })));
+    for method in ["engine.script", "ui.view", "document.inspect"] {
+        assert!(
+            matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::Rejected { error_details, .. }) if error_details["code"] == "UNSUPPORTED_CAPABILITY")
+        );
+    }
+    for command in ["file.new", "component.edit_in_place", "timeline.play", "document.snapshot.capture", "panel.open"] {
+        let mut request = guard_request("engine.execute");
+        request["command"] = json!(command);
+        assert!(matches!(remote.call_guarded("engine.execute", request), Err(crate::GuardedCallError::Rejected { .. })), "{command}");
+    }
+    let mut request = guard_request("engine.batch");
+    request["commands"] = json!([{"command":"parameters.change"},{"command":"file.new"}]);
+    assert!(matches!(remote.call_guarded("engine.batch", request), Err(crate::GuardedCallError::Rejected { .. })));
+    let (connections, wire) = peer.finish_counted(remote);
+    assert_eq!(connections, 0);
+    assert!(wire.is_empty());
+
+    // Execute resolves the first string, whereas batch resolves the first present Value.
+    // Collect every refusal mismatch before asserting so RED observes the whole bad-type/file
+    // table, not just command:null. A capable peer would otherwise receive these requests.
+    let bad_commands = [Value::Null, json!(7), json!(false), json!([]), json!({})];
+    let mut refused = Vec::new();
+    for command in &bad_commands {
+        for id in ["file.new", "doc.open", "DOC.OPEN"] {
+            let mut request = guard_request("engine.execute");
+            request["command"] = command.clone();
+            request["id"] = json!(id);
+            refused.push(request);
+        }
+        for key in ["path", "paths", "file", "files", "dir", "folder", "url", "out"] {
+            let mut request = guard_request("engine.execute");
+            request["command"] = command.clone();
+            request["id"] = json!("PaRaMeTeRs.ChAnGe");
+            request["params"][key] = Value::Null; // Presence, not the value's type, forbids it.
+            refused.push(request);
+        }
+    }
+    for id in [json!("parameters.change"), Value::Null, json!(false)] {
+        let mut request = guard_request("engine.execute");
+        request["command"] = json!("file.new");
+        request["id"] = id;
+        refused.push(request);
+    }
+    for id in ["file.new", "doc.open"] {
+        let mut request = guard_request("engine.execute");
+        request.as_object_mut().unwrap().remove("command");
+        request["id"] = json!(id);
+        refused.push(request);
+    }
+    let mut mismatches = Vec::new();
+    for request in refused {
+        let peer =
+            GuardPeer::new(|_, req| GuardAnswer::Reply(if req["method"] == "control.capabilities" { guard_capabilities() } else { guard_success() }));
+        let mut remote = peer.remote(ParamCheck::Off);
+        let result = remote.call_guarded("engine.execute", request.clone());
+        if !matches!(result, Err(crate::GuardedCallError::Rejected { ref error_details, .. }) if error_details["code"] == "UNSUPPORTED_CAPABILITY") {
+            mismatches.push(format!("not locally unsupported: {request}: {result:?}"));
+        }
+        let (connections, wire) = peer.finish_counted(remote);
+        if connections != 0 || !wire.is_empty() {
+            mismatches.push(format!("refusal did I/O: {request}: connections={connections}, wire={}", wire.len()));
+        }
+    }
+
+    // Native diagnostics must still own malformed/unknown commands. Neither a bad id nor an
+    // unused forbidden id overrides a valid string command, and no raw spelling is rewritten.
+    let mut allowed = Vec::new();
+    for command in &bad_commands {
+        let mut request = guard_request("engine.execute");
+        request["command"] = command.clone();
+        request["id"] = json!("PaRaMeTeRs.ChAnGe");
+        allowed.push((request, None));
+    }
+    let mut id_only = guard_request("engine.execute");
+    id_only.as_object_mut().unwrap().remove("command");
+    id_only["id"] = json!("PaRaMeTeRs.ChAnGe");
+    allowed.push((id_only, None));
+    for id in [json!("file.new"), Value::Null, json!(7), json!(false), json!([]), json!({})] {
+        let mut request = guard_request("engine.execute");
+        request["command"] = json!("PaRaMeTeRs.ChAnGe");
+        request["id"] = id;
+        allowed.push((request, None));
+    }
+    for (command, id, error) in [
+        (Value::Null, json!(false), "missing `command`"),
+        (json!([]), json!({}), "missing `command`"),
+        (json!(""), json!("file.new"), "unknown command ``"),
+        (json!("not.a.command"), json!("file.new"), "unknown command `not.a.command`"),
+    ] {
+        let mut request = guard_request("engine.execute");
+        request["command"] = command;
+        request["id"] = id;
+        allowed.push((request, Some(error)));
+    }
+    for (request, error) in allowed {
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+                guard_capabilities()
+            } else if let Some(error) = error {
+                json!({"ok":false,"error":error})
+            } else {
+                guard_success()
+            })
+        });
+        let mut remote = peer.remote(ParamCheck::Off);
+        let result = remote.call_guarded("engine.execute", request.clone());
+        if let Some(error) = error {
+            assert!(matches!(result, Err(crate::GuardedCallError::CommandFailed(ref message)) if message == error), "{request}: {result:?}");
+        } else {
+            assert!(result.is_ok(), "{request}: {result:?}");
+        }
+        let (connections, wire) = peer.finish_counted(remote);
+        assert_eq!(connections, 1);
+        assert_eq!(wire.iter().map(|(_, r)| r["method"].as_str().unwrap()).collect::<Vec<_>>(), ["control.capabilities", "engine.execute"]);
+        let mut expected = request;
+        expected["param_check"] = json!("off");
+        assert_eq!(wire[1].1["params"], expected, "the backend preserves the original envelope");
+    }
+
+    // Batch's existing Value-first resolution must NOT acquire execute's string fallback.
+    for command in &bad_commands {
+        let mut request = guard_request("engine.batch");
+        request["commands"] = json!([{"command":command,"id":"file.new"}]);
+        let native = json!({"completed":0,"results":[],"undone":0,"failed":{"index":0,"error":"missing command"}});
+        let reply = native.clone();
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+                guard_capabilities()
+            } else {
+                json!({"ok":true,"result":reply,"documentStamp":{"documentId":"doc-A","revision":"9007199254740993"}})
+            })
+        });
+        let mut remote = peer.remote(ParamCheck::Off);
+        assert_eq!(remote.call_guarded("engine.batch", request.clone()).unwrap().result, native);
+        let (connections, wire) = peer.finish_counted(remote);
+        assert_eq!(connections, 1);
+        assert_eq!(wire.len(), 2);
+        request["param_check"] = json!("off");
+        assert_eq!(wire[1].1["params"], request);
+    }
+    for step in [json!({"id":"file.new"}), json!({"command":"file.new","id":"parameters.change"})] {
+        let peer = GuardPeer::new(|_, _| GuardAnswer::Reply(guard_success()));
+        let mut remote = peer.remote(ParamCheck::Off);
+        let mut request = guard_request("engine.batch");
+        request["commands"] = json!([step]);
+        assert!(matches!(remote.call_guarded("engine.batch", request), Err(crate::GuardedCallError::Rejected { .. })));
+        let (connections, wire) = peer.finish_counted(remote);
+        assert_eq!(connections, 0);
+        assert!(wire.is_empty());
+    }
+    assert!(mismatches.is_empty(), "execute policy/dispatch mismatch ({} failures):\n{}", mismatches.len(), mismatches.join("\n"));
+}
+
+// The real Remote speaks JSON lines to this socket, including its own auth/id/capability/pending
+// machinery. A stop connection joins the peer deterministically; no sleeps prove event ordering.
+struct GuardPeer {
+    addr: String,
+    stop: std::sync::Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<Vec<(usize, Value)>>>,
+}
+
+impl GuardPeer {
+    fn new(mut answer: impl FnMut(usize, &Value) -> GuardAnswer + Send + 'static) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let stop = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stopped = stop.clone();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
+        let thread = std::thread::spawn(move || {
+            let mut log = Vec::new();
+            for (connection, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                if *stopped.lock().unwrap() == Some(stream.peer_addr().unwrap()) {
+                    break;
+                }
+                accepted.fetch_add(1, Ordering::SeqCst);
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    log.push((connection, request.clone()));
+                    let (mut reply, close) = match answer(connection, &request) {
+                        GuardAnswer::Reply(reply) => (reply, false),
+                        GuardAnswer::ReplyAndClose(reply) => (reply, true),
+                        GuardAnswer::Close => break,
+                    };
+                    reply["id"] = request["id"].clone();
+                    if writeln!(stream, "{reply}").is_err() || close {
+                        break;
+                    }
+                    line.clear();
+                }
+            }
+            log
+        });
+        Self { addr, stop, connections, thread: Some(thread) }
+    }
+
+    fn remote(&self, level: solidcraft_engine::schema::ParamCheck) -> crate::Remote {
+        let mut remote = crate::Remote::new(&self.addr, Some("0123456789abcdef0123456789abcdef")).with_param_check(level);
+        remote.set_waits(quick_waits(0, 0));
+        remote
+    }
+
+    fn finish(self, backend: impl Sized) -> Vec<(usize, Value)> {
+        self.finish_counted(backend).1
+    }
+
+    fn finish_counted(mut self, backend: impl Sized) -> (usize, Vec<(usize, Value)>) {
+        drop(backend);
+        self.wake();
+        let wire = self.thread.take().unwrap().join().unwrap();
+        (self.connections.load(std::sync::atomic::Ordering::SeqCst), wire)
+    }
+
+    fn wake(&self) {
+        // Publish the wake socket's identity under the same lock the accept loop checks.
+        // Queued backend connections are counted even if accept happens only during finish.
+        let mut stop = self.stop.lock().unwrap();
+        if let Ok(wake) = std::net::TcpStream::connect(&self.addr) {
+            *stop = wake.local_addr().ok();
+        }
+    }
+}
+
+impl Drop for GuardPeer {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            self.wake();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn guard_capabilities() -> Value {
+    json!({"ok":true,"result":{"guardedExecution":{"version":"1.0","execute":true,"batch":true},"param_check":["off","warn","strict"]}})
+}
+
+fn guard_request(method: &str) -> Value {
+    let mut request = if method == "engine.batch" {
+        json!({"commands":[{"command":"parameters.change","params":{"name":"width","value":"10 mm"}}]})
+    } else {
+        json!({"command":"parameters.change","params":{"name":"width","value":"10 mm"}})
+    };
+    request["expectedDocument"] = json!({"documentId":"doc-A","revision":"9007199254740993"});
+    request
+}
+
+fn guard_success() -> Value {
+    json!({"ok":true,"result":{"completed":1,"results":[null],"undone":0,"timings":[{"index":0,"ms":1.25}]},
+        "documentStamp":{"documentId":"doc-A","revision":"9007199254740994"},"param_check":"strict"})
+}
+
+// Catches negotiation on a discarded connection, unsupported downgrades and validation-level
+// fallback. Both execute and batch must remain on the negotiated socket, even at off.
+#[test]
+fn guarded_remote_capability_is_connection_scoped_and_precedes_send() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for level in [ParamCheck::Off, ParamCheck::Warn, ParamCheck::Strict] {
+        let peer = GuardPeer::new(|_, req| {
+            GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+                guard_capabilities()
+            } else {
+                let mut reply = guard_success();
+                reply["param_check"] = req["params"]["param_check"].clone();
+                reply
+            })
+        });
+        let mut remote = peer.remote(level);
+        for method in ["engine.execute", "engine.batch"] {
+            let reply = remote.call_guarded(method, guard_request(method)).unwrap();
+            assert_eq!(reply.document_stamp.revision, 9_007_199_254_740_994);
+            assert_eq!(reply.result["timings"][0]["ms"], 1.25);
+        }
+        let log = peer.finish(remote);
+        assert_eq!(
+            log.iter().map(|(_, r)| r["method"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["control.capabilities", "engine.execute", "engine.batch"]
+        );
+        assert!(log.iter().all(|(connection, _)| *connection == 0));
+        for (_, req) in &log[1..] {
+            assert_eq!(req["params"]["expectedDocument"], json!({"documentId":"doc-A","revision":"9007199254740993"}));
+            assert_eq!(req["params"]["param_check"], level.name());
+        }
+        for capability in [
+            json!({"ok":true,"result":{}}),
+            json!({"ok":true,"result":{"guardedExecution":false}}),
+            json!({"ok":true,"result":{"guardedExecution":{"version":"2.0","execute":true,"batch":true}}}),
+            json!({"ok":false,"error":"unknown method `control.capabilities`"}),
+        ] {
+            let peer = GuardPeer::new(move |_, _| GuardAnswer::Reply(capability.clone()));
+            let mut remote = peer.remote(level);
+            assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")),
+                Err(crate::GuardedCallError::Rejected { error_details, .. }) if error_details["code"] == "UNSUPPORTED_CAPABILITY"));
+            assert_eq!(peer.finish(remote).len(), 1, "no mutation at any level");
+        }
+    }
+    for method in ["engine.execute", "engine.batch"] {
+        let field = if method == "engine.execute" { "execute" } else { "batch" };
+        let peer = GuardPeer::new(move |_, _| {
+            let mut caps = guard_capabilities();
+            caps["result"]["guardedExecution"][field] = json!(false);
+            GuardAnswer::Reply(caps)
+        });
+        let mut remote = peer.remote(ParamCheck::Off);
+        assert!(matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::Rejected { .. })));
+        assert_eq!(peer.finish(remote).len(), 1);
+    }
+    for level in [ParamCheck::Warn, ParamCheck::Strict] {
+        let peer = GuardPeer::new(|_, _| {
+            let mut caps = guard_capabilities();
+            caps["result"]["param_check"] = json!(["off"]);
+            GuardAnswer::Reply(caps)
+        });
+        let mut remote = peer.remote(level);
+        assert!(matches!(remote.call_guarded("engine.batch", guard_request("engine.batch")), Err(crate::GuardedCallError::Rejected { .. })));
+        assert_eq!(peer.finish(remote).len(), 1);
+    }
+}
+
+// Catches connected helpers silently reconnecting after negotiation and stale cached capability.
+#[test]
+fn guarded_remote_connected_helpers_never_reconnect() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    let peer =
+        GuardPeer::new(
+            |_, req| if req["method"] == "control.capabilities" { GuardAnswer::ReplyAndClose(guard_capabilities()) } else { GuardAnswer::Close },
+        );
+    let mut remote = peer.remote(ParamCheck::Off);
+    remote.ensure_guarded_capability("engine.execute").unwrap();
+    assert!(matches!(
+        remote.call_guarded_connected("engine.execute", guard_request("engine.execute")),
+        Err(crate::GuardedCallError::OutcomeUnknown(_))
+    ));
+    assert!(remote.roundtrip_connected("{}").is_err());
+    assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+    assert_eq!(peer.finish(remote).iter().filter(|(_, r)| r["method"] == "control.capabilities").count(), 1);
+
+    let peer = GuardPeer::new(|connection, _| {
+        GuardAnswer::ReplyAndClose(if connection == 0 { guard_capabilities() } else { json!({"ok":true,"result":{}}) })
+    });
+    let mut remote = peer.remote(ParamCheck::Off);
+    remote.ensure_guarded_capability("engine.execute").unwrap();
+    assert!(remote.roundtrip_connected("{}").is_err()); // observes EOF and invalidates the cache
+    assert!(matches!(remote.call_guarded("engine.batch", guard_request("engine.batch")), Err(crate::GuardedCallError::Rejected { .. })));
+    let log = peer.finish(remote);
+    assert_eq!(log.iter().filter(|(_, r)| r["method"] == "control.capabilities").map(|(c, _)| *c).collect::<Vec<_>>(), [0, 1]);
+    assert!(!log.iter().any(|(_, r)| r["method"] == "engine.batch"));
+}
+
+// Catches connected methods creating a connection at all, and classifying a never-connected
+// request as pending/unknown rather than provably unsent.
+#[test]
+fn guarded_remote_no_connection_is_not_sent_and_does_not_create_pending() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    let peer = GuardPeer::new(|_, _| GuardAnswer::Reply(guard_success()));
+    let mut remote = peer.remote(ParamCheck::Off);
+    assert!(remote.roundtrip_connected("{}").is_err());
+    assert!(matches!(remote.call_guarded_connected("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::NotSent(_))));
+    assert_eq!(remote.call("control.pending", json!({})).unwrap(), json!({"pending":null}));
+    assert!(peer.finish(remote).is_empty());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let mut remote = crate::Remote::new(&addr, Some("0123456789abcdef0123456789abcdef"));
+    assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::NotSent(_))));
+    assert_eq!(remote.call("control.pending", json!({})).unwrap(), json!({"pending":null}));
+}
+
+// Catches either old execute retry or old send_batch routing; one received write is already an
+// uncertain effect. Ordinary reconnect/empty pending must not clear that uncertainty.
+#[test]
+fn guarded_remote_never_resends_after_write_or_reply_loss() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for method in ["engine.execute", "engine.batch"] {
+        let peer = GuardPeer::new(|_, req| match req["method"].as_str() {
+            Some("control.capabilities") => GuardAnswer::Reply(guard_capabilities()),
+            Some("control.running") => GuardAnswer::Reply(json!({"ok":true,"result":{"running":[]}})),
+            _ => GuardAnswer::Close,
+        });
+        let mut remote = peer.remote(ParamCheck::Off);
+        assert!(matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        remote.call("control.running", json!({})).unwrap(); // ordinary reconnect is permitted
+        let _ = remote.call("control.pending", json!({}));
+        assert!(matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        let log = peer.finish(remote);
+        assert_eq!(log.iter().filter(|(_, r)| r["method"] == method).count(), 1);
+        assert_eq!(log.iter().filter(|(_, r)| r["method"] == "control.capabilities").count(), 1);
+    }
+}
+
+// Catches old recursive retry_busy and claiming an unrun request is itself pending.
+#[test]
+fn guarded_remote_busy_is_refused_without_retry_or_false_pending() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    let peer = GuardPeer::new(|_, req| {
+        GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+            guard_capabilities()
+        } else {
+            json!({"ok":false,"busy":true,"unrun":true,"error":"an earlier request is running"})
+        })
+    });
+    let mut remote = peer.remote(ParamCheck::Off);
+    assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::CommandFailed(_))));
+    assert_eq!(remote.call("control.pending", json!({})).unwrap(), json!({"pending":null}));
+    let log = peer.finish(remote);
+    assert_eq!(log.len(), 2);
+}
+
+// Catches metadata stripping through outcome(), pending-slot inference and loss of the latch.
+#[test]
+fn guarded_remote_pending_keeps_original_reply_and_unknown() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for original in [
+        guard_success(),
+        json!({"ok":false,"error":"stale","errorDetails":{"code":"STALE_DOCUMENT","retry":"never",
+        "message":"stale","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}}}),
+    ] {
+        let reply = original.clone();
+        let mut polls = 0;
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(match req["method"].as_str() {
+                Some("control.capabilities") => guard_capabilities(),
+                Some("engine.batch") => running(),
+                Some("control.pending") => {
+                    polls += 1;
+                    if polls == 1 {
+                        json!({"ok":true,"result":{"pending":2,"done":false}})
+                    } else {
+                        json!({"ok":true,"result":{"pending":2,"done":true,"reply":reply}})
+                    }
+                }
+                _ => json!({"ok":true,"result":null}),
+            })
+        });
+        let mut remote = peer.remote(ParamCheck::Strict);
+        assert!(matches!(remote.call_guarded("engine.batch", guard_request("engine.batch")), Err(crate::GuardedCallError::Pending(_))));
+        let pending = remote.call("control.pending", json!({})).unwrap();
+        // The peer adds the wire request id; every other original sibling stays byte-value equal.
+        let mut actual = pending["reply"].clone();
+        actual.as_object_mut().unwrap().remove("id");
+        assert_eq!(actual, original);
+        assert_eq!(pending["method"], "engine.batch");
+        assert_eq!(pending["guarded"], true);
+        let log = peer.finish(remote);
+        assert_eq!(log.iter().filter(|(_, r)| r["method"] == "engine.batch").count(), 1);
+        assert!(log.iter().all(|(c, _)| *c == 0));
+    }
+    for empty in [false, true] {
+        let peer = GuardPeer::new(move |_, req| match req["method"].as_str() {
+            Some("control.capabilities") => GuardAnswer::Reply(guard_capabilities()),
+            Some("engine.execute") => GuardAnswer::Reply(running()),
+            Some("control.pending") if empty => GuardAnswer::Reply(json!({"ok":true,"result":{"pending":null}})),
+            _ => GuardAnswer::Close,
+        });
+        let mut remote = peer.remote(ParamCheck::Off);
+        assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        let _ = remote.call("control.pending", json!({}));
+        assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        assert_eq!(peer.finish(remote).iter().filter(|(_, r)| r["method"] == "engine.execute").count(), 1);
+    }
+}
+
+// Catches the immediate running->done branch stripping the stamp/stale details, and the later
+// pending tool dropping its disconnect uncertainty before the next guarded request.
+#[test]
+fn guarded_remote_immediate_and_later_pending_preserve_effect_facts() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for stale in [false, true] {
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(match req["method"].as_str() {
+                Some("control.capabilities") => guard_capabilities(),
+                Some("engine.execute") => running(),
+                _ => json!({"ok":true,"result":{"pending":1,"done":true,"reply": if stale {
+                json!({"ok":false,"error":"stale","errorDetails":{"code":"STALE_DOCUMENT","details":{"current":null}}})
+            } else { guard_success() }}}),
+            })
+        });
+        let mut remote = peer.remote(ParamCheck::Strict);
+        let reply = remote.call_guarded("engine.execute", guard_request("engine.execute"));
+        if stale {
+            assert!(matches!(reply, Err(crate::GuardedCallError::Rejected { error_details, .. })
+            if error_details == json!({"code":"STALE_DOCUMENT","details":{"current":null}})));
+        } else {
+            let reply = reply.unwrap();
+            assert_eq!(reply.document_stamp.revision, 9_007_199_254_740_994);
+            assert_eq!(reply.result["completed"], 1);
+        }
+        assert_eq!(peer.finish(remote).len(), 3);
+    }
+    let mut polls = 0;
+    let peer = GuardPeer::new(move |_, req| match req["method"].as_str() {
+        Some("control.capabilities") => GuardAnswer::Reply(guard_capabilities()),
+        Some("engine.execute") => GuardAnswer::Reply(running()),
+        Some("control.pending") => {
+            polls += 1;
+            if polls == 1 { GuardAnswer::Reply(json!({"ok":true,"result":{"pending":1,"done":false}})) } else { GuardAnswer::Close }
+        }
+        _ => GuardAnswer::Reply(json!({"ok":true,"result":{"running":[]}})),
+    });
+    let mut remote = peer.remote(ParamCheck::Off);
+    assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::Pending(_))));
+    let pending = remote.call("control.pending", json!({})).unwrap();
+    assert_eq!(pending["lost"], true);
+    assert_eq!(pending["guarded"], true);
+    assert_eq!(pending["method"], "engine.execute");
+    remote.call("control.running", json!({})).unwrap();
+    let _ = remote.call("control.pending", json!({}));
+    assert!(matches!(remote.call_guarded("engine.batch", guard_request("engine.batch")), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+    assert_eq!(peer.finish(remote).iter().filter(|(_, r)| r["method"] == "engine.execute").count(), 1);
+}
+
+// Catches a new guarded request inheriting the old request's Pending status and losing the
+// original settled stamp/error. Completion of the earlier call is not a retry of the new one.
+#[test]
+fn guarded_remote_settles_original_before_new_write() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    let mut polls = 0;
+    let peer = GuardPeer::new(move |_, req| {
+        GuardAnswer::Reply(match req["method"].as_str() {
+            Some("control.capabilities") => guard_capabilities(),
+            Some("control.pending") => {
+                polls += 1;
+                if polls <= 2 {
+                    json!({"ok":true,"result":{"pending":1,"done":false}})
+                } else {
+                    json!({"ok":true,"result":{"pending":1,"done":true,"reply":guard_success()}})
+                }
+            }
+            Some("engine.batch") => running(),
+            _ => guard_success(),
+        })
+    });
+    let mut remote = peer.remote(ParamCheck::Strict);
+    assert!(matches!(remote.call_guarded("engine.batch", guard_request("engine.batch")), Err(crate::GuardedCallError::Pending(_))));
+    assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::NotSent(_))));
+    remote.call_guarded("engine.execute", guard_request("engine.execute")).unwrap();
+    let pending = remote.call("control.pending", json!({})).unwrap();
+    assert_eq!(pending["method"], "engine.batch");
+    assert_eq!(pending["reply"]["documentStamp"], json!({"documentId":"doc-A","revision":"9007199254740994"}));
+    assert_eq!(peer.finish(remote).iter().filter(|(_, r)| r["method"] == "engine.execute").count(), 1);
+}
+
+// Catches apparently successful replies being certified without their stamp or requested echo.
+#[test]
+fn guarded_remote_missing_metadata_is_unknown_and_latched() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for level in [ParamCheck::Off, ParamCheck::Warn, ParamCheck::Strict] {
+        for missing_stamp in [true, false] {
+            if level == ParamCheck::Off && !missing_stamp {
+                continue;
+            }
+            let peer = GuardPeer::new(move |_, req| {
+                let mut reply = guard_success();
+                if req["method"] == "control.capabilities" {
+                    return GuardAnswer::Reply(guard_capabilities());
+                }
+                reply["param_check"] = json!(level.name());
+                reply.as_object_mut().unwrap().remove(if missing_stamp { "documentStamp" } else { "param_check" });
+                GuardAnswer::Reply(reply)
+            });
+            let mut remote = peer.remote(level);
+            for _ in 0..2 {
+                assert!(matches!(
+                    remote.call_guarded("engine.execute", guard_request("engine.execute")),
+                    Err(crate::GuardedCallError::OutcomeUnknown(_))
+                ));
+            }
+            assert_eq!(peer.finish(remote).len(), 2);
+        }
+    }
+}
+
+// Catches a terminal pending reply first classified unknown being resurrected as done/success
+// by the settled cache. Its raw facts remain available, but never certify a guarded success.
+#[test]
+fn guarded_remote_pending_missing_metadata_remains_unknown() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for (missing_stamp, deferred) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut original = guard_success();
+        original.as_object_mut().unwrap().remove(if missing_stamp { "documentStamp" } else { "param_check" });
+        let raw = original.clone();
+        let mut polls = 0;
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(match req["method"].as_str() {
+                Some("control.capabilities") => guard_capabilities(),
+                Some("engine.batch") => running(),
+                _ => {
+                    polls += 1;
+                    if deferred && polls == 1 {
+                        json!({"ok":true,"result":{"pending":1,"done":false}})
+                    } else {
+                        json!({"ok":true,"result":{"pending":1,"done":true,"reply":raw}})
+                    }
+                }
+            })
+        });
+        let mut remote = peer.remote(ParamCheck::Strict);
+        let reply = remote.call_guarded("engine.batch", guard_request("engine.batch"));
+        if deferred {
+            assert!(matches!(reply, Err(crate::GuardedCallError::Pending(_))));
+        } else {
+            assert!(matches!(reply, Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        }
+        let pending = remote.call("control.pending", json!({})).unwrap();
+        assert_eq!(pending["lost"], true, "unknown must not reappear as a certified done: {pending}");
+        assert_ne!(pending["done"], true);
+        assert_eq!(pending["reply"], original, "retain raw effect facts even when unconfirmed");
+        assert_eq!(pending["method"], "engine.batch");
+        assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        assert_eq!(peer.finish(remote).len(), if deferred { 4 } else { 3 });
+    }
+}
+
+// A tool's unknown classification must also latch the Remote that actually sent the batch.
+#[test]
+fn guarded_remote_nonobject_batch_immediate_latches_after_reconnect() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for level in [ParamCheck::Off, ParamCheck::Strict] {
+        for native in [json!(7), Value::Null, json!([1]), json!("native")] {
+            let peer = GuardPeer::new(move |_, req| match req["method"].as_str() {
+                Some("control.capabilities") => GuardAnswer::Reply(guard_capabilities()),
+                Some("control.running") => GuardAnswer::ReplyAndClose(json!({"ok":true,"result":{"running":[]}})),
+                _ => {
+                    let mut reply = guard_success();
+                    reply["result"] = native.clone();
+                    GuardAnswer::Reply(reply)
+                }
+            });
+            let mut remote = peer.remote(level);
+            let first = crate::call_tool(&mut remote, "batch", &guard_request("engine.batch"));
+            assert_eq!(first["structuredContent"]["outcomeUnknown"], true, "{first}");
+            for method in ["engine.execute", "engine.batch"] {
+                assert!(matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+            }
+            let _ = remote.call("control.pending", json!({}));
+            remote.call("control.running", json!({})).unwrap();
+            remote.call("control.running", json!({})).unwrap();
+            for method in ["engine.execute", "engine.batch"] {
+                assert!(matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+            }
+            let (connections, wire) = peer.finish_counted(remote);
+            assert!(connections >= 2, "ordinary call really reconnected");
+            assert_eq!(wire.iter().filter(|(_, r)| matches!(r["method"].as_str(), Some("engine.execute" | "engine.batch"))).count(), 1);
+        }
+    }
+}
+
+// All terminal paths share the original method, retain raw effect facts as Lost, and never
+// resurrect an unconfirmed batch when pending is consumed or an ordinary call reconnects.
+#[test]
+fn guarded_remote_nonobject_batch_pending_latches_all_finish_paths() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for route in ["within", "pending", "guarded", "ordinary"] {
+        for native in [json!(7), Value::Null, json!([])] {
+            let mut original = guard_success();
+            original["result"] = native;
+            let raw = original.clone();
+            let mut polls = 0;
+            let peer = GuardPeer::new(move |_, req| match req["method"].as_str() {
+                Some("control.capabilities") => GuardAnswer::Reply(guard_capabilities()),
+                Some("engine.batch") => GuardAnswer::Reply(running()),
+                Some("control.pending") => {
+                    polls += 1;
+                    GuardAnswer::Reply(if route != "within" && polls == 1 {
+                        json!({"ok":true,"result":{"pending":1,"done":false}})
+                    } else {
+                        json!({"ok":true,"result":{"pending":1,"done":true,"reply":raw}})
+                    })
+                }
+                Some("control.running") => GuardAnswer::ReplyAndClose(json!({"ok":true,"result":{"running":[]}})),
+                _ => GuardAnswer::Reply(guard_success()),
+            });
+            let mut remote = peer.remote(ParamCheck::Strict);
+            let first = remote.call_guarded("engine.batch", guard_request("engine.batch"));
+            if route == "within" {
+                assert!(matches!(first, Err(crate::GuardedCallError::OutcomeUnknown(_))), "{route}");
+            } else {
+                assert!(matches!(first, Err(crate::GuardedCallError::Pending(_))), "{route}");
+            }
+            if route == "guarded" {
+                assert!(matches!(
+                    remote.call_guarded("engine.execute", guard_request("engine.execute")),
+                    Err(crate::GuardedCallError::OutcomeUnknown(_))
+                ));
+            } else if route == "ordinary" {
+                remote.call("engine.commands", json!({})).unwrap();
+            }
+            let pending = remote.call("control.pending", json!({})).unwrap();
+            assert_eq!(pending["lost"], true, "{route}: {pending}");
+            assert_ne!(pending["done"], true);
+            assert_eq!(pending["reply"], original);
+            assert_eq!(pending["method"], "engine.batch");
+            assert_eq!(pending["guarded"], true);
+            assert_eq!(pending["steps"], 1);
+            assert_eq!(remote.call("control.pending", json!({})).unwrap()["pending"], Value::Null);
+            remote.call("control.running", json!({})).unwrap();
+            remote.call("control.running", json!({})).unwrap();
+            for method in ["engine.execute", "engine.batch"] {
+                assert!(matches!(remote.call_guarded(method, guard_request(method)), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+            }
+            let (connections, wire) = peer.finish_counted(remote);
+            assert!(connections >= 2);
+            assert_eq!(wire.iter().filter(|(_, r)| matches!(r["method"].as_str(), Some("engine.execute" | "engine.batch"))).count(), 1);
+        }
+    }
+}
+
+// Catches overwriting a per-request validation level with the bridge default, accepting the
+// wrong echo, or treating a partial write as a provable zero-send failure.
+#[test]
+fn guarded_remote_request_level_and_partial_write_fail_closed() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    for echo in ["strict", "off"] {
+        let peer = GuardPeer::new(move |_, req| {
+            GuardAnswer::Reply(if req["method"] == "control.capabilities" {
+                guard_capabilities()
+            } else {
+                let mut reply = guard_success();
+                reply["param_check"] = json!(echo);
+                reply
+            })
+        });
+        let mut remote = peer.remote(ParamCheck::Off);
+        let mut request = guard_request("engine.execute");
+        request["param_check"] = json!("strict");
+        let reply = remote.call_guarded("engine.execute", request);
+        if echo == "strict" {
+            assert!(reply.is_ok(), "{reply:?}");
+        } else {
+            assert!(matches!(reply, Err(crate::GuardedCallError::OutcomeUnknown(_))));
+        }
+        let log = peer.finish(remote);
+        assert_eq!(log[1].1["params"]["param_check"], "strict");
+    }
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let req: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "control.capabilities");
+        let mut caps = guard_capabilities();
+        caps["id"] = req["id"].clone();
+        writeln!(stream, "{caps}").unwrap();
+        let mut first = [0];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(first[0], b'{');
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        1 // one mutation began; it need not have reached the owner to make its effect uncertain
+    });
+    let mut remote = crate::Remote::new(&addr, Some("0123456789abcdef0123456789abcdef"));
+    let mut request = guard_request("engine.execute");
+    request["payload"] = json!("x".repeat(16 << 20));
+    assert!(matches!(remote.call_guarded("engine.execute", request), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+    assert_eq!(peer.join().unwrap(), 1);
+    assert!(matches!(remote.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::OutcomeUnknown(_))));
+}
+
+// Catches new Backend defaults calling old call(), Auto double-delegation/fallback, and built-in
+// legacy network calls dropping a guard (even a null guard on engine.script).
+#[test]
+fn guarded_backend_default_auto_and_legacy_entry_do_not_downgrade() {
+    use crate::Backend;
+    use solidcraft_engine::schema::ParamCheck;
+    struct Legacy(usize);
+    impl Backend for Legacy {
+        fn call(&mut self, _: &str, _: Value) -> Result<Value, String> {
+            self.0 += 1;
+            Ok(Value::Null)
+        }
+        fn has_ui(&self) -> bool {
+            false
+        }
+        fn describe(&self) -> String {
+            String::new()
+        }
+    }
+    let mut legacy = Legacy(0);
+    assert!(matches!(legacy.call_guarded("engine.execute", guard_request("engine.execute")), Err(crate::GuardedCallError::Rejected { .. })));
+    assert_eq!(legacy.0, 0);
+    let peer =
+        GuardPeer::new(|_, req| GuardAnswer::Reply(if req["method"] == "control.capabilities" { guard_capabilities() } else { guard_success() }));
+    let port = peer.addr.rsplit(':').next().unwrap().parse().unwrap();
+    let mut auto = crate::Auto::new(Headless::default(), Box::new(move || Some(port)), Some("0123456789abcdef0123456789abcdef"));
+    auto.call_guarded("engine.execute", guard_request("engine.execute")).unwrap();
+    assert_eq!(peer.finish(auto).len(), 2, "one capability + exactly one actual backend write");
+    let mut auto = crate::Auto::new(Headless::default(), Box::new(|| None), None);
+    assert!(
+        matches!(auto.call_guarded("engine.batch", guard_request("engine.batch")), Err(crate::GuardedCallError::Rejected { .. })),
+        "Headless awaits Task6, not legacy fallback"
+    );
+    for method in ["engine.execute", "engine.batch", "engine.script"] {
+        let peer = GuardPeer::new(|_, _| GuardAnswer::Reply(json!({"ok":true,"result":null})));
+        let mut remote = peer.remote(ParamCheck::Strict);
+        let mut request = guard_request(method);
+        request["expectedDocument"] = Value::Null;
+        assert!(remote.call(method, request).is_err_and(|e| e.contains("call_guarded")));
+        assert!(peer.finish(remote).is_empty());
     }
 }
 

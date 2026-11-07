@@ -63,6 +63,7 @@ pub mod drag_snap;
 pub mod easyprint_ui;
 pub mod edit_clipboard;
 pub mod edit_in_place;
+mod execution_guard;
 mod feature_edit;
 #[cfg(test)]
 mod font_literals_tests;
@@ -737,6 +738,8 @@ pub struct SolveApp {
     /// The modifiers of the synthetic press in progress (a Ctrl-drag keeps Ctrl while it moves).
     pub synthetic_mods: egui::Modifiers,
     control_rx: Option<Receiver<ControlRequest>>,
+    /// Leaving a document invalidates every request admitted in its current tab context.
+    guarded_context: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Control requests that change the design, held while a file loads or an agent's design
     /// change computes.
     control_held: std::collections::VecDeque<ControlRequest>,
@@ -919,6 +922,7 @@ impl SolveApp {
             synthetic: Vec::new(),
             synthetic_mods: egui::Modifiers::default(),
             control_rx: None,
+            guarded_context: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             agent_chat: Default::default(),
             ai_connect: Default::default(),
             control_held: Default::default(),
@@ -3323,8 +3327,12 @@ impl SolveApp {
             let shot_waits = open_meshing::active(self) && self.control_held.front().is_some_and(|r| r.method == "ui.screenshot");
             // Held requests go first, in order, once nothing makes them wait.
             let held = if waits || shot_waits { None } else { self.control_held.pop_front() };
-            let Some(req) = held.or_else(|| rx.as_ref().and_then(|rx| rx.try_recv().ok())) else { break };
+            let Some(mut req) = held.or_else(|| rx.as_ref().and_then(|rx| rx.try_recv().ok())) else { break };
             if req.refuse_cancelled_chat() {
+                continue;
+            }
+            if let Err(error) = execution_guard::admit(self, &mut req) {
+                let _ = req.reply.send(execution_guard::refusal_json(&error));
                 continue;
             }
             if shot_waits {
