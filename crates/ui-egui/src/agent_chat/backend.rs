@@ -170,13 +170,26 @@ pub trait ChatBackend {
 
 /// One HTTP request of the API backend (the desktop host sends it; nothing else in the chat
 /// reaches the network).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct HttpRequest {
     pub method: &'static str,
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub timeout_s: u64,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Even non-auth headers and URL paths/queries may contain credentials or prompt text.
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &"[redacted]")
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("timeout_s", &self.timeout_s)
+            .finish()
+    }
 }
 
 /// Sends an [`HttpRequest`]: the status and the body, or why it failed.

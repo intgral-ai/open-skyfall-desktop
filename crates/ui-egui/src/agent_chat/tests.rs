@@ -1,6 +1,1540 @@
 use super::*;
 use std::sync::mpsc::channel;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) mod direct_integration {
+    use super::*;
+    use host_ai::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    pub(in crate::agent_chat) const GUARD: Duration = Duration::from_secs(30);
+    pub(in crate::agent_chat) const KEY_A: &str = "task8-private-A-7f2b9456-never-project";
+    pub(in crate::agent_chat) const KEY_B: &str = "task8-private-B-25e93d10-never-project";
+
+    #[derive(Default)]
+    pub(in crate::agent_chat) struct Keys(Mutex<std::collections::HashMap<String, String>>);
+    impl backend::Secrets for Keys {
+        fn get(&self, id: &str) -> Result<Option<String>, String> {
+            Ok(self.0.lock().unwrap().get(id).cloned())
+        }
+        fn set(&self, id: &str, key: &str) -> Result<(), String> {
+            self.0.lock().unwrap().insert(id.into(), key.into());
+            Ok(())
+        }
+        fn delete(&self, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().remove(id);
+            Ok(())
+        }
+    }
+
+    fn config() -> agents::AgentConfig {
+        agents::AgentConfig {
+            id: "task8-original".into(),
+            name: "Fixture".into(),
+            kind: agents::Kind::Api,
+            base_url: "http://localhost:18080/v1".into(),
+            model: "chosen".into(),
+            key: true,
+            request_timeout_s: 90,
+            ..Default::default()
+        }
+    }
+
+    pub(in crate::agent_chat) fn app(http: backend::HttpFn, keys: Arc<Keys>) -> (SolveApp, egui::Context) {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        app.services.agent_http = Some(http);
+        app.services.secrets = Some(keys);
+        // load_prefs must publish into the *injected production* resource, without secret I/O.
+        let preferences = crate::prefs::Prefs { agents: vec![config()], agent_default: "task8-original".into(), ..Default::default() };
+        app.load_prefs(&json!({"preferences": preferences}).to_string());
+        app.preferences.agents = vec![config()];
+        app.preferences.agent_default = "task8-original".into();
+        (app, egui::Context::default())
+    }
+
+    pub(in crate::agent_chat) fn answer() -> Value {
+        json!({"choices":[{"message":{"role":"assistant","content":"current answer"},"finish_reason":"stop"}]})
+    }
+    pub(in crate::agent_chat) fn request(id: &str) -> GenerateRequest {
+        GenerateRequest {
+            connection_id: id.into(),
+            model_id: "chosen".into(),
+            messages: vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentPart::Text("host request".into())],
+                tool_calls: vec![],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            options: GenerateOptions {
+                delivery: Delivery::Buffered,
+                timeout_seconds: 60,
+                max_output_tokens: None,
+                temperature: None,
+                reasoning_effort: None,
+                output_schema: None,
+            },
+            continuation: None,
+        }
+    }
+    pub(in crate::agent_chat) fn context(host: &HostAi, turn: &str) -> CallContext {
+        CallContext {
+            scope: CallScope {
+                session: SessionKey { runtime_instance_id: "native-fixture".into(), session_id: "integration".into() },
+                turn_id: turn.into(),
+                workflow_run_id: "workflow".into(),
+            },
+            control: TurnControl::new().new_call().unwrap(),
+            deadline: host.deadline_after(Duration::from_secs(80)),
+            limits: AiLimits::contract_defaults(),
+            model_budget: Arc::new(ModelCallBudget::new(20).unwrap()),
+        }
+    }
+    pub(in crate::agent_chat) fn host(app: &SolveApp) -> Arc<HostAi> {
+        // The connected backend uses the production factory. Its facade peer substitutes only
+        // clock/entropy/artifact boundaries and uses the actual injected Services resources.
+        sync_ai_connections(app).unwrap();
+        let next = std::sync::atomic::AtomicU64::new(1);
+        let host = Arc::new(HostAi::new(HostAiDependencies {
+            shared: Arc::clone(&app.services.agent_ai),
+            http: app.services.agent_http.clone().unwrap(),
+            secrets: app.services.secrets.clone(),
+            artifacts: Arc::new(|_, _| panic!("direct text fixture must not read an artifact")),
+            clock: Arc::new(|| Duration::ZERO),
+            ids: Arc::new(move || Ok(format!("{:032x}", next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))),
+        }));
+        host.open_session(context(&host, "open").scope.session, AiLimits::contract_defaults()).unwrap();
+        host
+    }
+
+    // A watchdog is only a deadlock guard, never a timing-correctness assertion.
+    pub(in crate::agent_chat) fn until(app: &mut SolveApp, ctx: &egui::Context, done: impl Fn(&SolveApp) -> bool) {
+        let guard = Instant::now() + GUARD;
+        while !done(app) {
+            assert!(Instant::now() < guard, "backend did not settle");
+            poll(app, ctx);
+            std::thread::yield_now();
+        }
+    }
+    pub(in crate::agent_chat) fn connected(app: &mut SolveApp, ctx: &egui::Context) {
+        connect(app, ctx);
+        until(app, ctx, |a| a.agent_chat.state() == State::Ready && !a.agent_chat.models.is_empty());
+    }
+    pub(in crate::agent_chat) fn turn(app: &mut SolveApp, ctx: &egui::Context) {
+        send(app, ctx, "direct request".into());
+        until(app, ctx, |a| a.agent_chat.state() != State::Busy);
+    }
+
+    fn physical_workers_exited(app: &SolveApp, id: &str) {
+        let deadline = Instant::now() + GUARD;
+        loop {
+            if let Ok(first) = host_ai::test_support::admit(&app.services.agent_ai, id)
+                && let Ok(second) = host_ai::test_support::admit(&app.services.agent_ai, id)
+            {
+                drop((first, second));
+                return;
+            }
+            assert!(Instant::now() < deadline, "physical HTTP worker did not exit");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn direct_chat_and_host_ai_share_physical_http_caps() {
+        use backend::Secrets;
+        let keys = Arc::new(Keys::default());
+        keys.set("task8-original", KEY_A).unwrap();
+        let (entered, arrivals) = channel();
+        let (release, exits) = channel();
+        let exits = Mutex::new(exits);
+        let http: backend::HttpFn = Arc::new(move |r| {
+            if r.method == "GET" {
+                return Ok((200, br#"{"data":[]}"#.to_vec()));
+            }
+            entered.send(r.url.clone()).unwrap();
+            exits.lock().unwrap().recv_timeout(GUARD).unwrap();
+            Ok((200, answer().to_string().into_bytes()))
+        });
+        let (mut app, ctx) = app(http, keys);
+        connected(&mut app, &ctx);
+        let host = host(&app);
+        let binding = app.services.agent_ai.connections().bind("task8-original", "chosen").unwrap();
+        send(&mut app, &ctx, "first blocked".into());
+        arrivals.recv_timeout(GUARD).unwrap();
+        cancel(&mut app);
+        until(&mut app, &ctx, |a| a.agent_chat.state() != State::Busy);
+        let h = Arc::clone(&host);
+        let b = binding.clone();
+        let c = context(&h, "parallel");
+        let stop = Arc::clone(&c.control);
+        let (done, result) = channel();
+        let worker = std::thread::spawn(move || {
+            done.send(h.generate(&b, &c, request("task8-original"))).unwrap();
+        });
+        arrivals.recv_timeout(GUARD).unwrap();
+        let third = host.generate(&binding, &context(&host, "third"), request("task8-original")).unwrap_err();
+        assert_eq!(third.code(), AiErrorCode::ResourceExhausted, "cancelled direct HTTP still owns its physical slot");
+        stop.cancel();
+        assert_eq!(result.recv_timeout(GUARD).unwrap().unwrap_err().code(), AiErrorCode::Cancelled);
+        worker.join().unwrap();
+        assert!(arrivals.try_recv().is_err());
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        physical_workers_exited(&app, "task8-original");
+    }
+
+    #[test]
+    fn direct_chat_and_host_ai_share_physical_http_caps_across_windows() {
+        use backend::Secrets;
+        let pool = Arc::new(HttpAdmission::default());
+        let keys = Arc::new(Keys::default());
+        keys.set("task8-original", KEY_A).unwrap();
+        let (entered, arrivals) = channel();
+        let mut windows = Vec::new();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        let mut results = Vec::new();
+        for index in 0..8 {
+            let (release, wait) = channel();
+            let wait = Mutex::new(wait);
+            let entered = entered.clone();
+            let http: backend::HttpFn = Arc::new(move |r| {
+                if r.method == "GET" {
+                    return Ok((200, br#"{"data":[]}"#.to_vec()));
+                }
+                entered.send(()).unwrap();
+                wait.lock().unwrap().recv_timeout(GUARD).unwrap();
+                Ok((200, answer().to_string().into_bytes()))
+            });
+            let (mut app, ctx) = app(http, Arc::clone(&keys));
+            app.services.agent_ai = Arc::new(AiShared::new(Arc::clone(&pool)));
+            let id = format!("window-{index}");
+            keys.set(&id, KEY_A).unwrap();
+            app.preferences.agents[0].id = id.clone();
+            app.preferences.agent_default = id.clone();
+            connected(&mut app, &ctx);
+            let host = host(&app);
+            if index % 2 == 0 {
+                send(&mut app, &ctx, "blocked direct".into());
+                arrivals.recv_timeout(GUARD).unwrap();
+                cancel(&mut app);
+                until(&mut app, &ctx, |a| a.agent_chat.state() != State::Busy);
+            } else {
+                let binding = app.services.agent_ai.connections().bind(&id, "chosen").unwrap();
+                let context = context(&host, "blocked-host");
+                let control = Arc::clone(&context.control);
+                let (done, result) = channel();
+                let req = request(&id);
+                workers.push(std::thread::spawn(move || {
+                    done.send(host.generate(&binding, &context, req)).unwrap();
+                }));
+                arrivals.recv_timeout(GUARD).unwrap();
+                control.cancel();
+                results.push(result);
+            }
+            releases.push(release);
+            windows.push((app, ctx, id));
+        }
+        let (app, _, id) = &windows[0];
+        let host = host(app);
+        let binding = app.services.agent_ai.connections().bind(id, "chosen").unwrap();
+        let error = host.generate(&binding, &context(&host, "ninth"), request(id)).unwrap_err();
+        assert_eq!(error.code(), AiErrorCode::ResourceExhausted);
+        assert!(matches!(error.details(), AiErrorDetails::Resource { resource: "http_per_host", limit: 8 }));
+        // A catalog edit in one window cannot publish into another window's catalog.
+        assert_eq!(windows[1].0.services.agent_ai.connections().bind("window-0", "chosen").unwrap_err().code(), AiErrorCode::ConnectionChanged);
+        for result in results {
+            assert_eq!(result.recv_timeout(GUARD).unwrap().unwrap_err().code(), AiErrorCode::Cancelled);
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for (app, _, id) in &windows {
+            physical_workers_exited(app, id);
+        }
+        assert!(arrivals.try_recv().is_err());
+    }
+
+    #[test]
+    fn direct_chat_config_edits_do_not_retarget_an_active_turn() {
+        use backend::Secrets;
+        let keys = Arc::new(Keys::default());
+        keys.set("task8-original", KEY_A).unwrap();
+        let (entered, arrival) = channel();
+        let (release, wait) = channel();
+        let wait = Mutex::new(wait);
+        let http: backend::HttpFn = Arc::new(move |r| {
+            if r.method == "GET" {
+                return Ok((200, br#"{"data":[]}"#.to_vec()));
+            }
+            entered.send(r.url.clone()).unwrap();
+            wait.lock().unwrap().recv_timeout(GUARD).unwrap();
+            Ok((200, answer().to_string().into_bytes()))
+        });
+        let (mut app, ctx) = app(http, keys);
+        connected(&mut app, &ctx);
+        let host = host(&app);
+        let old = app.services.agent_ai.connections().bind("task8-original", "chosen").unwrap();
+        send(&mut app, &ctx, "endpoint pinned".into());
+        assert!(arrival.recv_timeout(GUARD).unwrap().contains(":18080/"));
+        app.preferences.agents[0].base_url = "http://localhost:18081/v1".into();
+        poll(&mut app, &ctx);
+        release.send(()).unwrap();
+        until(&mut app, &ctx, |a| a.agent_chat.state() != State::Busy);
+        let error = host.generate(&old, &context(&host, "old"), request("task8-original")).unwrap_err();
+        assert_eq!(error.code(), AiErrorCode::ConnectionChanged);
+        assert!(!format!("{:?}", app.agent_chat.items).contains("current answer"));
+        assert!(format!("{:?}", app.agent_chat.items).contains(&error.message()));
+        assert!(arrival.try_recv().is_err());
+        physical_workers_exited(&app, "task8-original");
+    }
+
+    #[test]
+    fn direct_chat_config_edits_do_not_retarget_an_active_turn_or_queued_model() {
+        use backend::Secrets;
+        let keys = Arc::new(Keys::default());
+        keys.set("task8-original", KEY_A).unwrap();
+        let (entered, arrival) = channel();
+        let (release, wait) = channel();
+        let wait = Mutex::new(Some(wait));
+        let requests = Arc::new(Mutex::new(Vec::<backend::HttpRequest>::new()));
+        let log = Arc::clone(&requests);
+        let http: backend::HttpFn = Arc::new(move |r| {
+            if r.method == "GET" {
+                return Ok((200, br#"{"data":[]}"#.to_vec()));
+            }
+            log.lock().unwrap().push(r.clone());
+            if let Some(wait) = wait.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                wait.recv_timeout(GUARD).unwrap();
+                return Ok((200, json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"measure","type":"function","function":{"name":"measure","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}).to_string().into_bytes()));
+            }
+            Ok((200, answer().to_string().into_bytes()))
+        });
+        let (mut app, ctx) = app(http, keys);
+        connected(&mut app, &ctx);
+        let _host = host(&app);
+        send(&mut app, &ctx, "old chosen model".into());
+        arrival.recv_timeout(GUARD).unwrap();
+        assert!(set_custom_model(&mut app, "next-model"));
+        release.send(()).unwrap();
+        until(&mut app, &ctx, |a| a.agent_chat.state() != State::Busy);
+        turn(&mut app, &ctx);
+        let models: Vec<Value> =
+            requests.lock().unwrap().iter().map(|r| serde_json::from_slice::<Value>(r.body.as_deref().unwrap()).unwrap()["model"].clone()).collect();
+        assert_eq!(models, [json!("chosen"), json!("chosen"), json!("next-model")]);
+        app.preferences.agents[0].request_timeout_s = 120;
+        app.preferences.agents[0].reasoning_effort = "high".into();
+        turn(&mut app, &ctx);
+        assert_eq!(requests.lock().unwrap()[3].timeout_s, 120);
+        assert_eq!(serde_json::from_slice::<Value>(requests.lock().unwrap()[3].body.as_deref().unwrap()).unwrap()["reasoning_effort"], "high");
+        app.preferences.agents[0].kind = agents::Kind::Anthropic;
+        poll(&mut app, &ctx);
+        turn(&mut app, &ctx);
+        assert_eq!(requests.lock().unwrap().len(), 4, "a protocol edit cannot reuse the old protocol history");
+        assert!(format!("{:?}", app.agent_chat.items).contains(crate::i18n::tr("ui.host_ai_reconnect_required")));
+        physical_workers_exited(&app, "task8-original");
+    }
+
+    #[test]
+    fn direct_chat_late_tool_reply_cannot_enter_a_new_turn() {
+        use backend::Secrets;
+        let keys = Arc::new(Keys::default());
+        keys.set("task8-original", KEY_A).unwrap();
+        let (entered, arrival) = channel();
+        let (release_old, old) = channel();
+        let old = Mutex::new(Some(old));
+        let (release_new, new) = channel();
+        let new = Mutex::new(new);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let http: backend::HttpFn = Arc::new(move |r| {
+            if r.method == "GET" {
+                return Ok((200, br#"{"data":[]}"#.to_vec()));
+            }
+            log.lock().unwrap().push(serde_json::from_slice::<Value>(r.body.as_deref().unwrap()).unwrap());
+            entered.send(()).unwrap();
+            let first = old.lock().unwrap().take();
+            if let Some(wait) = first {
+                wait.recv_timeout(GUARD).unwrap();
+                return Ok((200, json!({"choices":[{"message":{"role":"assistant","content":"late old text","tool_calls":[{"id":"late","type":"function","function":{"name":"execute","arguments":"{\"command\":\"parameters.change\",\"params\":{\"name\":\"width\",\"value\":12}}"}}]},"finish_reason":"tool_calls"}]}).to_string().into_bytes()));
+            }
+            new.lock().unwrap().recv_timeout(GUARD).unwrap();
+            Ok((200, answer().to_string().into_bytes()))
+        });
+        let (mut app, ctx) = app(http, keys);
+        connected(&mut app, &ctx);
+        let _host = host(&app);
+        let document = Arc::clone(&app.session.doc);
+        let undo = app.session.undo.len();
+        let revision = app.session.revision;
+        send(&mut app, &ctx, "old".into());
+        arrival.recv_timeout(GUARD).unwrap();
+        // Enqueue the next prompt immediately, before the old waiter has acknowledged Stop.
+        let backend = app.agent_chat.backend.as_mut().unwrap();
+        backend.cancel();
+        backend.prompt(&[PromptPart::Text("new".into())]);
+        release_old.send(()).unwrap();
+        arrival.recv_timeout(GUARD).unwrap();
+        release_new.send(()).unwrap();
+        until(&mut app, &ctx, |a| format!("{:?}", a.agent_chat.items).contains("current answer"));
+        let items = format!("{:?}", app.agent_chat.items);
+        assert!(!items.contains("late old text") && !items.contains("execute:"), "{items}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "no continuation/tool round from the cancelled answer");
+        assert!(!seen.lock().unwrap()[1].to_string().contains("late"));
+        assert!(Arc::ptr_eq(&document, &app.session.doc));
+        assert_eq!((app.session.undo.len(), app.session.revision), (undo, revision));
+        until(&mut app, &ctx, |a| a.agent_chat.state() != State::Busy);
+        physical_workers_exited(&app, "task8-original");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod host_ai_facade_tests {
+    use super::*;
+    use host_ai::*;
+    use std::sync::{
+        Mutex, Weak,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    struct Fixture {
+        host: Arc<HostAi>,
+        shared: Arc<AiShared>,
+        binding: ConnectionBinding,
+        session: SessionKey,
+        now: Arc<AtomicU64>,
+    }
+
+    fn fixture(http: backend::HttpFn, ids: Option<IdFn>) -> Fixture {
+        let shared = Arc::new(AiShared::default());
+        shared
+            .connections()
+            .replace(&[agents::AgentConfig {
+                id: "facade".into(),
+                kind: agents::Kind::Api,
+                base_url: "http://localhost:8080/v1".into(),
+                request_timeout_s: 90,
+                ..Default::default()
+            }])
+            .unwrap();
+        let binding = shared.connections().bind("facade", "chosen").unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = Arc::clone(&now);
+        let next = AtomicU64::new(1);
+        let host = Arc::new(HostAi::new(HostAiDependencies {
+            shared: Arc::clone(&shared),
+            http,
+            secrets: None,
+            artifacts: Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap())),
+            clock: Arc::new(move || Duration::from_secs(clock.load(Ordering::SeqCst))),
+            ids: ids.unwrap_or_else(|| Arc::new(move || Ok(format!("{:032x}", next.fetch_add(1, Ordering::SeqCst))))),
+        }));
+        let session = SessionKey { runtime_instance_id: "process-1".into(), session_id: "session".into() };
+        host.open_session(session.clone(), AiLimits::contract_defaults()).unwrap();
+        Fixture { host, shared, binding, session, now }
+    }
+
+    fn request() -> GenerateRequest {
+        GenerateRequest {
+            connection_id: "facade".into(),
+            model_id: "chosen".into(),
+            messages: vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentPart::Text("hello".into())],
+                tool_calls: vec![],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            options: GenerateOptions {
+                delivery: Delivery::Buffered,
+                timeout_seconds: 60,
+                max_output_tokens: None,
+                temperature: None,
+                reasoning_effort: None,
+                output_schema: None,
+            },
+            continuation: None,
+        }
+    }
+
+    fn context(f: &Fixture, budget: &Arc<ModelCallBudget>) -> CallContext {
+        CallContext {
+            scope: CallScope { session: f.session.clone(), turn_id: "turn".into(), workflow_run_id: "workflow".into() },
+            control: TurnControl::new().new_call().unwrap(),
+            deadline: Duration::from_secs(100),
+            limits: AiLimits::contract_defaults(),
+            model_budget: Arc::clone(budget),
+        }
+    }
+
+    fn text_body() -> Value {
+        json!({"choices":[{"message":{"role":"assistant","content":"  exact text  "},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":null}})
+    }
+    fn cad_body() -> Value {
+        json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"cad","type":"function","function":{"name":"execute","arguments":"{\"command\":\"parameters.change\",\"params\":{\"name\":\"width\",\"value\":12}}"}}]},"finish_reason":"tool_calls"}]})
+    }
+    fn reply_http(body: Value, posts: &Arc<AtomicUsize>) -> backend::HttpFn {
+        let posts = Arc::clone(posts);
+        Arc::new(move |req| {
+            assert_eq!(req.method, "POST");
+            posts.fetch_add(1, Ordering::SeqCst);
+            Ok((200, body.to_string().into_bytes()))
+        })
+    }
+
+    #[test]
+    fn host_ai_one_step_returns_cad_declaration_without_effects() {
+        // A hidden tool loop/dispatcher or a second POST must fail these observations.
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(reply_http(cad_body(), &posts), None);
+        let session = solidcraft_engine::Session::default();
+        let before_doc = Arc::clone(&session.doc);
+        let before_revision = session.revision;
+        let before_undo = session.undo.len();
+        let mut req = request();
+        req.tools.push(ToolDefinition {
+            name: "execute".into(),
+            description: "CAD declaration only".into(),
+            input_schema: json!({"type":"object","properties":{}}).as_object().unwrap().clone(),
+        });
+        let reply = f.host.generate(&f.binding, &context(&f, &Arc::new(ModelCallBudget::new(20).unwrap())), req).unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!(reply.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(reply.tool_calls[0].name, "execute");
+        assert_eq!(reply.tool_calls[0].arguments["command"], "parameters.change");
+        assert!(reply.text.is_empty());
+        assert!(Arc::ptr_eq(&before_doc, &session.doc));
+        assert_eq!((session.revision, session.undo.len()), (before_revision, before_undo));
+    }
+
+    #[test]
+    fn host_ai_cancel_and_retire_suppress_late_success_and_state() {
+        let pre = fixture(reply_http(cad_body(), &Arc::new(AtomicUsize::new(0))), None);
+        let cancelled = context(&pre, &Arc::new(ModelCallBudget::new(1).unwrap()));
+        cancelled.control.cancel();
+        assert_eq!(pre.host.generate(&pre.binding, &cancelled, request()).unwrap_err().code(), AiErrorCode::Cancelled);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let f = fixture(
+            Arc::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok((200, cad_body().to_string().into_bytes()))
+            }),
+            None,
+        );
+        let ctx = context(&f, &Arc::new(ModelCallBudget::new(20).unwrap()));
+        let control = Arc::clone(&ctx.control);
+        let h = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let pending = std::thread::spawn(move || h.generate(&binding, &ctx, request()));
+        started_rx.recv().unwrap();
+        f.host.retire_session(&f.session).unwrap();
+        assert_eq!(pending.join().unwrap().unwrap_err().code(), AiErrorCode::Cancelled);
+        assert_eq!(control.check(Duration::ZERO, Duration::MAX).unwrap_err().code(), AiErrorCode::Cancelled);
+        // The logically cancelled but blocked physical worker still owns its slot.
+        let permit = host_ai::test_support::admit(&f.shared, "facade").unwrap();
+        assert_eq!(host_ai::test_support::admit(&f.shared, "facade").err().unwrap().code(), AiErrorCode::ResourceExhausted);
+        drop(permit);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            f.host.generate(&f.binding, &context(&f, &Arc::new(ModelCallBudget::new(1).unwrap())), request()).unwrap_err().code(),
+            AiErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn host_ai_preflight_and_turn_budget_are_distinct() {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(reply_http(text_body(), &posts), None);
+        let budget = Arc::new(ModelCallBudget::new(20).unwrap());
+        let mut bad = request();
+        bad.model_id = "wrong".into();
+        assert_eq!(f.host.generate(&f.binding, &context(&f, &budget), bad).unwrap_err().code(), AiErrorCode::InvalidRequest);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        for _ in 0..20 {
+            f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        }
+        assert_eq!(f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap_err().code(), AiErrorCode::ResourceExhausted);
+        assert_eq!(posts.load(Ordering::SeqCst), 20);
+    }
+
+    #[test]
+    fn host_ai_describe_does_not_authenticate_a_runtime() {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(reply_http(text_body(), &posts), None);
+        let description = f.host.describe(&f.binding).unwrap();
+        assert_eq!(description.state, ConnectionState::Available);
+        assert!(description.capabilities.model_generate);
+        assert!(!description.capabilities.agent_run);
+        assert!(!description.capabilities.documents);
+        assert_eq!(description.capabilities.delivery, Delivery::Buffered);
+        let mut config = f.binding.configuration().clone();
+        config.key = true;
+        f.shared.connections().replace(&[config]).unwrap();
+        assert_eq!(f.host.describe(&f.binding).unwrap().state, ConnectionState::AuthRequired);
+        let budget = Arc::new(ModelCallBudget::new(1).unwrap());
+        assert_eq!(f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap_err().code(), AiErrorCode::AuthRequired);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        // No auth-method field is invented in this domain description.
+    }
+
+    #[test]
+    fn host_ai_text_usage_empty_reply_and_deadline_are_exact() {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(reply_http(text_body(), &posts), None);
+        let budget = Arc::new(ModelCallBudget::new(20).unwrap());
+        let reply = f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        assert_eq!(reply.text, ["  exact text  "]);
+        assert_eq!(reply.usage, Some(Usage { input_tokens: Some(7), output_tokens: None, total_tokens: None }));
+        f.now.store(99, Ordering::SeqCst);
+        assert_eq!(f.host.deadline_after(Duration::MAX), Duration::MAX);
+        let mut expired = context(&f, &budget);
+        expired.deadline = Duration::from_secs(99);
+        assert_eq!(f.host.generate(&f.binding, &expired, request()).unwrap_err().code(), AiErrorCode::Timeout);
+        expired.control.cancel();
+        assert_eq!(
+            f.host.generate(&f.binding, &expired, request()).unwrap_err().code(),
+            AiErrorCode::Timeout,
+            "timeout is irreversible, not relabelled cancellation"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn host_ai_preparation_id_reenters_actual_retire_and_cancel() {
+        for retire in [false, true] {
+            let target: Arc<Mutex<Option<(Weak<HostAi>, SessionKey, Arc<CallControl>)>>> = Arc::default();
+            let t = Arc::clone(&target);
+            let ids: IdFn = Arc::new(move || {
+                let (host, session, control) = t.lock().unwrap().clone().unwrap();
+                if retire {
+                    host.upgrade().unwrap().retire_session(&session).unwrap();
+                } else {
+                    control.cancel();
+                }
+                Ok("11111111111111111111111111111111".into())
+            });
+            let f = fixture(reply_http(cad_body(), &Arc::new(AtomicUsize::new(0))), Some(ids));
+            let ctx = context(&f, &Arc::new(ModelCallBudget::new(20).unwrap()));
+            *target.lock().unwrap() = Some((Arc::downgrade(&f.host), f.session.clone(), Arc::clone(&ctx.control)));
+            assert_eq!(f.host.generate(&f.binding, &ctx, request()).unwrap_err().code(), AiErrorCode::Cancelled);
+        }
+    }
+
+    #[test]
+    fn host_ai_paused_prepare_cancel_keeps_parent_usable() {
+        let (paused_tx, paused_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let resume_rx = Mutex::new(resume_rx);
+        let next = AtomicUsize::new(1);
+        let ids: IdFn = Arc::new(move || {
+            let n = next.fetch_add(1, Ordering::SeqCst);
+            if n == 2 {
+                paused_tx.send(()).unwrap();
+                resume_rx.lock().unwrap().recv().unwrap();
+            }
+            Ok(format!("{n:032x}"))
+        });
+        let f = fixture(reply_http(text_body(), &Arc::new(AtomicUsize::new(0))), Some(ids));
+        let budget = Arc::new(ModelCallBudget::new(20).unwrap());
+        let first = f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        let mut next_req = request();
+        next_req.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: first.text.into_iter().map(ContentPart::Text).collect(),
+            tool_calls: first.tool_calls,
+            tool_call_id: None,
+        });
+        next_req.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentPart::Text("next".into())],
+            tool_calls: vec![],
+            tool_call_id: None,
+        });
+        next_req.continuation = first.continuation;
+        let ctx = context(&f, &budget);
+        let control = Arc::clone(&ctx.control);
+        let h = Arc::clone(&f.host);
+        let b = f.binding.clone();
+        let req = next_req.clone();
+        let pending = std::thread::spawn(move || h.generate(&b, &ctx, req));
+        paused_rx.recv().unwrap();
+        control.cancel();
+        resume_tx.send(()).unwrap();
+        assert_eq!(pending.join().unwrap().unwrap_err().code(), AiErrorCode::Cancelled);
+        assert!(f.host.generate(&f.binding, &context(&f, &budget), next_req).unwrap().continuation.is_some());
+    }
+
+    #[test]
+    fn host_ai_remaining_timeout_is_not_direct_chat_minimum() {
+        let f = fixture(
+            Arc::new(|req| {
+                assert_eq!(req.timeout_s, 1);
+                Ok((200, text_body().to_string().into_bytes()))
+            }),
+            None,
+        );
+        f.now.store(99, Ordering::SeqCst);
+        let ctx = context(&f, &Arc::new(ModelCallBudget::new(1).unwrap()));
+        f.host.generate(&f.binding, &ctx, request()).unwrap();
+    }
+
+    #[test]
+    fn host_ai_lower_limits_unsupported_inputs_and_stale_binding_never_debit() {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(reply_http(text_body(), &posts), None);
+        let budget = Arc::new(ModelCallBudget::new(1).unwrap());
+        let mut low = context(&f, &budget);
+        low.limits.text_bytes = 3;
+        assert_eq!(f.host.generate(&f.binding, &low, request()).unwrap_err().code(), AiErrorCode::ResourceExhausted);
+        let mut wrong_scope = context(&f, &budget);
+        wrong_scope.scope.turn_id = "invalid space".into();
+        assert_eq!(f.host.generate(&f.binding, &wrong_scope, request()).unwrap_err().code(), AiErrorCode::InvalidRequest);
+        for option in 0..4 {
+            let mut req = request();
+            match option {
+                0 => req.options.output_schema = Some(json!({"type":"object"}).as_object().unwrap().clone()),
+                1 => req.options.delivery = Delivery::Streaming,
+                2 => req.options.reasoning_effort = Some("invented".into()),
+                _ => req.messages[0].content.push(ContentPart::Document {
+                    name: "x.pdf".into(),
+                    artifact: ArtifactRef { artifact_id: "pdf".into(), digest: [0; 32], size_bytes: 1, media_type: "application/pdf".into() },
+                }),
+            }
+            assert_eq!(f.host.generate(&f.binding, &context(&f, &budget), req).unwrap_err().code(), AiErrorCode::UnsupportedCapability);
+        }
+        let mut req = request();
+        req.continuation = Some(ContinuationId::parse("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap());
+        assert_eq!(f.host.generate(&f.binding, &context(&f, &budget), req).unwrap_err().code(), AiErrorCode::InvalidRequest);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        let mut config = f.binding.configuration().clone();
+        config.base_url = "http://localhost:9090/v1".into();
+        f.shared.connections().replace(&[config]).unwrap();
+        assert_eq!(
+            f.host.generate(&f.binding, &context(&f, &Arc::new(ModelCallBudget::new(1).unwrap())), request()).unwrap_err().code(),
+            AiErrorCode::ConnectionChanged
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn host_ai_one_call_cancel_does_not_cancel_other_call_or_reopen_old_generation() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let attempt = AtomicUsize::new(0);
+        let f = fixture(
+            Arc::new(move |_| {
+                if attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    started_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok((200, cad_body().to_string().into_bytes()))
+            }),
+            None,
+        );
+        let budget = Arc::new(ModelCallBudget::new(20).unwrap());
+        let ctx = context(&f, &budget);
+        let control = Arc::clone(&ctx.control);
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let pending = std::thread::spawn(move || host.generate(&binding, &ctx, request()));
+        started_rx.recv().unwrap();
+        control.cancel();
+        assert_eq!(pending.join().unwrap().unwrap_err().code(), AiErrorCode::Cancelled);
+        let good = f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        assert_eq!(good.tool_calls[0].name, "execute");
+        f.host.retire_session(&f.session).unwrap();
+        f.host.open_session(f.session.clone(), AiLimits::contract_defaults()).unwrap();
+        let mut stale = context(&f, &Arc::new(ModelCallBudget::new(1).unwrap()));
+        stale.control = control;
+        assert_eq!(f.host.generate(&f.binding, &stale, request()).unwrap_err().code(), AiErrorCode::Cancelled);
+        let mut stale_req = request();
+        stale_req.continuation = good.continuation;
+        assert_eq!(
+            f.host.generate(&f.binding, &context(&f, &Arc::new(ModelCallBudget::new(1).unwrap())), stale_req.clone()).unwrap_err().code(),
+            AiErrorCode::InvalidRequest
+        );
+        let replacement = SessionKey { runtime_instance_id: "process-2".into(), session_id: f.session.session_id.clone() };
+        f.host.open_session(replacement.clone(), AiLimits::contract_defaults()).unwrap();
+        let mut replacement_ctx = context(&f, &Arc::new(ModelCallBudget::new(1).unwrap()));
+        replacement_ctx.scope.session = replacement;
+        assert_eq!(f.host.generate(&f.binding, &replacement_ctx, stale_req).unwrap_err().code(), AiErrorCode::InvalidRequest);
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn host_ai_explicit_model_list_and_direct_primitive_use_existing_transport() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let f = fixture(
+            Arc::new(move |req| {
+                seen.lock().unwrap().push(req.method);
+                Ok((
+                    200,
+                    if req.method == "GET" {
+                        json!({"data":[{"id":"chosen","name":"Chosen"}]}).to_string().into_bytes()
+                    } else {
+                        text_body().to_string().into_bytes()
+                    },
+                ))
+            }),
+            None,
+        );
+        assert_eq!(f.host.list_models(&f.binding).unwrap()[0].id, "chosen");
+        let reader: ArtifactReadFn = Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap()));
+        let call = host_ai::messages::prepare_messages(
+            &f.session,
+            &f.binding,
+            &request(),
+            &AiLimits::contract_defaults(),
+            &reader,
+            &host_ai::provider::ProviderState::default(),
+        );
+        let control = TurnControl::new().new_call().unwrap();
+        assert_eq!(f.host.invoke_once(&f.binding, call.unwrap(), &control, Duration::from_secs(100)).unwrap().usage.unwrap().input_tokens, Some(7));
+        assert_eq!(*requests.lock().unwrap(), ["GET", "POST"]);
+    }
+
+    #[test]
+    fn host_ai_current_auth_and_credential_echo_stay_worker_private() {
+        struct Keys(Mutex<Option<String>>);
+        impl backend::Secrets for Keys {
+            fn get(&self, id: &str) -> Result<Option<String>, String> {
+                assert_eq!(id, "facade");
+                Ok(self.0.lock().unwrap().clone())
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unexpected secret mutation".into())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Err("unexpected secret mutation".into())
+            }
+        }
+        let posts = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&posts);
+        let f = fixture(reply_http(text_body(), &Arc::new(AtomicUsize::new(0))), None);
+        let mut config = f.binding.configuration().clone();
+        config.key = true;
+        f.shared.connections().replace(&[config]).unwrap();
+        let keys = Arc::new(Keys(Mutex::new(Some("key-original".into()))));
+        let host = HostAi::new(HostAiDependencies {
+            shared: Arc::clone(&f.shared),
+            secrets: Some(keys.clone()),
+            http: Arc::new(move |req| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let key = if n == 0 { "key-original" } else { "key-rotated" };
+                assert!(req.headers.contains(&("Authorization".into(), format!("Bearer {key}"))));
+                Ok((
+                    200,
+                    if n == 1 { json!({"choices":[{"message":{"content":"key-rotated"},"finish_reason":"stop"}]}) } else { text_body() }
+                        .to_string()
+                        .into_bytes(),
+                ))
+            }),
+            artifacts: Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap())),
+            clock: Arc::new(|| Duration::ZERO),
+            ids: Arc::new(|| Ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())),
+        });
+        host.open_session(f.session.clone(), AiLimits::contract_defaults()).unwrap();
+        assert_eq!(host.describe(&f.binding).unwrap().state, ConnectionState::Available);
+        let budget = Arc::new(ModelCallBudget::new(20).unwrap());
+        host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        *keys.0.lock().unwrap() = Some("key-rotated".into());
+        let err = host.generate(&f.binding, &context(&f, &budget), request()).unwrap_err();
+        assert_eq!(err.code(), AiErrorCode::MalformedResponse);
+        assert!(!format!("{err:?}").contains("key-rotated"));
+        *keys.0.lock().unwrap() = None;
+        assert_eq!(host.describe(&f.binding).unwrap().state, ConnectionState::AuthRequired);
+        assert_eq!(host.generate(&f.binding, &context(&f, &budget), request()).unwrap_err().code(), AiErrorCode::AuthRequired);
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn host_ai_paused_prepare_timeout_and_clock_reentry_cannot_publish() {
+        for retire_on_clock in [false, true] {
+            let (paused_tx, paused_rx) = channel();
+            let (resume_tx, resume_rx) = channel();
+            let resume_rx = Mutex::new(resume_rx);
+            let target: Arc<Mutex<Option<(Weak<HostAi>, SessionKey)>>> = Arc::default();
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let id_armed = Arc::clone(&armed);
+            let f = fixture(reply_http(text_body(), &Arc::new(AtomicUsize::new(0))), None);
+            let clock_now = Arc::clone(&f.now);
+            let clock_target = Arc::clone(&target);
+            let clock_armed = Arc::clone(&armed);
+            let host = Arc::new(HostAi::new(HostAiDependencies {
+                shared: Arc::clone(&f.shared),
+                http: reply_http(text_body(), &Arc::new(AtomicUsize::new(0))),
+                secrets: None,
+                artifacts: Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap())),
+                clock: Arc::new(move || {
+                    if retire_on_clock && clock_armed.swap(false, Ordering::SeqCst) {
+                        let (h, key) = clock_target.lock().unwrap().clone().unwrap();
+                        h.upgrade().unwrap().retire_session(&key).unwrap();
+                    }
+                    Duration::from_secs(clock_now.load(Ordering::SeqCst))
+                }),
+                ids: Arc::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                    id_armed.store(true, Ordering::SeqCst);
+                    Ok("dddddddddddddddddddddddddddddddd".into())
+                }),
+            }));
+            host.open_session(f.session.clone(), AiLimits::contract_defaults()).unwrap();
+            *target.lock().unwrap() = Some((Arc::downgrade(&host), f.session.clone()));
+            let ctx = context(&f, &Arc::new(ModelCallBudget::new(1).unwrap()));
+            let h = Arc::clone(&host);
+            let b = f.binding.clone();
+            let pending = std::thread::spawn(move || h.generate(&b, &ctx, request()));
+            paused_rx.recv().unwrap();
+            if !retire_on_clock {
+                f.now.store(100, Ordering::SeqCst);
+            }
+            resume_tx.send(()).unwrap();
+            assert_eq!(pending.join().unwrap().unwrap_err().code(), if retire_on_clock { AiErrorCode::Cancelled } else { AiErrorCode::Timeout });
+        }
+    }
+
+    #[test]
+    fn host_ai_empty_unknown_and_lower_response_limits_preserve_semantics() {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(reply_http(json!({"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"new-status"}]}), &posts), None);
+        let budget = Arc::new(ModelCallBudget::new(20).unwrap());
+        let first = f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        assert_eq!(first.text, [""]);
+        assert_eq!(first.finish_reason, FinishReason::Unknown);
+        assert_eq!(first.usage, None);
+        let mut req = request();
+        req.continuation = first.continuation;
+        req.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: first.text.into_iter().map(ContentPart::Text).collect(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        });
+        req.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentPart::Text("next".into())],
+            tool_calls: vec![],
+            tool_call_id: None,
+        });
+        f.host.generate(&f.binding, &context(&f, &budget), req).unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        let f = fixture(reply_http(cad_body(), &Arc::new(AtomicUsize::new(0))), None);
+        let budget = Arc::new(ModelCallBudget::new(1).unwrap());
+        let mut low = context(&f, &budget);
+        low.limits.tool_json_bytes = 2;
+        assert_eq!(f.host.generate(&f.binding, &low, request()).unwrap_err().code(), AiErrorCode::ResourceExhausted);
+        assert_eq!(
+            f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap_err().code(),
+            AiErrorCode::ResourceExhausted,
+            "an attempted provider call, even rejected at publication, consumes its budget"
+        );
+    }
+
+    fn c1_reopen(f: &Fixture, bytes: u32) {
+        f.host.retire_session(&f.session).unwrap();
+        let mut limits = AiLimits::contract_defaults();
+        limits.continuation_bytes = bytes;
+        f.host.open_session(f.session.clone(), limits).unwrap();
+    }
+
+    fn c1_context(f: &Fixture, budget: &Arc<ModelCallBudget>, bytes: u32) -> CallContext {
+        let mut ctx = context(f, budget);
+        ctx.limits.continuation_bytes = bytes;
+        ctx
+    }
+
+    fn c1_request(bytes: usize) -> GenerateRequest {
+        let mut req = request();
+        req.messages[0].content = vec![ContentPart::Text("x".repeat(bytes))];
+        req
+    }
+
+    #[test]
+    fn host_ai_c1_original_request_refuses_before_http_ids_and_budget() {
+        // The old two-copy reservation admits 16KiB here. Three live normalized
+        // request owners do not fit this same session's 50,000-byte aggregate.
+        let posts = Arc::new(AtomicUsize::new(0));
+        let ids = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ids);
+        let f = fixture(reply_http(text_body(), &posts), Some(Arc::new(move || Ok(format!("{:032x}", counted.fetch_add(1, Ordering::SeqCst) + 1)))));
+        c1_reopen(&f, 50_000);
+        let budget = Arc::new(ModelCallBudget::new(1).unwrap());
+        let error = f.host.generate(&f.binding, &c1_context(&f, &budget, 50_000), c1_request(16_384)).err();
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "original owner must be charged before dispatch, not at prepare/commit");
+        assert_eq!(ids.load(Ordering::SeqCst), 0);
+        assert_eq!(error.map(|e| e.code()), Some(AiErrorCode::ResourceExhausted));
+        // Same session/generation and the original allowance: no debit or leaked
+        // input/lease reservation may prevent this smaller call from succeeding.
+        f.host.generate(&f.binding, &c1_context(&f, &budget, 50_000), request()).unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!(ids.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn host_ai_c1_live_http_input_is_charged_then_reclaimed_on_failure_or_cancel() {
+        for cancel in [false, true] {
+            let (entered_tx, entered_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            let release_rx = Mutex::new(release_rx);
+            let posts = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&posts);
+            let f = fixture(
+                Arc::new(move |_| {
+                    if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                        return Err("injected transport failure".into());
+                    }
+                    Ok((200, text_body().to_string().into_bytes()))
+                }),
+                None,
+            );
+            c1_reopen(&f, 90_000);
+            let budget = Arc::new(ModelCallBudget::new(2).unwrap());
+            let ctx = c1_context(&f, &budget, 90_000);
+            let control = Arc::clone(&ctx.control);
+            let host = Arc::clone(&f.host);
+            let binding = f.binding.clone();
+            let pending = std::thread::spawn(move || host.generate(&binding, &ctx, c1_request(14_000)));
+            entered_rx.recv().unwrap();
+            let refused = f.host.generate(&f.binding, &c1_context(&f, &budget, 90_000), c1_request(14_000)).err().map(|e| e.code());
+            let while_held_posts = posts.load(Ordering::SeqCst);
+            if cancel {
+                control.cancel();
+            } else {
+                release_tx.send(()).unwrap();
+            }
+            let terminal = pending.join().unwrap().unwrap_err().code();
+            // With cancellation the physical HTTP still runs. The original normalized
+            // input is already destroyed with its waiter, so its aggregate may be reused.
+            let reclaimed = f.host.generate(&f.binding, &c1_context(&f, &budget, 90_000), c1_request(14_000));
+            if cancel {
+                release_tx.send(()).unwrap();
+            }
+            assert_eq!(refused, Some(AiErrorCode::ResourceExhausted));
+            assert_eq!(while_held_posts, 1, "a live original input is not uncharged caller memory");
+            assert_eq!(terminal, if cancel { AiErrorCode::Cancelled } else { AiErrorCode::TransportError });
+            assert!(reclaimed.is_ok(), "same-generation input/lease quota and unused second debit must be reusable: {reclaimed:?}");
+            assert_eq!(posts.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn host_ai_c1_paused_id_failure_releases_input_without_consuming_parent() {
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let ids = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ids);
+        let posts = Arc::new(AtomicUsize::new(0));
+        let f = fixture(
+            reply_http(text_body(), &posts),
+            Some(Arc::new(move || {
+                let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 2 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                    return Err(ModelCallBudget::new(0).err().unwrap());
+                }
+                Ok(format!("{n:032x}"))
+            })),
+        );
+        c1_reopen(&f, 96_000);
+        let budget = Arc::new(ModelCallBudget::new(4).unwrap());
+        let root = c1_request(4096);
+        let public = f.host.generate(&f.binding, &c1_context(&f, &budget, 96_000), root.clone()).unwrap();
+        let mut next = root;
+        next.continuation = public.continuation;
+        next.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: public.text.into_iter().map(ContentPart::Text).collect(),
+            tool_calls: public.tool_calls,
+            tool_call_id: None,
+        });
+        next.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentPart::Text("y".repeat(4096))],
+            tool_calls: vec![],
+            tool_call_id: None,
+        });
+        let ctx = c1_context(&f, &budget, 96_000);
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let req = next.clone();
+        let pending = std::thread::spawn(move || host.generate(&binding, &ctx, req));
+        entered_rx.recv().unwrap();
+        let refused = f.host.generate(&f.binding, &c1_context(&f, &budget, 96_000), c1_request(16_384)).err().map(|e| e.code());
+        let held_posts = posts.load(Ordering::SeqCst);
+        let held_ids = ids.load(Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        let failed = pending.join().unwrap().unwrap_err().code();
+        let successor = f.host.generate(&f.binding, &c1_context(&f, &budget, 96_000), next);
+        assert_eq!(refused, Some(AiErrorCode::ResourceExhausted));
+        assert_eq!((held_posts, held_ids), (2, 2), "pause retains original input plus lease/prepared-workspace capacity before any other HTTP/IDs");
+        assert_eq!(failed, AiErrorCode::InvalidRequest);
+        assert!(successor.is_ok(), "failed unpublished successor must refund original input and retain its parent: {successor:?}");
+        assert_eq!(posts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn host_ai_c1_retired_paused_input_refunds_only_its_original_generation() {
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let next_id = AtomicUsize::new(1);
+        let f = fixture(
+            reply_http(text_body(), &Arc::new(AtomicUsize::new(0))),
+            Some(Arc::new(move || {
+                let n = next_id.fetch_add(1, Ordering::SeqCst);
+                if n == 1 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok(format!("{n:032x}"))
+            })),
+        );
+        c1_reopen(&f, 90_000);
+        let ctx = c1_context(&f, &Arc::new(ModelCallBudget::new(1).unwrap()), 90_000);
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let pending = std::thread::spawn(move || host.generate(&binding, &ctx, c1_request(14_000)));
+        entered_rx.recv().unwrap();
+        c1_reopen(&f, 90_000);
+        let budget = Arc::new(ModelCallBudget::new(2).unwrap());
+        let replacement = f.host.generate(&f.binding, &c1_context(&f, &budget, 90_000), c1_request(14_000));
+        release_tx.send(()).unwrap();
+        let old = pending.join().unwrap().unwrap_err().code();
+        assert!(replacement.is_ok(), "old held input must not charge replacement generation: {replacement:?}");
+        assert_eq!(old, AiErrorCode::Cancelled);
+        f.host.generate(&f.binding, &c1_context(&f, &budget, 90_000), request()).unwrap();
+    }
+
+    fn r1_turn_generation_rebind(change: u8) {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&posts);
+        let ids = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ids);
+        let f = fixture(
+            Arc::new(move |req| {
+                assert_eq!(req.method, "POST");
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = if req.url.ends_with("/messages") {
+                    json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn"})
+                } else {
+                    text_body()
+                };
+                Ok((200, body.to_string().into_bytes()))
+            }),
+            Some(Arc::new(move || Ok(format!("{:032x}", counted.fetch_add(1, Ordering::SeqCst) + 1)))),
+        );
+        let budget = Arc::new(ModelCallBudget::new(2).unwrap());
+        f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        let mut changed = f.binding.configuration().clone();
+        match change {
+            0 => changed.base_url = "http://localhost:9090/v1".into(),
+            1 => changed.request_timeout_s = 120,
+            2 => changed.reasoning_effort = "high".into(),
+            3 => changed.kind = agents::Kind::Anthropic,
+            _ => changed.request_timeout_s = 30,
+        }
+        f.shared.connections().replace(&[changed]).unwrap();
+        let rebound = f.shared.connections().bind("facade", "chosen").unwrap();
+        let refused = f.host.generate(&rebound, &context(&f, &budget), request());
+        assert_eq!(refused.err().map(|e| e.code()), Some(AiErrorCode::ConnectionChanged), "a fresh binding must not retarget an admitted turn");
+        assert_eq!((posts.load(Ordering::SeqCst), ids.load(Ordering::SeqCst)), (1, 1));
+        // Failure must not replace the original pin with the rebound generation.
+        assert_eq!(f.host.generate(&rebound, &context(&f, &budget), request()).unwrap_err().code(), AiErrorCode::ConnectionChanged);
+        let mut fresh = context(&f, &Arc::new(ModelCallBudget::new(1).unwrap()));
+        fresh.scope.turn_id = "fresh-turn".into();
+        let mut fresh_request = request();
+        fresh_request.options.timeout_seconds = if change == 4 { 30 } else { 60 };
+        f.host.generate(&rebound, &fresh, fresh_request.clone()).unwrap();
+        assert_eq!((posts.load(Ordering::SeqCst), ids.load(Ordering::SeqCst)), (2, 2));
+        // Probe the *real* shared allowance through the existing direct primitive,
+        // not a test-only getter or a second budget. The refusal used no debit.
+        let reader: ArtifactReadFn = Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap()));
+        let mut call = host_ai::messages::prepare_messages(
+            &f.session,
+            &rebound,
+            &fresh_request,
+            &AiLimits::contract_defaults(),
+            &reader,
+            &host_ai::provider::ProviderState::default(),
+        )
+        .unwrap();
+        call.model_budget = Some(Arc::clone(&budget));
+        f.host.invoke_once(&rebound, call, &TurnControl::new().new_call().unwrap(), Duration::from_secs(100)).unwrap();
+        assert_eq!((posts.load(Ordering::SeqCst), ids.load(Ordering::SeqCst)), (3, 2));
+    }
+
+    #[test]
+    fn host_ai_r1_turn_generation_pins_endpoint() {
+        r1_turn_generation_rebind(0);
+    }
+    #[test]
+    fn host_ai_r1_turn_generation_pins_timeout() {
+        r1_turn_generation_rebind(1);
+    }
+    #[test]
+    fn host_ai_r1_turn_generation_pins_lower_timeout_before_option_preflight() {
+        r1_turn_generation_rebind(4);
+    }
+    #[test]
+    fn host_ai_r1_turn_generation_pins_reasoning() {
+        r1_turn_generation_rebind(2);
+    }
+    #[test]
+    fn host_ai_r1_turn_generation_pins_protocol() {
+        r1_turn_generation_rebind(3);
+    }
+
+    #[test]
+    fn host_ai_r1_turn_generation_preserves_live_key_picker_and_display() {
+        struct Keys(Mutex<String>);
+        impl backend::Secrets for Keys {
+            fn get(&self, id: &str) -> Result<Option<String>, String> {
+                assert_eq!(id, "facade");
+                Ok(Some(self.0.lock().unwrap().clone()))
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("read-only test store".into())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Err("read-only test store".into())
+            }
+        }
+        let posts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&posts);
+        let keys = Arc::new(Keys(Mutex::new("key-a".into())));
+        let mut f = fixture(reply_http(text_body(), &Arc::new(AtomicUsize::new(0))), None);
+        let id = AtomicUsize::new(1);
+        f.host = Arc::new(HostAi::new(HostAiDependencies {
+            shared: Arc::clone(&f.shared),
+            secrets: Some(keys.clone()),
+            http: Arc::new(move |req| {
+                let n = observed.fetch_add(1, Ordering::SeqCst);
+                let authorization = req.headers.iter().find(|(name, _)| name == "Authorization").map(|(_, value)| value.as_str());
+                assert_eq!(
+                    authorization,
+                    match n {
+                        1 => Some("Bearer key-a"),
+                        2 => Some("Bearer key-b"),
+                        _ => None,
+                    }
+                );
+                let body: Value = serde_json::from_slice(req.body.as_ref().unwrap()).unwrap();
+                assert_eq!(body["model"], "chosen", "the live picker is not the admitted selection");
+                Ok((200, text_body().to_string().into_bytes()))
+            }),
+            artifacts: Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap())),
+            clock: Arc::new(|| Duration::ZERO),
+            ids: Arc::new(move || Ok(format!("{:032x}", id.fetch_add(1, Ordering::SeqCst)))),
+        }));
+        f.host.open_session(f.session.clone(), AiLimits::contract_defaults()).unwrap();
+        let budget = Arc::new(ModelCallBudget::new(4).unwrap());
+        f.host.generate(&f.binding, &context(&f, &budget), request()).unwrap();
+        let mut config = f.binding.configuration().clone();
+        config.key = true;
+        config.name = "new display".into();
+        config.model = "different-picker".into();
+        f.shared.connections().replace(&[config.clone()]).unwrap();
+        let rebound = f.shared.connections().bind("facade", "chosen").unwrap();
+        f.host.generate(&rebound, &context(&f, &budget), request()).unwrap();
+        *keys.0.lock().unwrap() = "key-b".into();
+        f.host.generate(&rebound, &context(&f, &budget), request()).unwrap();
+        config.key = false;
+        config.name = "third display".into();
+        config.model = "another-picker".into();
+        f.shared.connections().replace(&[config]).unwrap();
+        f.host.generate(&f.shared.connections().bind("facade", "chosen").unwrap(), &context(&f, &budget), request()).unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 4);
+    }
+
+    // A timeout below is only a deadlock watchdog; success never depends on elapsed
+    // time. Wait for a completion message BEFORE joining the corresponding thread.
+    const R1_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
+    fn r1_duplicate_control(variant: u8) {
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let posts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&posts);
+        let ids = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ids);
+        let f = fixture(
+            Arc::new(move |_| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+                }
+                Ok((200, text_body().to_string().into_bytes()))
+            }),
+            Some(Arc::new(move || Ok(format!("{:032x}", counted.fetch_add(1, Ordering::SeqCst) + 1)))),
+        );
+        let budget = Arc::new(ModelCallBudget::new(2).unwrap());
+        let owner = context(&f, &budget);
+        let control = Arc::clone(&owner.control);
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let (done_tx, done_rx) = channel();
+        let first = std::thread::spawn(move || {
+            let _ = done_tx.send(host.generate(&binding, &owner, request()));
+        });
+        entered_rx.recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+        let mut duplicate = context(&f, &budget);
+        duplicate.control = Arc::clone(&control);
+        let mut bad = request();
+        let other_session = SessionKey { runtime_instance_id: f.session.runtime_instance_id.clone(), session_id: "other-session".into() };
+        match variant {
+            1 => bad.model_id = "wrong".into(),
+            2 => duplicate.deadline = Duration::ZERO,
+            3 => duplicate.limits.text_bytes = 1,
+            4 => duplicate.scope.workflow_run_id = "other-workflow".into(),
+            5 => {
+                f.host.open_session(other_session.clone(), AiLimits::contract_defaults()).unwrap();
+                duplicate.scope.session = other_session.clone();
+                duplicate.model_budget = Arc::new(ModelCallBudget::new(1).unwrap());
+            }
+            6 => duplicate.limits.continuation_bytes = 50_000,
+            _ => {}
+        }
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let (b_tx, b_rx) = channel();
+        let second = std::thread::spawn(move || {
+            let _ = b_tx.send(host.generate(&binding, &duplicate, bad));
+        });
+        let refused = b_rx.recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+        second.join().unwrap();
+        if variant == 5 {
+            f.host.retire_session(&other_session).unwrap();
+        }
+        let still_active = control.check(Duration::ZERO, Duration::MAX);
+        let before_release = (posts.load(Ordering::SeqCst), ids.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        let answer = done_rx.recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+        first.join().unwrap();
+        assert_eq!(
+            refused.err().map(|e| e.code()),
+            Some(AiErrorCode::InvalidRequest),
+            "duplicate admission takes precedence over unowned input/deadline mutations"
+        );
+        assert!(still_active.is_ok(), "rejected B must neither cancel nor time out A: {still_active:?}");
+        assert_eq!(before_release, (1, 0), "only the original owner may dispatch/prepare");
+        let answer = answer.unwrap();
+        assert!(answer.continuation.is_some());
+        let mut next = request();
+        next.continuation = answer.continuation;
+        next.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: answer.text.into_iter().map(ContentPart::Text).collect(),
+            tool_calls: answer.tool_calls,
+            tool_call_id: None,
+        });
+        next.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentPart::Text("next".into())],
+            tool_calls: vec![],
+            tool_call_id: None,
+        });
+        f.host.generate(&f.binding, &context(&f, &budget), next).unwrap();
+        assert_eq!((posts.load(Ordering::SeqCst), ids.load(Ordering::SeqCst)), (2, 2), "B used no allowance, IDs or parent successor");
+    }
+
+    #[test]
+    fn host_ai_r1_control_claim_rejects_duplicate() {
+        r1_duplicate_control(0);
+    }
+    #[test]
+    fn host_ai_r1_control_claim_rejects_malformed_duplicate() {
+        r1_duplicate_control(1);
+    }
+    #[test]
+    fn host_ai_r1_control_claim_rejects_expired_duplicate() {
+        r1_duplicate_control(2);
+    }
+    #[test]
+    fn host_ai_r1_control_claim_rejects_lower_limit_duplicate() {
+        r1_duplicate_control(3);
+    }
+    #[test]
+    fn host_ai_r1_control_claim_rejects_scope_mismatch_duplicate() {
+        r1_duplicate_control(4);
+    }
+    #[test]
+    fn host_ai_r1_control_claim_rejects_cross_session_retire() {
+        r1_duplicate_control(5);
+    }
+    #[test]
+    fn host_ai_r1_control_claim_rejects_lower_continuation_duplicate() {
+        r1_duplicate_control(6);
+    }
+
+    #[test]
+    fn host_ai_r1_control_claim_precedes_first_external_clock() {
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let clocks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&clocks);
+        let posts = Arc::new(AtomicUsize::new(0));
+        let mut f = fixture(reply_http(text_body(), &posts), None);
+        let ids = AtomicUsize::new(1);
+        f.host = Arc::new(HostAi::new(HostAiDependencies {
+            shared: Arc::clone(&f.shared),
+            http: reply_http(text_body(), &posts),
+            secrets: None,
+            artifacts: Arc::new(|_, _| Err(ModelCallBudget::new(0).err().unwrap())),
+            clock: Arc::new(move || {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+                }
+                Duration::ZERO
+            }),
+            ids: Arc::new(move || Ok(format!("{:032x}", ids.fetch_add(1, Ordering::SeqCst)))),
+        }));
+        f.host.open_session(f.session.clone(), AiLimits::contract_defaults()).unwrap();
+        let budget = Arc::new(ModelCallBudget::new(1).unwrap());
+        let owner = context(&f, &budget);
+        let control = Arc::clone(&owner.control);
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let (done_tx, done_rx) = channel();
+        let first = std::thread::spawn(move || {
+            let _ = done_tx.send(host.generate(&binding, &owner, request()));
+        });
+        entered_rx.recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+        let mut duplicate = context(&f, &budget);
+        duplicate.control = Arc::clone(&control);
+        duplicate.deadline = Duration::ZERO;
+        let host = Arc::clone(&f.host);
+        let binding = f.binding.clone();
+        let (b_tx, b_rx) = channel();
+        let second = std::thread::spawn(move || {
+            let _ = b_tx.send(host.generate(&binding, &duplicate, request()));
+        });
+        let refused = b_rx.recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+        second.join().unwrap();
+        let before_release = clocks.load(Ordering::SeqCst);
+        let active = control.check(Duration::ZERO, Duration::MAX);
+        release_tx.send(()).unwrap();
+        let result = done_rx.recv_timeout(R1_DEADLOCK_GUARD).unwrap();
+        first.join().unwrap();
+        assert_eq!(refused.err().map(|e| e.code()), Some(AiErrorCode::InvalidRequest));
+        assert_eq!(before_release, 1, "an unowned B must not invoke its clock/check before rejection");
+        assert!(active.is_ok());
+        assert!(result.unwrap().continuation.is_some());
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn host_ai_continuation_domain_ids_are_opaque_validated_values() {
+    use host_ai::{AiErrorCode, ContinuationId};
+    for bad in ["", "0123456789abcdef", "0123456789ABCDEF0123456789ABCDEF", "../../0123456789abcdef0123456789", "0000000000000000000000000000000g"] {
+        assert_eq!(ContinuationId::parse(bad).err().unwrap().code(), AiErrorCode::InvalidRequest);
+    }
+    let id = ContinuationId::parse("0123456789abcdef0123456789abcdef").unwrap();
+    assert_eq!(id.as_str(), "0123456789abcdef0123456789abcdef");
+    let a = host_ai::continuation::random_id().unwrap();
+    let b = host_ai::continuation::random_id().unwrap();
+    assert_eq!(ContinuationId::parse(&a).unwrap().as_str(), a);
+    assert_eq!(ContinuationId::parse(&b).unwrap().as_str(), b);
+    assert_ne!(a, b);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn host_ai_normalized_domain_binding_and_options_preflight() {
+    use host_ai::provider::ProviderState;
+    use host_ai::{
+        AiErrorCode, AiLimits, AiShared, ArtifactReadFn, ContentPart, Delivery, GenerateOptions, GenerateRequest, MessageRole, ModelMessage,
+        SessionKey,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let shared = AiShared::default();
+    let config = agents::AgentConfig {
+        id: "domain-5".into(),
+        kind: agents::Kind::Api,
+        base_url: "https://models.example/v1".into(),
+        reasoning_effort: "high".into(),
+        ..Default::default()
+    };
+    shared.connections().replace(&[config]).unwrap();
+    let binding = shared.connections().bind("domain-5", "chosen").unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    let reader: ArtifactReadFn = Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Err(host_ai::ModelCallBudget::new(0).err().unwrap())
+    });
+    let session = SessionKey { runtime_instance_id: "runtime".into(), session_id: "session".into() };
+    let mut request = GenerateRequest {
+        connection_id: "domain-5".into(),
+        model_id: "chosen".into(),
+        messages: vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentPart::Text("hello".into())],
+            tool_calls: vec![],
+            tool_call_id: None,
+        }],
+        tools: vec![],
+        options: GenerateOptions {
+            delivery: Delivery::Buffered,
+            timeout_seconds: 5,
+            max_output_tokens: Some(23),
+            temperature: Some(0.5),
+            reasoning_effort: None,
+            output_schema: None,
+        },
+        continuation: None,
+    };
+    let mut limits = AiLimits::contract_defaults();
+    limits.call_max_seconds = 5;
+    limits.http_per_connection = 1;
+    limits.http_per_host = 2;
+    let prepare =
+        |request: &GenerateRequest| host_ai::messages::prepare_messages(&session, &binding, request, &limits, &reader, &ProviderState::default());
+    let call = prepare(&request).unwrap();
+    assert_eq!(call.reasoning_effort.as_deref(), Some("high"), "consume the frozen default, not a live picker value");
+    assert_eq!(
+        (call.max_output_tokens, call.temperature, call.timeout_seconds, call.http_per_connection, call.http_per_host),
+        (Some(23), Some(0.5), 5, 1, 2)
+    );
+    for (connection, model) in [("other", "chosen"), ("domain-5", "other")] {
+        request.connection_id = connection.into();
+        request.model_id = model.into();
+        assert_eq!(prepare(&request).err().unwrap().code(), AiErrorCode::InvalidRequest);
+    }
+    request.connection_id = "domain-5".into();
+    request.model_id = "chosen".into();
+    request.options.timeout_seconds = 6;
+    assert_eq!(prepare(&request).err().unwrap().code(), AiErrorCode::InvalidRequest);
+    request.options.timeout_seconds = 5;
+    request.options.delivery = Delivery::Streaming;
+    assert_eq!(prepare(&request).err().unwrap().code(), AiErrorCode::UnsupportedCapability);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+}
+
 fn transcript_clipboard_harness(layout: crate::shell::LayoutMode) -> crate::scenario::Harness {
     let mut h = narrow_chat();
     h.app.ui.layout = layout;
@@ -2231,7 +3765,9 @@ fn a_listing_that_fails_says_why_and_keeps_the_list_of_last_time() {
         poll(&mut app, &ctx);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(app.agent_chat.models_note.as_deref().is_some_and(|note| note.contains("offline")), "{:?}", app.agent_chat.models_note);
+    // The note names a safe failure classification; arbitrary transport text never reaches it.
+    let safe = trf("ui.agent_chat_models_failed", &[("error", tr("ui.host_ai_model_failed"))]);
+    assert_eq!(app.agent_chat.models_note.as_deref(), Some(safe.as_str()));
     assert_eq!(ids(&app), ["m"]);
     assert!(models_shown(&app));
     disconnect(&mut app);

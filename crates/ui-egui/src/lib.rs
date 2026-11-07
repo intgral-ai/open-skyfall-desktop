@@ -482,6 +482,9 @@ pub struct Services {
     pub browser_files: Option<Box<dyn Fn()>>,
     /// HTTP for the agent chat's API agents (OpenAI-compatible and Anthropic-compatible endpoints); None: no API agents.
     pub agent_http: Option<agent_chat::backend::HttpFn>,
+    /// Native per-window catalog and explicitly injected physical HTTP pool.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub agent_ai: std::sync::Arc<agent_chat::host_ai::AiShared>,
     /// The system keychain, for API agents' keys; None: keys can't be stored.
     pub secrets: Option<std::sync::Arc<dyn agent_chat::backend::Secrets>>,
     /// Upload a model to EasyPrint (Printables' slicer in the browser) and answer with the address
@@ -1164,6 +1167,10 @@ impl SolveApp {
             }
             self.ui.layout = p.layout;
             self.preferences = p;
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Err(error) = agent_chat::sync_ai_connections(self) {
+                agent_chat::ai_sync_failed(self, error);
+            }
         }
         // Before a design given at start opens: its paths follow the network preferences.
         prefs::sync_surface_analysis(self);

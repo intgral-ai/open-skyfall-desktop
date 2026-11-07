@@ -4352,6 +4352,7 @@ dependencies = [
  "arboard",
  "egui",
  "egui-wgpu",
+ "getrandom 0.3.4",
  "image",
  "log",
  "minisign-verify",

@@ -312,7 +312,7 @@ Grok Build also supports `XAI_API_KEY` for users who choose API authentication.
 - An endpoint's card under Preferences → AI → **Agents** has the same **Model** picker. While the
   agent isn't running, opening the picker lists the models (just viewing the page asks nothing),
   and a pick becomes the model for its next connection. While it runs, a pick changes the chat's
-  model at once.
+  next message's model; a message already running keeps its chosen model.
 - The key goes into the system keychain (Keychain on macOS, Credential Manager on Windows, the
   Secret Service on Linux) and is only ever sent over HTTPS or to this computer. **Test** asks an
   OpenAI-compatible endpoint for its models; an Anthropic-compatible one gets a short message,
@@ -321,7 +321,7 @@ Grok Build also supports `XAI_API_KEY` for users who choose API authentication.
   coding agent, and no cap on model requests per message (Stop ends it). **Request timeout** is how long one model request may
   take: 300 s by default, from 30 s to an hour. A slow local model (a large model on modest
   hardware, or a long message with many tool results) may need more; raise it here or in the
-  endpoint's entry under **Agents**, where a change applies from the next request. A request that
+  endpoint's entry under **Agents**, where a change applies to the next message. A request that
   runs out of time ends the message with the limit it hit and where to raise it. **Reasoning
   effort** is optional and empty by default: nothing is sent and the provider's own default
   applies. When set, the value goes out as `reasoning_effort` on each `/chat/completions`
@@ -334,8 +334,23 @@ protocol, endpoint, model and request timeout, and **Save** changes it in place:
 its permission setting and the tools you always allow for it. A stored key is never shown: leave
 the key field empty to keep it, or type a new one to replace it. A saved key still only goes to
 HTTPS or this computer, so moving an endpoint with a key to a plain `http://` address elsewhere is
-refused. The running conversation takes a new request timeout at once; a new command, endpoint
-or model applies the next time the agent connects.
+refused. Each physical request reads this connection's current key from the original system-keychain
+entry, on a worker, including model listings and explicit compatibility retries. Replacing a key
+therefore affects the next call without reconnecting. A required key that was deleted prevents
+the request; SolidCraft does not fall back to an earlier key.
+
+An accepted message pins its endpoint, protocol, timeout, reasoning defaults and chosen model.
+Editing invocation settings invalidates that active message instead of moving it to a different
+endpoint. Timeout and reasoning edits take effect on the next message; protocol changes require
+reconnecting so that one protocol's history is never replayed through another.
+
+API replies are buffered, not streamed. **Stop** revokes the message and discards late text and
+tool proposals; it cannot interrupt a network call already running. That physical call keeps its
+HTTP slot until the host HTTP function exits. Direct chat and the native one-step HostAi service
+share a process-wide ceiling of two physical calls per original connection ID and eight across
+all windows. Each window has its own connection catalog. At capacity a call is refused rather
+than queued. HostAi itself does not execute tools or run chat rounds; this does not add a runtime
+execution selector to the panel or claim any Mastra wire integration.
 
 For Ollama, choosing a model checks its reported capabilities in the background. If its
 capabilities list lacks `tools`, a warning below the model picker explains that the model can

@@ -144,7 +144,13 @@ struct ModelListing {
 /// List an endpoint's models in the background, one listing at a time; a finished one stays until
 /// it is asked for again. `secret` runs on that thread too: a keychain may take its time to answer.
 #[cfg(not(target_arch = "wasm32"))]
-fn start_listing(app: &mut SolveApp, ctx: &egui::Context, key: ListingKey, secret: impl FnOnce() -> Result<Option<String>, String> + Send + 'static) {
+fn start_listing(
+    app: &mut SolveApp,
+    ctx: &egui::Context,
+    key: ListingKey,
+    connection: Option<(Arc<host_ai::HostAi>, host_ai::ConnectionBinding)>,
+    secret: impl FnOnce() -> Result<Option<String>, String> + Send + 'static,
+) {
     let state = &mut app.agent_chat.settings;
     if state.listing.is_some() || state.endpoint_models.contains_key(&key) {
         return;
@@ -162,10 +168,13 @@ fn start_listing(app: &mut SolveApp, ctx: &egui::Context, key: ListingKey, secre
     let wake = ctx.clone();
     let spawned = std::thread::Builder::new().name("endpoint-models".into()).spawn(move || {
         let _language = crate::i18n::scope(language);
-        let list = secret().and_then(|secret| match protocol {
-            Protocol::OpenAi => super::api_client::model_list(&http, &url, secret.as_deref()),
-            Protocol::Anthropic => super::api_client::anthropic_model_list(&http, &url, secret.as_deref()),
-        });
+        let list = match connection {
+            Some((host, binding)) => host.list_models(&binding).map_err(|error| error.message()),
+            None => secret().and_then(|secret| match protocol {
+                Protocol::OpenAi => super::api_client::model_list(&http, &url, secret.as_deref()),
+                Protocol::Anthropic => super::api_client::anthropic_model_list(&http, &url, secret.as_deref()),
+            }),
+        };
         let _ = tx.send(list);
         wake.request_repaint();
     });
@@ -192,11 +201,13 @@ pub(super) fn poll_listing(app: &mut SolveApp, ctx: &egui::Context) {
         state.listing = None;
     }
     let Some((key, agent)) = state.card_listing.take() else { return };
-    let secrets = app.services.secrets.clone().filter(|_| key.2);
-    start_listing(app, ctx, key, move || match secrets {
-        Some(secrets) => secrets.get(&agent).map_err(|e| trf("ui.ai_keychain_error", &[("error", &e)])),
-        None => Ok(None),
-    });
+    let model = app.preferences.agents.iter().find(|c| c.id == agent).map(|c| c.model.as_str()).unwrap_or("");
+    match direct_host_ai(app).and_then(|host| host.bind(&agent, model).map(|binding| (host, binding))) {
+        Ok(connection) => start_listing(app, ctx, key, Some(connection), || Ok(None)),
+        Err(error) => {
+            app.agent_chat.settings.endpoint_models.insert(key, Err(error.message()));
+        }
+    }
 }
 
 /// The Add dialog's listing, of what its fields said when last left, never of a half-typed address.
@@ -222,8 +233,13 @@ fn list_for_dialog(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let typed = typed.filter(|_| key.2);
     let stored = stored.filter(|_| key.2).and_then(|agent| app.services.secrets.clone().map(|secrets| (secrets, agent)));
-    start_listing(app, ctx, key, move || match stored {
-        Some((secrets, agent)) => secrets.get(&agent).map_err(|e| trf("ui.ai_keychain_error", &[("error", &e)])),
+    start_listing(app, ctx, key, None, move || match stored {
+        Some((secrets, agent)) => secrets
+            .get(&agent)
+            .map_err(|_| tr("ui.host_ai_key_unavailable").to_string())?
+            .filter(|key| !key.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| tr("ui.ai_http_key").to_string()),
         None => Ok(typed),
     });
 }
@@ -376,7 +392,7 @@ pub(super) fn choose_preset(s: &mut AddState, protocol: Protocol, index: usize) 
 /// Run a connection test in the background (it starts the agent briefly, or asks the endpoint
 /// for its models).
 #[cfg(not(target_arch = "wasm32"))]
-fn start_test(app: &SolveApp, e: &agents::Entry, key: Option<String>) -> Test {
+fn start_test(app: &SolveApp, e: &agents::Entry, secret: impl FnOnce() -> Result<Option<String>, String> + Send + 'static) -> Test {
     let (tx, rx) = std::sync::mpsc::channel();
     match e.kind {
         Kind::Acp => {
@@ -385,18 +401,25 @@ fn start_test(app: &SolveApp, e: &agents::Entry, key: Option<String>) -> Test {
                 let _ = tx.send(super::acp_client::test_agent(&argv, &working_dir()));
             });
         }
-        Kind::Api => {
+        Kind::Api | Kind::Anthropic if e.id.is_empty() => {
+            // Explicit unsaved dialog test. Its edited URL/key are not a saved connection binding.
             let Some(http) = app.services.agent_http.clone() else { return Test::Done(Err(TestError::Other(tr("ui.ai_no_http").to_string()))) };
-            let (url, model) = (e.base_url.clone(), e.model.clone());
+            let (kind, url, model) = (e.kind, e.base_url.clone(), e.model.clone());
             std::thread::spawn(move || {
-                let _ = tx.send(super::api_client::test_endpoint(&http, &url, key.as_deref(), &model).map_err(TestError::Other));
+                let result = secret().and_then(|key| match kind {
+                    Kind::Anthropic => super::api_client::test_anthropic_endpoint(&http, &url, key.as_deref(), &model),
+                    _ => super::api_client::test_endpoint(&http, &url, key.as_deref(), &model),
+                });
+                let _ = tx.send(result.map_err(TestError::Other));
             });
         }
-        Kind::Anthropic => {
-            let Some(http) = app.services.agent_http.clone() else { return Test::Done(Err(TestError::Other(tr("ui.ai_no_http").to_string()))) };
-            let (url, model) = (e.base_url.clone(), e.model.clone());
+        Kind::Api | Kind::Anthropic => {
+            let (host, binding) = match direct_host_ai(app).and_then(|host| host.bind(&e.id, &e.model).map(|binding| (host, binding))) {
+                Ok(connection) => connection,
+                Err(error) => return Test::Done(Err(TestError::Other(error.message()))),
+            };
             std::thread::spawn(move || {
-                let _ = tx.send(super::api_client::test_anthropic_endpoint(&http, &url, key.as_deref(), &model).map_err(TestError::Other));
+                let _ = tx.send(host.test_connection(&binding).map_err(|error| TestError::Other(error.message())));
             });
         }
     }
@@ -925,8 +948,7 @@ fn agents_section(app: &mut SolveApp, ui: &mut egui::Ui) {
         });
     });
     if let Some(e) = test {
-        let key = if e.key { app.services.secrets.as_ref().and_then(|s| s.get(&e.id).ok().flatten()) } else { None };
-        let started = start_test(app, &e, key);
+        let started = start_test(app, &e, || Ok(None));
         app.agent_chat.settings.tests.insert(e.id.clone(), started);
     }
     if let Some(id) = edit {
@@ -971,8 +993,10 @@ fn agents_section(app: &mut SolveApp, ui: &mut egui::Ui) {
         app.preferences.agents.retain(|a| a.id != id);
         app.preferences.agent_permissions.remove(&id);
         app.preferences.agent_always_allow.remove(&id);
-        if let Some(s) = &app.services.secrets {
-            let _ = s.delete(&id);
+        if let Some(s) = &app.services.secrets
+            && s.delete(&id).is_err()
+        {
+            app.agent_chat.notice(tr("ui.host_ai_key_unavailable"), true);
         }
         if app.agent_chat.agent_id.as_deref() == Some(id.as_str()) {
             app.agent_chat.agent_id = None;
@@ -984,6 +1008,10 @@ fn agents_section(app: &mut SolveApp, ui: &mut egui::Ui) {
     }
     if app.agent_chat.settings.tests.values().any(|t| matches!(t, Test::Running(_))) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(error) = sync_ai_connections(app) {
+        ai_sync_failed(app, error);
     }
 }
 
@@ -1188,12 +1216,22 @@ pub fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
             };
             // Editing with the key field left empty tests with the stored key, which is only ever
             // sent where a saved key may go (HTTPS or this computer).
-            let key = Some(s.key.trim().to_string()).filter(|k| !k.is_empty()).or_else(|| {
-                let id = s.editing.as_deref().filter(|_| s.saved_key && url.as_deref().is_ok_and(agents::key_safe_for))?;
-                app.services.secrets.as_ref().and_then(|store| store.get(id).ok().flatten())
-            });
+            let key = Some(s.key.trim().to_string()).filter(|k| !k.is_empty());
+            let stored = s
+                .editing
+                .clone()
+                .filter(|_| key.is_none() && s.saved_key && url.as_deref().is_ok_and(agents::key_safe_for))
+                .and_then(|id| app.services.secrets.clone().map(|store| (store, id)));
             let result = match url {
-                Ok(_) => start_test(app, &e, key),
+                Ok(_) => start_test(app, &e, move || match stored {
+                    Some((store, id)) => store
+                        .get(&id)
+                        .map_err(|_| tr("ui.host_ai_key_unavailable").to_string())?
+                        .filter(|key| !key.trim().is_empty())
+                        .map(Some)
+                        .ok_or_else(|| tr("ui.ai_http_key").to_string()),
+                    None => Ok(key),
+                }),
                 Err(err) => Test::Done(Err(TestError::Other(err))),
             };
             if let Some(s) = app.agent_chat.settings.add.as_mut() {
@@ -1268,11 +1306,13 @@ fn add_agent(app: &mut SolveApp) -> Result<(), String> {
     }
     if let Some(k) = key {
         let Some(store) = &app.services.secrets else { return Err(tr("ui.ai_no_keychain").to_string()) };
-        store.set(&c.id, &k).map_err(|e| trf("ui.ai_keychain_error", &[("error", &e)]))?;
+        store.set(&c.id, &k).map_err(|_| tr("ui.host_ai_key_unavailable").to_string())?;
         c.key = true;
     }
     let Some(at) = editing else {
         app.preferences.agents.push(c);
+        #[cfg(not(target_arch = "wasm32"))]
+        sync_ai_connections(app).map_err(|error| error.message())?;
         return Ok(());
     };
     match app.preferences.agents.get_mut(at) {
@@ -1283,7 +1323,7 @@ fn add_agent(app: &mut SolveApp) -> Result<(), String> {
                 && !c.key
                 && let Some(store) = &app.services.secrets
             {
-                let _ = store.delete(&c.id);
+                store.delete(&c.id).map_err(|_| tr("ui.host_ai_key_unavailable").to_string())?;
             }
             *old = c;
             let id = old.id.clone();
@@ -1302,6 +1342,8 @@ fn add_agent(app: &mut SolveApp) -> Result<(), String> {
             }
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    sync_ai_connections(app).map_err(|error| error.message())?;
     Ok(())
 }
 
@@ -1311,6 +1353,143 @@ mod card_tests {
     use super::*;
     use crate::scenario::{self, Harness};
     use serde_json::json;
+
+    #[test]
+    fn direct_chat_and_host_ai_observe_current_original_secret() {
+        use super::super::host_ai::*;
+        use super::super::tests::direct_integration as d;
+        use std::sync::{Arc, Mutex};
+        let keys = Arc::new(d::Keys::default());
+        keys.set("task8-original", d::KEY_A).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<backend::HttpRequest>::new()));
+        let log = Arc::clone(&requests);
+        let http: backend::HttpFn = Arc::new(move |r| {
+            log.lock().unwrap().push(r.clone());
+            Ok((200, if r.method == "GET" { br#"{"data":[]}"#.to_vec() } else { d::answer().to_string().into_bytes() }))
+        });
+        let (mut app, ctx) = d::app(http, Arc::clone(&keys));
+        // No test-only catalog: this is populated by load_prefs and used by connect.
+        let binding = app.services.agent_ai.connections().bind("task8-original", "chosen").unwrap();
+        d::connected(&mut app, &ctx);
+        let host = d::host(&app);
+        d::turn(&mut app, &ctx);
+        assert!(open_edit(&mut app, "task8-original"));
+        app.agent_chat.settings.add.as_mut().unwrap().key = d::KEY_B.into();
+        add_agent(&mut app).unwrap();
+        app.agent_chat.settings.add = None;
+        host.generate(&binding, &d::context(&host, "rotated"), d::request("task8-original")).unwrap();
+        d::turn(&mut app, &ctx);
+        let authorization: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| r.headers.iter().find(|(n, _)| n == "Authorization").unwrap().1.clone())
+            .collect();
+        assert_eq!(authorization, [format!("Bearer {}", d::KEY_A), format!("Bearer {}", d::KEY_B), format!("Bearer {}", d::KEY_B)]);
+        keys.delete("task8-original").unwrap();
+        let posts = authorization.len();
+        d::turn(&mut app, &ctx);
+        assert_eq!(
+            host.generate(&binding, &d::context(&host, "deleted"), d::request("task8-original")).unwrap_err().code(),
+            AiErrorCode::AuthRequired
+        );
+        assert_eq!(requests.lock().unwrap().iter().filter(|r| r.method == "POST").count(), posts);
+        // Original UI removal path removes both the original store entry and catalog entry.
+        let mut h = Harness::new();
+        h.app = app;
+        h.app.home.open = false;
+        h.app.agent_chat.detection = Some(Default::default());
+        h.call("ui.resize", json!({"width":1600,"height":1400}));
+        h.call("ui.prefs", json!({"open":"Assistant"}));
+        h.frames(4);
+        reveal_card_action(&mut h, "prefs:ai_remove:task8-original").unwrap();
+        h.step(&json!({"click":{"handle":"prefs:ai_remove:task8-original"}})).unwrap();
+        assert_eq!(h.app.services.agent_ai.connections().bind("task8-original", "chosen").unwrap_err().code(), AiErrorCode::ConnectionChanged);
+        assert!(keys.get("task8-original").unwrap().is_none());
+    }
+
+    #[test]
+    fn direct_chat_and_host_ai_observe_current_original_secret_on_go_compatibility_attempts() {
+        use super::super::tests::direct_integration as d;
+        use std::sync::{Arc, Mutex};
+        let keys = Arc::new(d::Keys::default());
+        keys.set("task8-original", d::KEY_A).unwrap();
+        let (entered, arrival) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(Some(wait));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        let http: backend::HttpFn = Arc::new(move |r| {
+            if r.method == "GET" {
+                return Ok((200, br#"{"data":[]}"#.to_vec()));
+            }
+            log.lock().unwrap().push(r.clone());
+            if let Some(wait) = wait.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                wait.recv_timeout(d::GUARD).unwrap();
+                return Ok((400, br#"{"error":{"message":"does not support this protocol"}}"#.to_vec()));
+            }
+            Ok((200, d::answer().to_string().into_bytes()))
+        });
+        let (mut app, ctx) = d::app(http, keys);
+        app.preferences.agents[0].base_url = "https://opencode.ai/inference/go/v1".into();
+        app.preferences.agents[0].model = "muse-spark-1.3-contributor".into();
+        d::connected(&mut app, &ctx);
+        send(&mut app, &ctx, "explicit fallback".into());
+        arrival.recv_timeout(d::GUARD).unwrap();
+        assert!(open_edit(&mut app, "task8-original"));
+        app.agent_chat.settings.add.as_mut().unwrap().key = d::KEY_B.into();
+        add_agent(&mut app).unwrap();
+        app.agent_chat.settings.add = None;
+        release.send(()).unwrap();
+        d::until(&mut app, &ctx, |a| a.agent_chat.state() != super::super::State::Busy);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.ends_with("/responses"));
+        assert!(requests[1].url.ends_with("/chat/completions"));
+        let keys: Vec<_> = requests.iter().map(|r| r.headers.iter().find(|(n, _)| n == "Authorization").unwrap().1.as_str()).collect();
+        assert_eq!(keys, [format!("Bearer {}", d::KEY_A), format!("Bearer {}", d::KEY_B)]);
+        assert!(format!("{:?}", app.agent_chat.items).contains("current answer"));
+    }
+
+    #[test]
+    fn host_ai_error_projection_and_preferences_are_secret_free() {
+        use super::super::host_ai::*;
+        use super::super::tests::direct_integration as d;
+        use std::sync::Arc;
+        let keys = Arc::new(d::Keys::default());
+        keys.set("task8-original", d::KEY_A).unwrap();
+        let http: backend::HttpFn = Arc::new(|r| {
+            if r.method == "GET" {
+                return Ok((200, br#"{"data":[]}"#.to_vec()));
+            }
+            // Actual HTTP boundary echoes the *current* Authorization key in a success body.
+            let key = r.headers.iter().find(|(n, _)| n == "Authorization").unwrap().1.trim_start_matches("Bearer ");
+            Ok((200, json!({"choices":[{"message":{"role":"assistant","content":key},"finish_reason":"stop"}]}).to_string().into_bytes()))
+        });
+        let (mut app, ctx) = d::app(http, Arc::clone(&keys));
+        d::connected(&mut app, &ctx);
+        let host = d::host(&app);
+        let binding = app.services.agent_ai.connections().bind("task8-original", "chosen").unwrap();
+        let mut errors = String::new();
+        for (turn, key) in [("a", d::KEY_A), ("b", d::KEY_B)] {
+            assert!(open_edit(&mut app, "task8-original"));
+            app.agent_chat.settings.add.as_mut().unwrap().key = key.into();
+            add_agent(&mut app).unwrap();
+            app.agent_chat.settings.add = None;
+            d::turn(&mut app, &ctx);
+            let error = host.generate(&binding, &d::context(&host, turn), d::request("task8-original")).unwrap_err();
+            assert_eq!(error.code(), AiErrorCode::MalformedResponse);
+            errors.push_str(&format!("{error:?} {} {:?}", error.message(), error.details()));
+        }
+        let status = control(&mut app, &ctx, &json!({})).unwrap();
+        let projection = format!("{} {:?} {status} {errors} {binding:?}", app.prefs(), app.agent_chat.items);
+        for secret in [d::KEY_A, d::KEY_B] {
+            assert!(!projection.contains(secret));
+        }
+        assert!(!app.agent_chat.items.iter().any(|i| matches!(i, Item::Agent { .. })));
+    }
 
     /// The fixed Preferences window scrolls even on a tall desktop. Use actual wheel input
     /// before clicking a card action whose published geometry may be outside the viewport.
@@ -2089,7 +2268,10 @@ mod card_tests {
         let listing = h.app.agent_chat.settings.add.as_ref().unwrap().listing.clone();
         let (models, note) = listed_for(&h.app.agent_chat.settings.endpoint_models, listing.as_ref());
         assert!(models.is_empty());
-        assert!(note.as_deref().is_some_and(|note| note.contains("no such key")), "{note:?}");
+        assert!(
+            note.as_deref().is_some_and(|note| note.contains("HTTP 401: ") && !note.contains("no such key")),
+            "a safe status, not the provider's body: {note:?}"
+        );
         h.step(&json!({"key":"Escape"})).unwrap();
         h.frames(3);
         let add = h.app.agent_chat.settings.add.as_mut().unwrap();

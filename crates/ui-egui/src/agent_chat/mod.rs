@@ -28,6 +28,8 @@ pub mod context;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod discover;
 pub mod gate;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod host_ai;
 mod markdown;
 mod markdown_view;
 mod panel;
@@ -965,6 +967,26 @@ fn working_dir() -> std::path::PathBuf {
 
 /// Start the agent: the chat's control endpoint for its MCP bridge if needed, the process.
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn sync_ai_connections(app: &SolveApp) -> Result<(), host_ai::AiError> {
+    app.services.agent_ai.connections().replace(&app.preferences.agents)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn direct_host_ai(app: &SolveApp) -> Result<Arc<host_ai::HostAi>, host_ai::AiError> {
+    sync_ai_connections(app)?;
+    host_ai::HostAi::direct(Arc::clone(&app.services.agent_ai), app.services.agent_http.clone(), app.services.secrets.clone())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn ai_sync_failed(app: &mut SolveApp, error: host_ai::AiError) {
+    cancel(app);
+    let text = error.message();
+    if !matches!(app.agent_chat.items.last(), Some(Item::Notice { text: old, error: true }) if old == &text) {
+        app.agent_chat.notice(text, true);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
     disconnect(app);
     let Some(entry) = agents::current(app) else {
@@ -975,21 +997,23 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
         chat.picking = Some(true);
         return;
     };
-    // An API agent's key comes from the keychain for this connection only.
-    let key = if entry.kind.is_api() && entry.key {
-        match app.services.secrets.as_ref().map(|s| s.get(&entry.id)) {
-            Some(Ok(k)) => k,
-            Some(Err(e)) => {
-                app.agent_chat.notice(trf("ui.ai_keychain_error", &[("error", &e)]), true);
+    if let Err(error) = sync_ai_connections(app) {
+        ai_sync_failed(app, error);
+        app.agent_chat.state = Some(State::Failed);
+        return;
+    }
+    let host = if entry.kind.is_api() {
+        match direct_host_ai(app) {
+            Ok(host) => Some(host),
+            Err(error) => {
+                ai_sync_failed(app, error);
                 app.agent_chat.state = Some(State::Failed);
                 return;
             }
-            None => None,
         }
     } else {
         None
     };
-    let http = app.services.agent_http.clone();
     let chat = &mut app.agent_chat;
     if chat.tools_port.is_none()
         && let Some(start) = chat.control_starter.as_mut()
@@ -1019,23 +1043,10 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
     let started: Result<Box<dyn ChatBackend>, String> = match entry.kind {
         agents::Kind::Acp if entry.argv.is_empty() => Err(tr("ui.agent_chat_none_found").to_string()),
         agents::Kind::Acp => acp_client::AcpBackend::start(&entry.argv, start).map(|b| Box::new(b) as Box<dyn ChatBackend>),
-        kind @ (agents::Kind::Api | agents::Kind::Anthropic) => match http {
-            Some(http) => {
-                let protocol = if kind == agents::Kind::Anthropic { agents::Protocol::Anthropic } else { agents::Protocol::OpenAi };
-                api_client::ApiBackend::start(
-                    api_client::ApiConfig {
-                        name: entry.name.clone(),
-                        protocol,
-                        base_url: entry.base_url.clone(),
-                        model: entry.model.clone(),
-                        key,
-                        http,
-                        request_timeout_s: entry.request_timeout_s,
-                        reasoning_effort: entry.reasoning_effort.clone(),
-                    },
-                    start,
-                )
-                .map(|b| Box::new(b) as Box<dyn ChatBackend>)
+        agents::Kind::Api | agents::Kind::Anthropic => match host {
+            Some(host_ai) => {
+                api_client::ApiBackend::start(api_client::ApiConfig { connection_id: entry.id.clone(), model: entry.model.clone(), host_ai }, start)
+                    .map(|b| Box::new(b) as Box<dyn ChatBackend>)
             }
             None => Err(tr("ui.ai_no_http").to_string()),
         },
@@ -1536,6 +1547,11 @@ fn start_turn(app: &mut SolveApp, text: String, image: bool, at: Option<usize>, 
 /// files are named after the text (text files in full), and pictures go as images to an agent
 /// that takes them. `at` is the message's place in the conversation, where its picture is kept.
 fn start_turn_with(app: &mut SolveApp, text: String, image: bool, at: Option<usize>, files: Vec<attach::Attachment>, note: Option<&str>) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(error) = sync_ai_connections(app) {
+        ai_sync_failed(app, error);
+        return;
+    }
     let (pictures, documents) = (app.agent_chat.images, app.agent_chat.documents);
     let changed = app.agent_chat.seen.as_deref().and_then(|seen| changed_note(seen, &app.session.doc));
     let notes: Vec<&str> = note.into_iter().chain(changed.as_deref()).collect();
@@ -1987,6 +2003,10 @@ pub(crate) fn take_loaded(app: &mut SolveApp, ctx: &egui::Context) {
 }
 
 pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(error) = sync_ai_connections(app) {
+        ai_sync_failed(app, error);
+    }
     settings::poll_tests(&mut app.agent_chat);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(rx) = &app.agent_chat.detecting
@@ -2407,6 +2427,8 @@ pub fn control(app: &mut SolveApp, ctx: &egui::Context, p: &Value) -> Result<Val
         c.key = false;
         app.preferences.agents.retain(|x| x.id != c.id);
         app.preferences.agents.push(c);
+        #[cfg(not(target_arch = "wasm32"))]
+        sync_ai_connections(app).map_err(|error| error.message())?;
     }
     if let Some(id) = p.get("agent").and_then(Value::as_str) {
         if !agents::entries(app).iter().any(|e| e.id == id) {

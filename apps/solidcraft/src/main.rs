@@ -572,6 +572,8 @@ fn services(cc: &eframe::CreationContext<'_>, folder: &DialogFolder) -> Services
         easyprint_upload: Some(std::sync::Arc::new(easyprint_upload)),
         browser_files: None,
         agent_http: Some(std::sync::Arc::new(agent_http)),
+        #[cfg(not(target_arch = "wasm32"))]
+        agent_ai: new_window_ai(),
         secrets: Some(std::sync::Arc::new(Keychain)),
         show_in_folder: Some(Box::new(|path| {
             let folder = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -591,6 +593,19 @@ fn services(cc: &eframe::CreationContext<'_>, folder: &DialogFolder) -> Services
             let _ = command.spawn();
         })),
     }
+}
+
+/// One admission pool per process; catalogs belong to individual windows, never this static.
+#[cfg(not(target_arch = "wasm32"))]
+fn process_wide_http_limiter() -> std::sync::Arc<solidcraft_ui_egui::agent_chat::host_ai::HttpAdmission> {
+    use solidcraft_ui_egui::agent_chat::host_ai::HttpAdmission;
+    static HTTP: std::sync::OnceLock<std::sync::Arc<HttpAdmission>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(HTTP.get_or_init(|| std::sync::Arc::new(HttpAdmission::default())))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn new_window_ai() -> std::sync::Arc<solidcraft_ui_egui::agent_chat::host_ai::AiShared> {
+    std::sync::Arc::new(solidcraft_ui_egui::agent_chat::host_ai::AiShared::new(process_wide_http_limiter()))
 }
 
 /// HTTPS GET for the update check (docs/updates.md): certificates from the operating system, a
@@ -1505,6 +1520,24 @@ fn desktop_chooser_fallback(dbus_session: bool, portal_service: bool, wayland_di
 #[cfg(all(test, unix, not(target_os = "macos")))]
 mod backend_tests {
     use super::prefer_x11;
+
+    #[test]
+    fn native_windows_use_independent_catalogs_and_the_process_http_pool() {
+        use solidcraft_ui_egui::agent_chat::{
+            agents::{AgentConfig, Kind},
+            host_ai::AiErrorCode,
+        };
+        let first = super::new_window_ai();
+        let second = super::new_window_ai();
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert!(std::sync::Arc::ptr_eq(&super::process_wide_http_limiter(), &super::process_wide_http_limiter()));
+        let config = AgentConfig { id: "window-fixture".into(), kind: Kind::Api, base_url: "http://localhost:18080/v1".into(), ..Default::default() };
+        first.connections().replace(&[config]).unwrap();
+        assert!(first.connections().bind("window-fixture", "chosen").is_ok());
+        assert_eq!(second.connections().bind("window-fixture", "chosen").unwrap_err().code(), AiErrorCode::ConnectionChanged);
+        let services = solidcraft_ui_egui::Services { agent_ai: first, ..Default::default() };
+        assert!(services.agent_ai.connections().bind("window-fixture", "chosen").is_ok());
+    }
 
     #[test]
     fn xwayland_by_default_native_wayland_on_niri_and_the_override_wins() {
