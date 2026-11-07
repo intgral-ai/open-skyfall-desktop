@@ -344,8 +344,9 @@ sock.sendall((json.dumps({"id": 1, "method": "ui.inspect", "params": {}, "token"
 
 ### Limits
 
-The channel is untrusted input. A request line may be at most 16 MiB; a longer one is answered
-with `{"ok": false, "error": "request too large"}` and the connection is closed, as are
+The channel is untrusted input. The protocol budget is 16 MiB of JSON text per
+request, excluding its framing LF; clients must enforce that budget before sending.
+A `{"ok": false, "error": "request too large"}` refusal closes the connection, as do
 connections that send eight lines that are not JSON. At most 16 connections are served at once
 (further ones get `{"ok": false, "error": "too many connections"}`), at most 64 queued requests
 run per frame so a flood cannot starve drawing, and a request that the UI thread has not
@@ -417,6 +418,168 @@ Any other word is refused; other methods ignore the field. An app older than thi
 `param_check`, so a client that needs the check asks `control.capabilities` first and treats a
 reply without `param_check` as unchecked. The bridged MCP server asks once per connection
 ([mcp.md](mcp.md)).
+
+## Guarded document execution
+
+`expectedDocument` is optional outer metadata in `engine.execute` or
+`engine.batch` **params**, beside `command`/`commands`, not inside CAD parameters
+or a batch step. Omitting it keeps legacy behavior and reply shapes. Explicit
+`null` is invalid. The app also guards the direct read methods
+`document.inspect`, `document.revision` and `engine.commands`; MCP uses its
+existing execute/batch tools instead.
+
+First read the existing `document.revision` method (or execute that command).
+Its result remains `{document_id, revision}` with the original numeric u64
+revision; this is not a new discovery command. Keep `document_id` unchanged as
+`documentId`, and format the **original integer** as a decimal string:
+`{"documentId":"<original id>","revision":"<original u64 digits>"}`.
+Rust can use `as_u64()` then `to_string()`; Python's ordinary JSON integer reader
+also preserves these digits. JavaScript clients must decode the original JSON
+integer losslessly (for example, a lossless integer/BigInt decoder), not call
+`String()` or `BigInt()` on an already-rounded JavaScript Number. Do not change
+the legacy response to a string. Read again after a stale refusal before deciding
+on a **new** operation; never silently substitute a newer stamp for an old request.
+
+Wire stamps have exactly two fields. `documentId` matches
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. `revision` is an ASCII canonical decimal
+string from `"0"` through `"18446744073709551615"`. Numbers, signs, leading
+zeros, fractions, exponents, whitespace, non-ASCII digits, overflow, missing or
+extra stamp fields are invalid. Native Engine `DocumentStamp` instead holds
+`document_id: String` and `revision: u64`; wire validation is integration-owned.
+
+`control.capabilities` adds
+`"guardedExecution":{"version":"1.0","execute":true,"batch":true}` inside
+its result. This advertises a **subset**, not arbitrary guarded commands:
+
+- Registered commands in `appearance`, `assembly`, `body`, `component`, `config`,
+  `construct`, `contact`, `explode`, `expr`, `face`, `joint`, `material`, `mesh`,
+  `model`, `occurrence`, `parameters`, `plastic`, `sheet`, `sketch`, `solid`,
+  `surface` and `timeline`; plus `document.inspect`, `document.revision`,
+  `engine.commands`, `engine.describe`, `inspect.measure`, `inspect.clearance`,
+  `inspect.interference`, `browser.visibility`, `edit.undo` and `edit.redo`.
+- Excluded even in those namespaces: `component.edit_in_place`,
+  `component.finish_edit`, `component.update_links`, `timeline.play`,
+  `appearance.favorite`, IDs containing `export`, `import`, `save` or `library`,
+  and command parameters with any top-level `path`, `paths`, `file`, `files`,
+  `dir`, `folder`, `url` or `out` key (presence is enough).
+- File/open/new/recovery, scripts, tab switching, panel/layout and render-job
+  routes are not guarded capabilities. A batch with an unsupported step is
+  refused before any step/checkpoint. Unknown commands retain native diagnostics.
+  `document.snapshot.capture` (#11) is not implemented here. A guard does not
+  provide a frozen snapshot, isolated workspace or permission to overwrite edits.
+
+The host compares the original stamp again at actual application, including
+queued work, cursor replay, off-thread work and final delivery of a read made on
+a copy. A matching version cannot override Stop. Leaving a tab invalidates an
+admitted request; returning cannot resurrect it. Same-name/shared-content tabs
+still have distinct identities. Stop closes the trusted chat-turn flag immediately;
+request JSON cannot manufacture that authority. A command chip's Stop cancels that
+command, not the whole chat turn. Earlier successful edits are not erased by Stop.
+
+Success keeps native `result` and adds sibling `documentStamp`. Refusal keeps
+the string `error` and adds sibling `errorDetails` (`code`, `message`,
+`retry:"never"`, `details`). `STALE_DOCUMENT` includes `expected` and `current`;
+`current:null` means the target is closed/not present. A target still open in a
+different tab reports the active stamp instead. Stale rejection has zero writes
+and no undo/checkpoint effect. It is not a command failure or rollback report.
+
+The batch base is compared once before application, not against each of its own
+edits. The native limit remains 10 000 steps. With guarded rollback true/default,
+checkpoint establishment failure runs **zero** steps: `completed:0`, `results:[]`,
+`undone:0`, `rolled_back:false`, all indices in `not_run`, and
+`failed:{index:null,command:"edit.checkpoint",stage:"checkpoint",error:...}`.
+With explicit `rollback:false`, no checkpoint is required; partial success stays
+applied. Later restore failure is reported truthfully as `rolled_back:false`;
+this is not an unconditional transaction-atomicity guarantee. An outer `ok:true`
+batch can contain `result.failed`; read the body and actual resulting stamp.
+
+Same-connection timeouts are **pending**, not definite failure: retrieve the
+original reply with `control.pending`. Its nested `reply` retains the original
+`documentStamp`/`errorDetails` siblings. After connection/reply loss the outcome
+is unknown; a new connection cannot recover that pending slot. Do not resend the
+guarded operation or fall back to individual batch steps. A missing/invalid stamp
+on a supposed guarded success is also unknown. MCP's `expect` is a separate
+post-application measurement guarded by the **applied** stamp: mismatch or a
+stale/unverifiable measurement does not undo the write. Pending completion does
+not run a deferred expectation against whatever design is current later.
+
+### Checked guarded examples
+
+These are labelled JSON examples, not captured runtime logs. In native-path tests,
+the actual before/after stamps are mapped to `doc-A` and the two string revisions
+below; they are symbolic states, not a claim about counter increments. Never use
+these template stamps as discovered identities. Requests below are the contents
+of the named tool's arguments; for control, send them as `params` with
+`engine.execute`/`engine.batch` and an ordinary request `id` on an authenticated
+connection. Ignore tool-only `expect` there. Replies here are control bodies
+(without the echoed `id`), except `pending` and `expectation-failed`, explicitly
+showing MCP structured bodies to explain the extra tool-level facts. Closed and
+primitive cases replay Task7 protocol fixtures through the actual MCP decoder;
+pending is a deterministic same-connection protocol fixture, not GUI evidence.
+Matching/stale/unsupported/expectation cases use real native/tool paths. The
+`envelope-vectors` strings are exact UTF-8 JSON texts shared by both thin-parser
+tests; acceptance means valid syntax/stamp, **not** permission or a matching live
+document. #5 still owns the authoritative shared corpus; these examples are not
+a claim that its bundle or TypeScript consumer has been delivered.
+
+<!-- guarded-examples -->
+```json
+[
+  {"label":"matching-execute","tool":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"ok":true,"result":{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}},
+  {"label":"matching-batch","tool":"batch","arguments":{"commands":[{"command":"parameters.change","params":{"name":"width","expression":"20 mm"}},{"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}],"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"ok":true,"result":{"completed":2,"results":[{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},{"name":"width","expression":"30 mm","value":30.0,"display_value":30.0,"recomputed":0,"restored":0,"errors":[]}],"undone":0},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}},
+  {"label":"stale","tool":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"ok":false,"error":"The document changed before this write could apply.","errorDetails":{"code":"STALE_DOCUMENT","message":"The document changed before this write could apply.","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":{"documentId":"doc-A","revision":"9007199254740994"}}}}},
+  {"label":"closed","tool":"execute","arguments":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"ok":false,"error":"stale","errorDetails":{"code":"STALE_DOCUMENT","message":"stale","retry":"never","details":{"expected":{"documentId":"doc-A","revision":"9007199254740993"},"current":null}}}},
+  {"label":"unsupported","tool":"execute","arguments":{"command":"file.new","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"ok":false,"error":"This execution path does not support guarded requests.","errorDetails":{"code":"UNSUPPORTED_CAPABILITY","message":"This execution path does not support guarded requests.","retry":"never","details":{"capability":"file.new"}}}},
+  {"label":"primitive-wrapper","tool":"execute","arguments":{"command":"parameters.list","expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"ok":true,"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}}},
+  {"label":"pending","tool":"execute","arguments":{"command":"parameters.list","expect":{"bodies":0},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":false,"reply":{"pending":"`engine.execute` (parameters.list)","done":true,"result":{"result":7,"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"}},"expectation":null,"note":"Tool-level expectation checks were not executed for this pending request; the original effect facts are retained."}},
+  {"label":"expectation-failed","tool":"execute","arguments":{"command":"parameters.change","params":{"name":"width","expression":"20 mm"},"expect":{"bodies":1},"expectedDocument":{"documentId":"doc-A","revision":"9007199254740993"}},"isError":true,"reply":{"result":{"name":"width","expression":"20 mm","value":20.0,"display_value":20.0,"recomputed":0,"restored":0,"errors":[]},"documentStamp":{"documentId":"doc-A","revision":"9007199254740994"},"expectation":{"ok":false,"measured":{"volume_mm3":0.0,"bodies":0,"bbox":null},"expected":{"bodies":1},"mismatch":["bodies: measured 0, expected 1"]}}},
+  {"label":"envelope-vectors","vectors":[
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"0\"}}","accept":true,"revision":"0"},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"9007199254740993\"}}","accept":true,"revision":"9007199254740993"},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"18446744073709551615\"}}","accept":true,"revision":"18446744073709551615"},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"A0._:-z\",\"revision\":\"0\"}}","accept":true,"revision":"0"},
+    {"utf8":"{\"expectedDocument\":null}","accept":false},
+    {"utf8":"{\"expectedDocument\":0}","accept":false},
+    {"utf8":"{\"expectedDocument\":true}","accept":false},
+    {"utf8":"{\"expectedDocument\":[]}","accept":false},
+    {"utf8":"{\"expectedDocument\":\"stamp\"}","accept":false},
+    {"utf8":"{\"expectedDocument\":{}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"0\",\"extra\":true}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":0}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":null}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":true}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":[]}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":{}}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"00\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"01\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"+1\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"-1\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"1e3\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"1.0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"18446744073709551616\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"99999999999999999999\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"100000000000000000000\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\" 1\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"1 \"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"1\\n\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"\\t1\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"１\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"doc-A\",\"revision\":\"١\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"\",\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"-bad\",\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"a/b\",\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"é\",\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":null,\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":1,\"revision\":\"0\"}}","accept":false},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"revision\":\"0\"}}","accept":true,"revision":"0"},
+    {"utf8":"{\"expectedDocument\":{\"documentId\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"revision\":\"0\"}}","accept":false}
+  ]}
+]
+```
+<!-- /guarded-examples -->
 
 ## Engine
 

@@ -9,6 +9,360 @@ use serde_json::json;
 
 use crate::scenario::Harness;
 
+/// Only the worker boundary is controlled: real copy/ahead computation still runs. Channels
+/// prove compute -> person's edit -> delivery; timeouts only detect a deadlock.
+pub(crate) mod guarded_workers {
+    use serde_json::Value;
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    enum Next {
+        Immediate,
+        Gated { computed: Sender<()>, release: Receiver<()>, delivered: Sender<()> },
+    }
+    thread_local! { static NEXT: RefCell<Option<Next>> = const { RefCell::new(None) }; }
+
+    pub(crate) struct Gate {
+        computed: Receiver<()>,
+        release: Sender<()>,
+        delivered: Receiver<()>,
+    }
+    impl Gate {
+        pub(crate) fn computed(&self) {
+            self.computed.recv_timeout(std::time::Duration::from_secs(30)).expect("real computation finished");
+        }
+        pub(crate) fn release(self) {
+            self.release.send(()).unwrap();
+            self.delivered.recv_timeout(std::time::Duration::from_secs(30)).expect("result delivered before owner polls");
+        }
+    }
+    pub(crate) fn gate() -> Gate {
+        let (computed_tx, computed) = channel();
+        let (release, release_rx) = channel();
+        let (delivered_tx, delivered) = channel();
+        NEXT.with(|next| *next.borrow_mut() = Some(Next::Gated { computed: computed_tx, release: release_rx, delivered: delivered_tx }));
+        Gate { computed, release, delivered }
+    }
+    pub(super) fn immediate() {
+        NEXT.with(|next| *next.borrow_mut() = Some(Next::Immediate));
+    }
+    pub(crate) fn spawn<F>(scope: Option<solidcraft_engine::io::vfs::PathScope>, f: F) -> Result<Receiver<Option<Value>>, F>
+    where
+        F: FnOnce() -> Option<Value> + Send + 'static,
+    {
+        let Some(next) = NEXT.with(|next| next.borrow_mut().take()) else { return Err(f) };
+        let (tx, rx) = channel();
+        match next {
+            Next::Immediate => tx.send(solidcraft_engine::io::vfs::scoped(scope, f)).unwrap(),
+            Next::Gated { computed, release, delivered } => {
+                std::thread::spawn(move || {
+                    let reply = solidcraft_engine::io::vfs::scoped(scope, f);
+                    computed.send(()).unwrap();
+                    if release.recv_timeout(std::time::Duration::from_secs(30)).is_ok() {
+                        let _ = tx.send(reply);
+                        let _ = delivered.send(());
+                    }
+                });
+            }
+        }
+        Ok(rx)
+    }
+}
+
+fn guarded_harness() -> Harness {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.run("parameters.add", json!({"name":"width","expression":"10 mm"})).unwrap();
+    h.app.apply_off_thread = Some(Duration::ZERO);
+    h.app.preferences.agent_off_thread = true;
+    h
+}
+
+fn guarded_request(
+    h: &mut Harness,
+    method: &str,
+    mut params: serde_json::Value,
+) -> (crate::ControlRequest, std::sync::mpsc::Receiver<serde_json::Value>) {
+    let stamp = h.app.session.document_stamp();
+    params["expectedDocument"] = json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()});
+    let (mut req, rx) = crate::ControlRequest::new(method, params);
+    crate::execution_guard::admit(&mut h.app, &mut req).unwrap_or_else(|_| panic!("matching admission"));
+    (req, rx)
+}
+
+fn guarded_change() -> serde_json::Value {
+    json!({"command":"parameters.change","params":{"name":"width","expression":"30 mm"}})
+}
+
+fn checkpoint(h: &mut Harness) -> u64 {
+    h.app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap()
+}
+
+fn guarded_history(h: &Harness) -> serde_json::Value {
+    let snapshots = |items: &[solidcraft_engine::Snapshot]| {
+        items
+            .iter()
+            .map(|s| {
+                json!({
+                    "label":s.label,"doc":s.doc.to_json(),"active_sketch":s.active_sketch,
+                    "pending_moves":s.pending_moves,"visibility":s.visibility,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    json!({"undo":snapshots(&h.app.session.undo),"redo":snapshots(&h.app.session.redo)})
+}
+
+#[test]
+fn guarded_ahead_batch_rejects_edit_after_compute_before_apply() {
+    // Missing final guard (or retrying a new base) must not allocate even a batch checkpoint.
+    let mut h = guarded_harness();
+    let (req, rx) = guarded_request(
+        &mut h,
+        "engine.batch",
+        json!({"commands":[guarded_change(),
+        {"command":"parameters.change","params":{"name":"height","expression":"40 mm"}}]}),
+    );
+    let expected = req.params["expectedDocument"].clone();
+    let gate = guarded_workers::gate();
+    assert!(h.app.offload_control(&h.ctx, req).is_none());
+    gate.computed();
+    h.app.run("parameters.change", json!({"name":"width","expression":"20 mm"})).unwrap();
+    let doc = h.app.session.doc.clone();
+    let history = guarded_history(&h);
+    let before = checkpoint(&mut h);
+    gate.release();
+    h.app.poll_control_jobs(&h.ctx);
+    let r = rx.try_recv().expect("stale immediately, not a retry on a newer base");
+    assert_eq!(r["errorDetails"]["code"], "STALE_DOCUMENT", "{r}");
+    assert_eq!(r["errorDetails"]["details"]["expected"], expected);
+    assert!(h.app.control_job.is_none());
+    assert!(std::sync::Arc::ptr_eq(&doc, &h.app.session.doc));
+    assert_eq!(guarded_history(&h), history);
+    assert_eq!(checkpoint(&mut h), before + 1, "no refused batch checkpoint");
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(h.app.session.doc.params.iter().find(|p| p.name == "width").unwrap().expr, "10 mm", "person's undo is still on top");
+    assert!(!h.app.session.doc.params.iter().any(|p| p.name == "height"));
+}
+
+#[test]
+fn guarded_ahead_departure_return_and_held_second_request() {
+    for closed in [false, true] {
+        let mut h = guarded_harness();
+        let (req, rx) = guarded_request(&mut h, "engine.execute", guarded_change());
+        let original = req.guarded.as_ref().unwrap().context.clone();
+        let expected = req.params["expectedDocument"].clone();
+        let gate = guarded_workers::gate();
+        assert!(h.app.offload_control(&h.ctx, req).is_none());
+        gate.computed();
+        crate::documents::open_tab(&mut h.app, solidcraft_engine::Session::default()).unwrap();
+        if closed {
+            crate::documents::close(&mut h.app, 0, true);
+        } else {
+            crate::documents::switch(&mut h.app, 0);
+            let stamp = h.app.session.document_stamp();
+            assert_eq!(expected, json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()}));
+        }
+        assert!(!original.load(std::sync::atomic::Ordering::Relaxed));
+        let before = h.app.session.doc.clone();
+        let history = guarded_history(&h);
+        gate.release();
+        h.app.poll_control_jobs(&h.ctx);
+        let r = rx.try_recv().expect("invalid original admission refused");
+        assert_eq!(r["errorDetails"]["code"], "STALE_DOCUMENT", "closed={closed}: {r}");
+        assert_eq!(r["errorDetails"]["details"]["expected"], expected);
+        if closed {
+            assert_eq!(r["errorDetails"]["details"]["current"], json!(null));
+        }
+        assert!(std::sync::Arc::ptr_eq(&before, &h.app.session.doc));
+        assert_eq!(guarded_history(&h), history);
+    }
+    let mut h = guarded_harness();
+    let (first, first_rx) = guarded_request(&mut h, "engine.execute", guarded_change());
+    let (second, second_rx) = guarded_request(&mut h, "engine.execute", guarded_change());
+    let pin = second.guarded.as_ref().unwrap().context.clone();
+    let expected = second.params["expectedDocument"].clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.app.control_rx = Some(rx);
+    let gate = guarded_workers::gate();
+    tx.send(first).unwrap();
+    tx.send(second).unwrap();
+    h.frames(1);
+    assert_eq!(h.app.control_held.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(h.app.control_held[0].guarded.as_ref().map(|a| &a.context).unwrap(), &pin));
+    gate.computed();
+    gate.release();
+    h.app.poll_control_jobs(&h.ctx);
+    assert_eq!(first_rx.try_recv().unwrap()["ok"], true);
+    let undo = h.app.session.undo.len();
+    h.frames(1);
+    let r = second_rx.try_recv().expect("second same-base request is stale");
+    assert_eq!(r["errorDetails"]["code"], "STALE_DOCUMENT", "{r}");
+    assert_eq!(r["errorDetails"]["details"]["expected"], expected);
+    assert_eq!(h.app.session.undo.len(), undo);
+    assert!(h.app.control_job.is_none());
+}
+
+#[test]
+fn guarded_immediate_completion_and_cursor_keep_original_guard() {
+    let mut h = guarded_harness();
+    h.app.apply_off_thread = Some(Duration::from_secs(1));
+    let undo = h.app.session.undo.len();
+    let (req, rx) = guarded_request(&mut h, "engine.execute", guarded_change());
+    guarded_workers::immediate(); // Receiver is full before within_wait, independent of machine speed.
+    assert!(h.app.offload_control(&h.ctx, req).is_none());
+    assert_eq!(rx.try_recv().unwrap()["ok"], true);
+    assert!(h.app.control_job.is_none());
+    h.app.poll_control_jobs(&h.ctx);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+
+    // The common owner helper also rejects an edit inserted after a completed computation.
+    // Even replacing the wire expected with the new live base cannot rebind the admission.
+    let (mut req, rx) = guarded_request(&mut h, "engine.execute", guarded_change());
+    let expected = req.params["expectedDocument"].clone();
+    let ahead = h.app.session.ahead();
+    let kept = ahead.kept();
+    ahead.evaluate(&[("parameters.change".into(), json!({"name":"width","expression":"30 mm"}))]).unwrap();
+    h.app.run("parameters.change", json!({"name":"width","expression":"40 mm"})).unwrap();
+    let current = h.app.session.document_stamp();
+    req.params["expectedDocument"] = json!({"documentId":current.document_id,"revision":current.revision.to_string()});
+    let doc = h.app.session.doc.clone();
+    let history = guarded_history(&h);
+    let before = checkpoint(&mut h);
+    h.app.finish_control_ahead(&h.ctx, req, kept);
+    let r = rx.try_recv().unwrap();
+    assert_eq!(r["errorDetails"]["code"], "STALE_DOCUMENT", "{r}");
+    assert_eq!(r["errorDetails"]["details"]["expected"], expected);
+    assert!(std::sync::Arc::ptr_eq(&doc, &h.app.session.doc));
+    assert_eq!(guarded_history(&h), history);
+    assert_eq!(checkpoint(&mut h), before + 1);
+
+    for ahead in [false, true] {
+        for action in ["return", "cancel", "match"] {
+            let mut h = guarded_harness();
+            h.app.ui.agent_cursor.show = true;
+            h.app.preferences.agent_off_thread = ahead;
+            h.frames(1);
+            let (mut req, rx) =
+                guarded_request(&mut h, "engine.execute", json!({"command":"solid.box","params":{"length":1,"width":1,"height":1,"corner":[0,0,0]}}));
+            let expected = req.params["expectedDocument"].clone();
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            req.chat_turn = Some(active.clone());
+            if ahead {
+                guarded_workers::immediate();
+            }
+            assert!(crate::agent_cursor::intercept(&mut h.app, &req));
+            assert!(h.app.agent.computing().is_none(), "still gliding");
+            if action == "return" {
+                crate::documents::open_tab(&mut h.app, solidcraft_engine::Session::default()).unwrap();
+                crate::documents::switch(&mut h.app, 0);
+            } else if action == "cancel" {
+                active.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            let doc = h.app.session.doc.clone();
+            let undo = h.app.session.undo.len();
+            let before = checkpoint(&mut h);
+            h.frames(120);
+            let r = rx.try_recv().expect("cursor completion answered");
+            if action == "match" {
+                assert_eq!(r["ok"], true, "ahead={ahead}: {r}");
+                assert_eq!(h.app.session.undo.len(), undo + 1);
+                assert_eq!(h.app.session.doc.features.len(), 1);
+                assert_eq!(r["documentStamp"]["documentId"], expected["documentId"]);
+            } else {
+                assert_eq!(r["ok"], false, "ahead={ahead} action={action}: {r}");
+                if action == "return" {
+                    assert_eq!(r["errorDetails"]["code"], "STALE_DOCUMENT", "{r}");
+                    assert_eq!(r["errorDetails"]["details"]["expected"], expected);
+                }
+                assert!(std::sync::Arc::ptr_eq(&doc, &h.app.session.doc));
+                assert_eq!(h.app.session.undo.len(), undo);
+            }
+            assert_eq!(checkpoint(&mut h), before + 1);
+            assert!(!h.app.agent.busy());
+            assert!(rx.try_recv().is_err(), "exactly one answer/application");
+        }
+    }
+}
+
+#[test]
+fn guarded_copy_read_rechecks_live_source_on_both_completion_paths() {
+    for (method, id) in [
+        ("document.inspect", "document.inspect"),
+        ("engine.execute", "document.inspect"),
+        ("engine.execute", "inspect.measure"),
+        ("command", "inspect.measure"),
+    ] {
+        for immediate in [false, true] {
+            for changed in [false, true] {
+                let mut h = guarded_harness();
+                // Ensure the source's real revision differs from a fresh scratch's followed state.
+                h.app.run("parameters.change", json!({"name":"width","expression":"12 mm"})).unwrap();
+                let params = if method == "document.inspect" { json!({}) } else { json!({"command":id,"params":{}}) };
+                let (req, rx) = guarded_request(&mut h, method, params);
+                let expected = req.params["expectedDocument"].clone();
+                let before = checkpoint(&mut h);
+                let completed = if immediate {
+                    h.app.apply_off_thread = Some(Duration::from_secs(1));
+                    Some(crate::control_job::test_support::completed_read(&mut h.app, req, id, json!({})))
+                } else {
+                    let gate = guarded_workers::gate();
+                    assert!(h.app.offload_control(&h.ctx, req).is_none());
+                    gate.computed();
+                    if changed {
+                        h.app.run("parameters.change", json!({"name":"width","expression":"20 mm"})).unwrap();
+                    }
+                    gate.release();
+                    None
+                };
+                if immediate && changed {
+                    h.app.run("parameters.change", json!({"name":"width","expression":"20 mm"})).unwrap();
+                }
+                let doc = h.app.session.doc.clone();
+                let history = guarded_history(&h);
+                if let Some(job) = completed {
+                    crate::control_job::test_support::answer_completed(&mut h.app, job);
+                } else {
+                    h.app.poll_control_jobs(&h.ctx);
+                }
+                let r = rx.try_recv().expect("copy answered");
+                if changed {
+                    assert_eq!(r["errorDetails"]["code"], "STALE_DOCUMENT", "{id} immediate={immediate}: {r}");
+                    assert_eq!(r["errorDetails"]["details"]["expected"], expected);
+                    assert_ne!(r["errorDetails"]["details"]["current"], expected);
+                } else {
+                    assert_eq!(r["ok"], true, "{r}");
+                    assert_eq!(r["documentStamp"], expected, "live/source stamp, never scratch: {r}");
+                    if id == "document.inspect" {
+                        assert!(r["result"]["params"].is_array() || r["result"]["params"].is_object(), "{r}");
+                    } else {
+                        assert!(r["result"]["total"].is_object(), "{r}");
+                    }
+                }
+                assert!(std::sync::Arc::ptr_eq(&doc, &h.app.session.doc));
+                assert_eq!(guarded_history(&h), history);
+                assert_eq!(checkpoint(&mut h), before + 1);
+                assert!(h.app.control_answering.is_empty());
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+    // Exercise the actual immediate offload branch, not just the held owner boundary above.
+    for method in ["document.inspect", "engine.execute"] {
+        let mut h = guarded_harness();
+        h.app.apply_off_thread = Some(Duration::from_secs(1));
+        let params = if method == "document.inspect" { json!({}) } else { json!({"command":"inspect.measure"}) };
+        let (req, rx) = guarded_request(&mut h, method, params);
+        let expected = req.params["expectedDocument"].clone();
+        guarded_workers::immediate();
+        assert!(h.app.offload_control(&h.ctx, req).is_none());
+        let r = rx.try_recv().unwrap();
+        assert_eq!(r["documentStamp"], expected, "{r}");
+        assert!(h.app.control_answering.is_empty());
+    }
+}
+
 /// A 60 × 20 × 10 block, a 10 × 10 × 5 boss on it, and a 4 mm hole through the boss, the
 /// marker at the end. Every command computes off the window thread (no wait at all).
 fn block_boss_hole() -> Harness {

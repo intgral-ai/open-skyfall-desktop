@@ -373,7 +373,13 @@ fn reuse_open(app: &mut SolveApp, request: &Request) -> bool {
 
 /// A control-channel (MCP) `doc.open` or STEP/mesh import runs like File > Open: off the window
 /// thread, answered when the file is in. Other requests come back to be handled now.
-pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Option<crate::control::ControlRequest> {
+pub fn control(app: &mut SolveApp, mut req: crate::control::ControlRequest) -> Option<crate::control::ControlRequest> {
+    // Also defend direct callers: unsupported guarded routes must never consume the request
+    // into a loader that cannot preserve its original document precondition.
+    if let Err(error) = crate::execution_guard::admit(app, &mut req) {
+        let _ = req.reply.send(crate::execution_guard::refusal_json(&error));
+        return None;
+    }
     if cfg!(target_arch = "wasm32") || !matches!(req.method.as_str(), "engine.execute" | "command") {
         return Some(req);
     }

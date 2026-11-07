@@ -41,6 +41,477 @@ fn rel(a: f64, b: f64) -> f64 {
 }
 
 #[test]
+fn conditioned_stamp_uses_actual_state_not_view_revision() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let before = s.document_stamp();
+    let _: u64 = before.revision;
+    assert_eq!(before.document_id, s.document_id);
+    assert_eq!(before.revision, s.design_revision());
+    assert_eq!(run(&mut s, "document.revision", json!({})), json!({"document_id": before.document_id, "revision": before.revision}));
+    run(&mut s, "parameters.list", json!({}));
+    assert_eq!(s.document_stamp(), before);
+
+    let view_revision = s.revision;
+    run(&mut s, "select.set", json!({"items": [{"type": "plane", "name": "XY"}]}));
+    assert_eq!(s.selection.len(), 1);
+    assert_ne!(s.revision, view_revision);
+    assert_eq!(s.document_stamp(), before);
+    run(&mut s, "view.front", json!({}));
+    assert!(s.camera.is_some());
+    run(&mut s, "inspect.section", json!({"plane": "XY", "offset": 2}));
+    assert!(s.section.is_some());
+    assert_eq!(s.document_stamp(), before);
+
+    run(&mut s, "parameters.change", json!({"name": "width", "expression": "20 mm"}));
+    let after = s.document_stamp();
+    assert_eq!(after.document_id, before.document_id);
+    assert_ne!(after.revision, before.revision);
+    assert_eq!(after.revision, s.design_revision());
+
+    let mut other = Session { doc: s.doc.clone(), ..Session::default() };
+    assert!(Arc::ptr_eq(&other.doc, &s.doc));
+    assert_ne!(other.document_stamp().document_id, after.document_id);
+}
+
+#[test]
+fn conditioned_execute_delegates_and_stale_has_no_history_effect() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let before = s.document_stamp();
+    assert!(s.check_document_stamp(&before).is_ok());
+    let change_to_20 = json!({"name": "width", "expression": "20 mm"});
+    let change_to_30 = json!({"name": "width", "expression": "30 mm"});
+    let mut direct = s.scratch();
+    let expected_native = run(&mut direct, "parameters.change", change_to_20.clone());
+    let undo_len = s.undo.len();
+    let (native, after) = s.execute_if_current("parameters.change", &change_to_20, &before).expect("matching native command should succeed");
+    assert_eq!(after.document_id, before.document_id);
+    assert_ne!(after.revision, before.revision);
+    assert_eq!(native["value"], 20.0);
+    assert_eq!(native, expected_native);
+    assert_eq!(s.document_stamp(), after);
+    assert_eq!(s.undo.len(), undo_len + 1);
+
+    // Populate both history stacks and keep a live checkpoint, so clearing any of them is visible.
+    run(&mut s, "parameters.change", change_to_30.clone());
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.document_stamp(), after);
+    let checkpoint = s.checkpoint();
+    let (doc, undo, redo, checkpoints) = (s.doc.clone(), s.undo.clone(), s.redo.clone(), s.checkpoints.clone());
+    let next_checkpoint = s.next_checkpoint;
+    assert!(!undo.is_empty() && !redo.is_empty());
+    let assert_history = |actual: &[Snapshot], expected: &[Snapshot]| {
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(expected) {
+            assert!(Arc::ptr_eq(&a.doc, &e.doc));
+            assert_eq!(a.label, e.label);
+            assert_eq!(a.active_sketch, e.active_sketch);
+            assert_eq!(a.pending_moves, e.pending_moves);
+            assert_eq!(a.visibility, e.visibility);
+        }
+    };
+    let wrong_identity = DocumentStamp { document_id: format!("{}-other", after.document_id), revision: after.revision };
+    for expected_stamp in [&before, &wrong_identity] {
+        assert!(matches!(s.check_document_stamp(expected_stamp),
+            Err(ConditionedError::Changed { expected, current }) if expected == *expected_stamp && current == after));
+        assert!(matches!(s.execute_if_current("parameters.change", &change_to_30, expected_stamp),
+            Err(ConditionedError::Changed { expected, current }) if expected == *expected_stamp && current == after));
+        assert!(Arc::ptr_eq(&s.doc, &doc));
+        assert_eq!(s.doc.param("width").unwrap().expr, "20 mm");
+        assert_eq!(s.document_stamp(), after);
+        assert_history(&s.undo, &undo);
+        assert_history(&s.redo, &redo);
+        assert_eq!(s.next_checkpoint, next_checkpoint);
+        assert_eq!(s.checkpoints.len(), checkpoints.len());
+        for (a, e) in s.checkpoints.iter().zip(&checkpoints) {
+            assert_eq!(a.id, e.id);
+            assert!(Arc::ptr_eq(&a.doc, &e.doc));
+            assert_eq!(a.active_sketch, e.active_sketch);
+            assert_eq!(a.pending_moves, e.pending_moves);
+            assert_eq!(a.visibility, e.visibility);
+            assert_history(&a.undo, &e.undo);
+            assert_history(&a.redo, &e.redo);
+        }
+    }
+    assert!(matches!(s.execute_if_current("unknown.conditioned", &json!({}), &after),
+        Err(ConditionedError::Command(EngineError::UnknownCommand(id))) if id == "unknown.conditioned"));
+    assert!(matches!(s.execute_if_current("parameters.change", &json!({}), &after),
+        Err(ConditionedError::Command(EngineError::BadParams { cmd, .. })) if cmd == "parameters.change"));
+    assert!(Arc::ptr_eq(&s.doc, &doc));
+    assert_history(&s.undo, &undo);
+    assert_history(&s.redo, &redo);
+    assert_eq!(s.document_stamp(), after);
+    assert_eq!(s.checkpoint(), checkpoint + 1);
+
+    // The resulting stamp must come from the live session even when execute replaces its design.
+    let (native, replaced) = s.execute_if_current("file.new", &json!({}), &after).unwrap();
+    assert!(native.is_object());
+    assert_ne!(replaced.document_id, after.document_id);
+    assert_eq!(s.document_stamp(), replaced);
+}
+
+// Boundary recorder for the real batch core: distinct adapters, no geometry or substitute
+// runner. A wrong adapter, checkpoint receipt, or merge branch changes observable calls/body.
+struct BatchCoreContext {
+    calls: Vec<(&'static str, String, Value)>,
+    checkpoint: std::result::Result<Value, String>,
+    refuse_restore: bool,
+    refuse_merge: bool,
+}
+
+impl Default for BatchCoreContext {
+    fn default() -> Self {
+        Self { calls: Vec::new(), checkpoint: Ok(json!({"checkpoint":77})), refuse_restore: false, refuse_merge: false }
+    }
+}
+
+fn batch_core_step(c: &mut BatchCoreContext, id: &str, params: Value) -> std::result::Result<Value, String> {
+    c.calls.push(("step", id.into(), params.clone()));
+    assert!(!id.starts_with("edit."), "history must not reach the step adapter");
+    if params.get("changes").is_some() {
+        if c.refuse_merge {
+            Err("combined refused".into())
+        } else {
+            Ok(json!({"changed":{"width":20.0,"depth":30.0},"recomputed":0,"restored":0,"errors":[]}))
+        }
+    } else if params["expression"] == "bad" {
+        Err("bad expression".into())
+    } else {
+        Ok(json!({"applied":params}))
+    }
+}
+
+fn batch_core_history(c: &mut BatchCoreContext, id: &str, params: Value) -> std::result::Result<Value, String> {
+    c.calls.push(("history", id.into(), params));
+    match id {
+        "edit.checkpoint" => c.checkpoint.clone(),
+        "edit.restore_checkpoint" if c.refuse_restore => Err("restore refused".into()),
+        "edit.restore_checkpoint" => Ok(json!({"checkpoint":77,"restored":true})),
+        _ => panic!("a step reached history: {id}"),
+    }
+}
+
+#[test]
+fn batch_shared_core_uses_distinct_step_and_history_invokers() {
+    let mut c = BatchCoreContext::default();
+    let steps = [json!({"command":"PARAMETERS.CHANGE","params":{"name":"width","expression":"20"}})];
+    let body = batch::run_document_steps(&mut c, &steps, &json!({}), batch_core_step, batch_core_history, batch::CheckpointPolicy::BestEffort);
+    assert_eq!(body, json!({"completed":1,"results":[{"applied":{"name":"width","expression":"20"}}],"undone":0}));
+    assert_eq!(
+        c.calls,
+        vec![
+            ("history", "edit.checkpoint".into(), json!({})),
+            ("step", "PARAMETERS.CHANGE".into(), json!({"name":"width","expression":"20"})),
+            ("history", "edit.restore_checkpoint".into(), json!({"checkpoint":77,"forget":true}))
+        ]
+    );
+}
+
+#[test]
+fn batch_shared_core_preserves_failure_facts() {
+    let steps = [
+        json!({"id":"parameters.change","params":{"name":"width","expression":"20"}}),
+        json!({"command":"parameters.change","params":{"expression":"bad"}}),
+        json!({"command":"parameters.list"}),
+    ];
+    for refuse_restore in [false, true] {
+        let mut c = BatchCoreContext { refuse_restore, ..Default::default() };
+        let body = batch::run_document_steps(&mut c, &steps, &json!({}), batch_core_step, batch_core_history, batch::CheckpointPolicy::BestEffort);
+        assert_eq!(
+            body,
+            json!({"completed":1,"results":[{"applied":{"name":"width","expression":"20"}}],
+            "failed":{"index":1,"command":"parameters.change","error":"bad expression"},"undone":usize::from(!refuse_restore),"rolled_back":!refuse_restore})
+        );
+        assert_eq!(
+            c.calls.iter().map(|(kind, id, _)| format!("{kind}:{id}")).collect::<Vec<_>>(),
+            ["history:edit.checkpoint", "step:parameters.change", "step:parameters.change", "history:edit.restore_checkpoint"]
+        );
+        assert_eq!(c.calls[3].2, json!({"checkpoint":77}), "failure restores without forget");
+    }
+}
+
+#[test]
+fn batch_shared_core_coalescing_fallback_and_timing_indices() {
+    let steps = [
+        json!({"command":"parameters.list"}),
+        json!({"command":"parameters.change","params":{"name":"width","expression":"20"}}),
+        json!({"id":"parameters.change","params":{"name":"depth","expression":"30"}}),
+    ];
+    for refuse_merge in [false, true] {
+        let mut c = BatchCoreContext { refuse_merge, ..Default::default() };
+        let body = batch::run_document_steps(
+            &mut c,
+            &steps,
+            &json!({"coalesce_parameters":true,"profile":true}),
+            batch_core_step,
+            batch_core_history,
+            batch::CheckpointPolicy::BestEffort,
+        );
+        assert_eq!(body["completed"], 3);
+        assert_eq!(body["results"].as_array().map(Vec::len), Some(3));
+        assert!(body.get("rolled_back").is_none());
+        let rows = body["timings"].as_array().unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r["index"].clone()).collect::<Vec<_>>(),
+            if refuse_merge { vec![json!(0), json!(1), json!(2)] } else { vec![json!(0), json!(1)] }
+        );
+        for row in rows {
+            assert!(row["ms"].as_f64().is_some_and(|ms| ms.is_finite() && ms >= 0.0));
+            assert!(row["profile"].is_object());
+        }
+        assert!(body["total_ms"].as_f64().is_some_and(|ms| ms.is_finite() && ms >= 0.0));
+        assert_eq!(c.calls[2], ("step", "parameters.change".into(), json!({"changes":{"depth":"30","width":"20"}})));
+        assert_eq!(c.calls.len(), if refuse_merge { 6 } else { 4 });
+        if !refuse_merge {
+            assert_eq!(body["results"][1]["coalesced"], 2);
+            assert_eq!(body["results"][1]["value"], 20.0);
+            assert_eq!(body["results"][2]["value"], 30.0);
+        }
+    }
+    let mut c = BatchCoreContext::default();
+    let body = batch::run_document_steps(&mut c, &steps, &json!({}), batch_core_step, batch_core_history, batch::CheckpointPolicy::BestEffort);
+    assert!(body.get("timings").is_none() && body.get("total_ms").is_none());
+    assert_eq!(c.calls.len(), 5, "coalesce defaults off");
+}
+
+#[test]
+fn batch_shared_core_empty_and_null_params() {
+    let mut c = BatchCoreContext::default();
+    let body = batch::run_document_steps(&mut c, &[], &json!({}), batch_core_step, batch_core_history, batch::CheckpointPolicy::BestEffort);
+    assert_eq!(body, json!({"completed":0,"results":[],"undone":0}));
+    assert_eq!(
+        c.calls,
+        vec![("history", "edit.checkpoint".into(), json!({})), ("history", "edit.restore_checkpoint".into(), json!({"checkpoint":77,"forget":true}))]
+    );
+    let steps = [json!({"id":"parameters.list","params":null}), json!({"command":null,"id":"parameters.list"})];
+    let mut c = BatchCoreContext::default();
+    let body = batch::run_document_steps(
+        &mut c,
+        &steps,
+        &json!({"rollback":false,"timings":true}),
+        batch_core_step,
+        batch_core_history,
+        batch::CheckpointPolicy::BestEffort,
+    );
+    assert_eq!(c.calls, vec![("step", "parameters.list".into(), json!({}))]);
+    assert_eq!(body["completed"], 1);
+    assert_eq!(body["results"], json!([{"applied":{}}]));
+    assert_eq!(body["failed"], json!({"index":1,"command":null,"error":"missing `command`"}));
+    assert_eq!(body["rolled_back"], false);
+    assert_eq!(body["undone"], 0);
+    assert_eq!(body["timings"][1]["index"], 1);
+    assert!(body["timings"][0].get("profile").is_none());
+}
+
+#[test]
+fn batch_shared_checkpoint_unguarded_keeps_best_effort() {
+    for checkpoint in [Err("checkpoint refused".into()), Ok(json!({})), Ok(json!({"checkpoint":"77"})), Ok(json!({"checkpoint":-1}))] {
+        let mut c = BatchCoreContext { checkpoint, ..Default::default() };
+        let body = batch::run_document_steps(
+            &mut c,
+            &[json!({"command":"parameters.list"}), json!({"command":"parameters.change","params":{"expression":"bad"}})],
+            &json!({}),
+            batch_core_step,
+            batch_core_history,
+            batch::CheckpointPolicy::BestEffort,
+        );
+        assert_eq!(body["completed"], 1);
+        assert_eq!(body["rolled_back"], false);
+        assert_eq!(body["undone"], 0);
+        assert_eq!(c.calls.len(), 3, "checkpoint failure must not cause invalid restore");
+    }
+}
+
+#[test]
+fn batch_shared_checkpoint_required_refuses_invalid_receipts() {
+    let steps = [
+        json!({"command":"parameters.change","params":{"name":"width","expression":"20"}}),
+        json!({"command":"parameters.change","params":{"name":"depth","expression":"30"}}),
+    ];
+    for checkpoint in
+        [Err("checkpoint refused".into()), Ok(json!({})), Ok(json!({"checkpoint":"77"})), Ok(json!({"checkpoint":-1})), Ok(json!({"checkpoint":1.5}))]
+    {
+        for options in [json!({"coalesce_parameters":true}), json!({"rollback":true,"coalesce_parameters":true})] {
+            let mut c = BatchCoreContext { checkpoint: checkpoint.clone(), ..Default::default() };
+            let body = batch::run_document_steps(&mut c, &steps, &options, batch_core_step, batch_core_history, batch::CheckpointPolicy::Required);
+            assert_eq!(body["completed"], 0, "{body}");
+            assert_eq!(body["results"], json!([]));
+            assert_eq!(body["not_run"], json!([0, 1]));
+            assert_eq!(body["rolled_back"], false);
+            assert_eq!(body["undone"], 0);
+            assert_eq!(body["failed"]["index"], Value::Null);
+            assert_eq!(body["failed"]["command"], "edit.checkpoint");
+            assert_eq!(body["failed"]["stage"], "checkpoint");
+            assert!(body["failed"]["error"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(c.calls, vec![("history", "edit.checkpoint".into(), json!({}))]);
+        }
+        let mut c = BatchCoreContext { checkpoint, ..Default::default() };
+        let body = batch::run_document_steps(
+            &mut c,
+            &steps,
+            &json!({"rollback":false}),
+            batch_core_step,
+            batch_core_history,
+            batch::CheckpointPolicy::Required,
+        );
+        assert_eq!(body["completed"], 2);
+        assert_eq!(c.calls.len(), 2);
+        assert!(c.calls.iter().all(|(kind, _, _)| *kind == "step"));
+    }
+}
+
+// Catches rechecking the original base between steps, stale checkpoint allocation, or a
+// synthetic result stamp. Uses real parameter commands and the existing history commands.
+#[test]
+fn conditioned_batch_checks_base_once_before_history() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name":"width","expression":"10 mm"}));
+    let base = s.document_stamp();
+    let undo = s.undo.len();
+    let next = s.next_checkpoint;
+    let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = trace.clone();
+    s.set_command_check(Some(Arc::new(move |id, p, _| {
+        observed.lock().unwrap().push((id.to_string(), p.clone()));
+        Ok(())
+    })));
+    let steps = [
+        json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}),
+        json!({"id":"parameters.change","params":{"name":"width","expression":"30 mm"}}),
+    ];
+    let (body, after) = s.batch_if_current(&steps, &json!({}), &base).unwrap();
+    assert_eq!(body["completed"], 2);
+    assert_eq!(body["results"][0]["value"], 20.0);
+    assert_eq!(body["results"][1]["value"], 30.0);
+    assert!(body.get("failed").is_none() && body.get("rolled_back").is_none());
+    assert_eq!(s.doc.param("width").unwrap().expr, "30 mm");
+    assert_eq!(s.undo.len(), undo + 2);
+    assert_eq!(s.next_checkpoint, next + 1);
+    assert_ne!(after, base);
+    assert_eq!(s.document_stamp(), after);
+    assert_eq!(trace.lock().unwrap().last().unwrap(), &("edit.restore_checkpoint".into(), json!({"checkpoint":next,"forget":true})));
+    trace.lock().unwrap().clear();
+    let (doc, undo, redo, next) = (s.doc.clone(), s.undo.len(), s.redo.len(), s.next_checkpoint);
+    for stale in [base, DocumentStamp { document_id: format!("{}-other", after.document_id), revision: after.revision }] {
+        assert!(
+            matches!(s.batch_if_current(&steps,&json!({}),&stale),Err(ConditionedError::Changed{expected,current}) if expected==stale && current==after)
+        );
+        assert!(Arc::ptr_eq(&s.doc, &doc));
+        assert_eq!((s.undo.len(), s.redo.len(), s.next_checkpoint), (undo, redo, next));
+        assert!(trace.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn conditioned_batch_preserves_limits_preflight_and_result_facts() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name":"width","expression":"10 mm"}));
+    let base = s.document_stamp();
+    let next = s.next_checkpoint;
+    let oversized = vec![json!({"command":"parameters.list"}); 10_001];
+    assert!(
+        matches!(s.batch_if_current(&oversized,&json!({}),&base),Err(ConditionedError::Command(EngineError::Other(message))) if message=="engine.batch: commands must be an array of at most 10000 steps")
+    );
+    assert_eq!(s.next_checkpoint, next);
+    for (level, last) in [
+        (schema::ParamCheck::Off, json!({"command":"unknown.batch"})),
+        (schema::ParamCheck::Strict, json!({"command":"solid.box","params":{"lenght":10,"width":10,"height":10}})),
+    ] {
+        s.param_check = level;
+        let steps = [json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}), last];
+        let (body, stamp) = s.batch_if_current(&steps, &json!({}), &base).unwrap();
+        assert_eq!(body["completed"], 0);
+        assert_eq!(body["failed"]["index"], 1);
+        assert_eq!(body["not_run"], json!([0, 1]));
+        assert_eq!(body["rolled_back"], false);
+        assert_eq!(stamp, base);
+        assert_eq!(s.next_checkpoint, next);
+    }
+    s.param_check = schema::ParamCheck::Off;
+    let edits = [
+        json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}),
+        json!({"command":"parameters.change","params":{"name":"width","expression":"30 mm"}}),
+    ];
+    let (body, after) = s.batch_if_current(&edits, &json!({"coalesce_parameters":true,"timings":true}), &base).unwrap();
+    assert_eq!(body["completed"], 2);
+    assert_eq!(body["results"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["results"][0]["coalesced"], 2);
+    assert_eq!(body["results"][1]["value"], 30.0);
+    assert_eq!(body["timings"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["timings"][0]["index"], 0);
+    assert_eq!(s.document_stamp(), after);
+    for rollback in [true, false] {
+        let base = s.document_stamp();
+        let next = s.next_checkpoint;
+        let (body, after) = s
+            .batch_if_current(
+                &[
+                    json!({"command":"parameters.change","params":{"name":"width","expression":"40 mm"}}),
+                    json!({"command":"parameters.change","params":{"name":"width","expression":"1 +"}}),
+                ],
+                &json!({"rollback":rollback,"coalesce_parameters":true}),
+                &base,
+            )
+            .unwrap();
+        assert_eq!(body["completed"], 1);
+        assert_eq!(body["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["failed"]["index"], 1);
+        assert_eq!(body["rolled_back"], rollback);
+        assert_eq!(body["undone"], usize::from(rollback));
+        assert_eq!(s.doc.param("width").unwrap().expr, if rollback { "30 mm" } else { "40 mm" });
+        assert_eq!(s.next_checkpoint, next + u64::from(rollback));
+        assert_eq!(s.document_stamp(), after);
+    }
+}
+
+#[test]
+fn conditioned_batch_required_checkpoint_refusal_and_restore_failure() {
+    for (refused, rollback) in [("edit.checkpoint", true), ("edit.checkpoint", false), ("edit.restore_checkpoint", true)] {
+        let mut s = Session::default();
+        run(&mut s, "parameters.add", json!({"name":"width","expression":"10 mm"}));
+        let base = s.document_stamp();
+        let doc = s.doc.clone();
+        let undo = s.undo.len();
+        let next = s.next_checkpoint;
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = trace.clone();
+        s.set_command_check(Some(Arc::new(move |id, _, _| {
+            observed.lock().unwrap().push(id.to_string());
+            if id == refused { Err("injected history refusal".into()) } else { Ok(()) }
+        })));
+        let (body, after) = s
+            .batch_if_current(
+                &[
+                    json!({"command":"parameters.change","params":{"name":"width","expression":"20 mm"}}),
+                    json!({"command":"parameters.change","params":{"name":"width","expression":"1 +"}}),
+                ],
+                &json!({"rollback":rollback,"coalesce_parameters":true}),
+                &base,
+            )
+            .unwrap();
+        assert_eq!(body["rolled_back"], false);
+        assert_eq!(body["undone"], 0);
+        if rollback && refused == "edit.checkpoint" {
+            assert_eq!(body["completed"], 0);
+            assert_eq!(body["not_run"], json!([0, 1]));
+            assert_eq!(body["failed"]["stage"], "checkpoint");
+            assert_eq!(*trace.lock().unwrap(), ["edit.checkpoint"]);
+            assert!(Arc::ptr_eq(&s.doc, &doc));
+            assert_eq!(s.undo.len(), undo);
+            assert_eq!(s.next_checkpoint, next);
+            assert_eq!(after, base);
+        } else {
+            assert_eq!(body["completed"], 1);
+            assert_eq!(s.doc.param("width").unwrap().expr, "20 mm");
+            assert_eq!(s.undo.len(), undo + 1);
+            assert_eq!(trace.lock().unwrap().iter().filter(|id| id.as_str() == "edit.checkpoint").count(), usize::from(rollback));
+            assert_eq!(s.document_stamp(), after);
+        }
+    }
+}
+
+#[test]
 fn round_as_tall_as_a_disc_uses_up_its_wall() {
     // #190: a disc 13 in radius and 2 high, its top edge rounded by 2.
     let mut s = Session::default();

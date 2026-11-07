@@ -340,6 +340,51 @@ fn boxed(x: f64) -> Value {
     json!({"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0]}})
 }
 
+// Catches gate handoffs that enqueue stale/unsupported work before host admission.
+#[test]
+fn guarded_control_gate_handoffs_admit_before_execution_held() {
+    for mode in [agents::Mode::Edits, agents::Mode::Ask] {
+        let (mut app, tx) = app_in_a_turn();
+        app.preferences.ai_permissions = mode;
+        app.run("parameters.add", json!({"name":"width","expression":"10 mm"})).unwrap();
+        let stamp = app.session.document_stamp();
+        let expected = json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()});
+        let response = ask(
+            &tx,
+            "engine.execute",
+            json!({"command":"parameters.change","params":{"name":"width","expression":"30 mm"},"expectedDocument":expected}),
+        );
+        if mode == agents::Mode::Ask {
+            pump_tools(&mut app);
+            assert_eq!(app.agent_chat.held.len(), 1);
+        }
+        app.run("parameters.change", json!({"name":"width","expression":"20 mm"})).unwrap();
+        if mode == agents::Mode::Ask {
+            let id = app.agent_chat.held[0].id;
+            approve(&mut app, id, true);
+        } else {
+            pump_tools(&mut app);
+        }
+        assert!(app.control_held.is_empty(), "stale requests must not enter execution held state");
+        let response = response.try_recv().unwrap();
+        assert_eq!(response["errorDetails"]["code"], "STALE_DOCUMENT", "{response}");
+        assert_eq!(response["errorDetails"]["details"]["expected"], expected);
+        assert_eq!(app.session.doc.param("width").unwrap().expr, "20 mm");
+    }
+    let (mut app, tx) = app_in_a_turn();
+    app.preferences.ai_permissions = agents::Mode::All;
+    let stamp = app.session.document_stamp();
+    let response = ask(
+        &tx,
+        "engine.execute",
+        json!({"command":"doc.open","params":{"path":"not-opened.sc"},"expectedDocument":{"documentId":stamp.document_id,"revision":stamp.revision.to_string()}}),
+    );
+    pump_tools(&mut app);
+    assert!(app.control_held.is_empty());
+    assert_eq!(response.try_recv().unwrap()["errorDetails"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert!(!app.file_load.busy());
+}
+
 /// Everything the agent changed in one message undoes as one step, and the conversation offers
 /// that undo while nothing else has happened since.
 #[test]
@@ -698,6 +743,11 @@ fn a_title_that_mentions_solidcraft_goes_through_the_users_mode() {
 
 use std::sync::Mutex;
 
+struct CancelObserver {
+    active: Arc<std::sync::atomic::AtomicBool>,
+    reply: Sender<bool>,
+}
+
 /// A backend that records what the panel asks of it, and reports what the test pushes.
 #[derive(Clone, Default)]
 struct Script {
@@ -705,6 +755,9 @@ struct Script {
     events: Arc<Mutex<Vec<Event>>>,
     /// Every prompt in full (its text and pictures).
     prompts: Arc<Mutex<Vec<Vec<PromptPart>>>>,
+    /// Observe the host's trusted flag at the external cancellation boundary, without
+    /// inventing a terminal event (a provider need not ever acknowledge Stop).
+    cancel_observer: Arc<Mutex<Option<CancelObserver>>>,
 }
 
 impl Script {
@@ -729,6 +782,9 @@ impl ChatBackend for Script {
         self.prompts.lock().unwrap().push(parts.to_vec());
     }
     fn cancel(&mut self) {
+        if let Some(observer) = self.cancel_observer.lock().unwrap().as_ref() {
+            let _ = observer.reply.send(observer.active.load(std::sync::atomic::Ordering::Relaxed));
+        }
         self.calls.lock().unwrap().push("cancel".into());
     }
     fn new_session(&mut self) {
@@ -758,6 +814,442 @@ fn app_with_script() -> (SolveApp, Script, egui::Context) {
 
 fn ended(script: &Script, reason: &str) {
     script.report(Event::TurnEnded { reason: reason.into() });
+}
+
+fn guarded_stop_request(app: &mut SolveApp, method: &str, mut params: Value) -> (ControlRequest, Receiver<Value>) {
+    let stamp = app.session.document_stamp();
+    params["expectedDocument"] = json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()});
+    let (mut req, reply) = ControlRequest::new(method, params);
+    req.chat_turn = Some(app.agent_chat.turn.as_ref().unwrap().active.clone());
+    crate::execution_guard::admit(app, &mut req).unwrap_or_else(|_| panic!("matching admission"));
+    (req, reply)
+}
+
+fn guarded_stop_history(app: &SolveApp) -> Value {
+    let snapshots = |items: &[solidcraft_engine::Snapshot]| {
+        items
+            .iter()
+            .map(|s| {
+                json!({"doc":s.doc.to_json(),"label":s.label,
+            "active_sketch":s.active_sketch,"pending_moves":s.pending_moves,"visibility":s.visibility})
+            })
+            .collect::<Vec<_>>()
+    };
+    json!({"undo":snapshots(&app.session.undo),"redo":snapshots(&app.session.redo)})
+}
+
+fn assert_guarded_cancelled(reply: &Value, operation: &str) {
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(reply["error"].as_str().is_some_and(|s| !s.is_empty()), "{reply}");
+    assert_eq!(reply["errorDetails"]["code"], "CANCELLED", "{reply}");
+    assert_eq!(reply["errorDetails"]["retry"], "never", "{reply}");
+    assert_eq!(reply["errorDetails"]["details"], json!({"operation":operation}), "{reply}");
+    assert!(reply.get("result").is_none() && reply.get("documentStamp").is_none(), "{reply}");
+}
+
+#[test]
+fn guarded_stop_closes_flag_without_backend_terminal() {
+    // Moving flag closure back to finish_turn, or below backend.cancel, breaks this handshake.
+    let (mut app, script, ctx) = app_with_script();
+    send(&mut app, &ctx, "make a box".into());
+    send(&mut app, &ctx, "later".into());
+    let active = app.agent_chat.turn.as_ref().unwrap().active.clone();
+    let (observe, observed) = channel();
+    *script.cancel_observer.lock().unwrap() = Some(CancelObserver { active: active.clone(), reply: observe });
+    app.agent_chat.push(Item::Permission { key: 9, title: "external permission".into(), options: Vec::new(), answer: None });
+    let before = app.session.doc.clone();
+    cancel(&mut app);
+    assert!(!observed.try_recv().unwrap(), "backend.cancel must see revoked authority");
+    assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.agent_chat.turn.as_ref().is_some_and(|t| Arc::ptr_eq(&t.active, &active)));
+    poll(&mut app, &ctx); // Script deliberately sends no terminal event.
+    assert!(app.agent_chat.turn.is_some());
+    assert_eq!(app.agent_chat.state(), State::Busy);
+    assert!(app.agent_chat.backend.is_some());
+    assert_eq!(script.calls(), ["prompt: make a box", "cancel"]);
+    assert_eq!(texts(&app), ["later"]);
+    assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Permission { answer: Some(_), .. })));
+    assert!(!app.agent_chat.items.iter().any(|i| matches!(i, Item::Changes { .. })));
+    assert!(Arc::ptr_eq(&before, &app.session.doc) && app.session.undo.is_empty());
+}
+
+#[test]
+fn guarded_stop_refuses_matching_queue_cursor_and_ahead() {
+    // A matching stamp cannot revive work admitted before Stop. No worker terminal is needed.
+    for route in ["queue", "cursor", "cursor-ahead", "ahead", "immediate", "copy"] {
+        let (mut app, _script, ctx) = app_with_script();
+        send(&mut app, &ctx, "make a box".into());
+        let method = if route == "copy" { "document.inspect" } else { "engine.batch" };
+        let params = if route == "copy" { json!({}) } else { json!({"commands":[boxed(0.0),boxed(20.0)]}) };
+        let (req, reply) = guarded_stop_request(&mut app, method, params);
+        let expected = req.guarded.as_ref().unwrap().expected.clone();
+        let mut gate = None;
+        let mut immediate = None;
+        if route.starts_with("cursor") {
+            app.ui.agent_cursor.show = true;
+            crate::scenario::publish_handle("toolbar:solid.box", egui::pos2(100.0, 100.0));
+            if route == "cursor-ahead" {
+                app.apply_off_thread = Some(std::time::Duration::ZERO);
+                app.preferences.agent_off_thread = true;
+                gate = Some(crate::history_off_thread_tests::guarded_workers::gate());
+            }
+            assert!(crate::agent_cursor::intercept(&mut app, &req));
+        } else if matches!(route, "ahead" | "copy") {
+            app.apply_off_thread = Some(std::time::Duration::ZERO);
+            app.preferences.agent_off_thread = true;
+            gate = Some(crate::history_off_thread_tests::guarded_workers::gate());
+            assert!(app.offload_control(&ctx, req).is_none());
+        } else if route == "immediate" {
+            let ahead = app.session.ahead();
+            let kept = ahead.kept();
+            ahead.evaluate(&[("solid.box".into(), boxed(0.0)["params"].clone()), ("solid.box".into(), boxed(20.0)["params"].clone())]).unwrap();
+            immediate = Some((req, kept));
+        } else {
+            app.control_held.push_back(req);
+        }
+        if let Some(gate) = &gate {
+            gate.computed();
+        }
+        assert_eq!(app.session.document_stamp(), expected, "still matching at Stop: {route}");
+        let doc = app.session.doc.clone();
+        let history = guarded_stop_history(&app);
+        let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        cancel(&mut app);
+        if let Some(gate) = gate {
+            gate.release();
+        }
+        if let Some((req, kept)) = immediate {
+            app.finish_control_ahead(&ctx, req, kept);
+        }
+        app.drain_control(&ctx);
+        crate::agent_cursor::step(&mut app, &ctx);
+        app.poll_control_jobs(&ctx);
+        let r = reply.try_recv().unwrap_or_else(|e| panic!("{route}: {e}"));
+        assert_guarded_cancelled(&r, method);
+        for _ in 0..8 {
+            app.now += 2.0;
+            crate::agent_cursor::step(&mut app, &ctx);
+            app.poll_control_jobs(&ctx);
+            app.drain_control(&ctx);
+        }
+        assert!(reply.try_recv().is_err(), "no late success: {route}");
+        assert!(Arc::ptr_eq(&doc, &app.session.doc), "{route}");
+        assert_eq!(guarded_stop_history(&app), history, "{route}");
+        assert_eq!(app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"], checkpoint + 1, "no refused batch checkpoint: {route}");
+        assert!(app.control_job.is_none() && app.control_answering.is_empty() && !app.agent.busy());
+        assert!(app.agent_chat.turn.is_some(), "terminal still owns the turn");
+    }
+}
+
+#[test]
+fn guarded_stop_inactive_direct_calls_ignore_forged_authority() {
+    // Direct handle used to skip the trusted cancellation check; JSON cannot reopen it.
+    for route in ["handle", "run", "offload", "admit"] {
+        for stale in [false, true] {
+            let (mut app, _script, ctx) = app_with_script();
+            send(&mut app, &ctx, "make a box".into());
+            let (mut req, reply) = guarded_stop_request(&mut app, "engine.batch", json!({"commands":[boxed(0.0)]}));
+            let active = req.chat_turn.as_ref().unwrap().clone();
+            active.store(false, std::sync::atomic::Ordering::Relaxed);
+            req.params["turnId"] = json!("forged-live-turn");
+            req.params["active"] = json!(true);
+            if stale {
+                app.run("parameters.add", json!({"name":"person","expression":"1 mm"})).unwrap();
+            }
+            let doc = app.session.doc.clone();
+            let history = guarded_stop_history(&app);
+            let r = match route {
+                "handle" => match crate::control::handle(&mut app, &ctx, &req) {
+                    crate::control::Outcome::Done(r) => r,
+                    _ => panic!("not a screenshot"),
+                },
+                "run" => {
+                    app.run_control(&ctx, req);
+                    reply.try_recv().unwrap()
+                }
+                "offload" => {
+                    assert!(app.offload_control(&ctx, req).is_none());
+                    reply.try_recv().unwrap()
+                }
+                _ => match crate::execution_guard::admit(&mut app, &mut req) {
+                    Err(error) => crate::execution_guard::refusal_json(&error),
+                    Ok(()) => panic!("inactive cannot be admitted"),
+                },
+            };
+            assert_guarded_cancelled(&r, "engine.batch");
+            assert!(Arc::ptr_eq(&doc, &app.session.doc));
+            assert_eq!(guarded_stop_history(&app), history);
+            assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+}
+
+#[test]
+fn guarded_stop_keeps_committed_edit_and_merges_undo_once() {
+    // Stop must not remove the turn or merge now: only a later terminal owns that work.
+    let (mut app, script, ctx) = app_with_script();
+    send(&mut app, &ctx, "two boxes".into());
+    let original = app.session.doc.clone();
+    let (first, reply) = guarded_stop_request(&mut app, "engine.batch", json!({"commands":[boxed(0.0),boxed(20.0)]}));
+    app.run_control(&ctx, first);
+    assert_eq!(reply.try_recv().unwrap()["ok"], true);
+    assert_eq!(app.session.undo.len(), 2);
+    let (second, late) = guarded_stop_request(&mut app, "engine.batch", json!({"commands":[boxed(40.0)]}));
+    app.control_held.push_back(second);
+    let committed = app.session.doc.clone();
+    let history = guarded_stop_history(&app);
+    cancel(&mut app);
+    assert!(app.agent_chat.turn.is_some());
+    assert_eq!(guarded_stop_history(&app), history, "no early undo merge");
+    app.drain_control(&ctx);
+    assert_guarded_cancelled(&late.try_recv().unwrap(), "engine.batch");
+    assert!(Arc::ptr_eq(&committed, &app.session.doc));
+    assert_eq!(guarded_stop_history(&app), history);
+    script.report(Event::Text { thought: false, text: "the committed boxes remain".into() });
+    ended(&script, "cancelled");
+    poll(&mut app, &ctx);
+    assert!(app.agent_chat.turn.is_none());
+    assert_eq!(app.session.undo.len(), 1);
+    let changes = app.agent_chat.items.iter().position(|i| matches!(i, Item::Changes { steps: 2, .. })).unwrap();
+    let merged = guarded_stop_history(&app);
+    ended(&script, ""); // Even a late normal-success terminal cannot merge or apply again.
+    poll(&mut app, &ctx);
+    assert_eq!(guarded_stop_history(&app), merged, "duplicate terminal cannot merge twice");
+    assert_eq!(app.agent_chat.items.iter().filter(|i| matches!(i, Item::Changes { .. })).count(), 1);
+    assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Agent { text, .. } if text == "the committed boxes remain")));
+    undo_changes(&mut app, changes);
+    assert!(Arc::ptr_eq(&original, &app.session.doc));
+}
+
+#[test]
+fn guarded_command_chip_stop_allows_next_request() {
+    // Chip Stop drops only this receiver, not the turn token or a request behind it.
+    for cursor in [false, true] {
+        let (mut app, script, ctx) = app_with_script();
+        send(&mut app, &ctx, "make a box".into());
+        let active = app.agent_chat.turn.as_ref().unwrap().active.clone();
+        app.apply_off_thread = Some(std::time::Duration::ZERO);
+        app.preferences.agent_off_thread = true;
+        let (req, reply) = guarded_stop_request(&mut app, "engine.execute", boxed(0.0));
+        let (next, next_reply) = guarded_stop_request(&mut app, "engine.execute", boxed(20.0));
+        let gate = crate::history_off_thread_tests::guarded_workers::gate();
+        if cursor {
+            app.ui.agent_cursor.show = true;
+            crate::scenario::publish_handle("toolbar:solid.box", egui::pos2(100.0, 100.0));
+            assert!(crate::agent_cursor::intercept(&mut app, &req));
+            for _ in 0..8 {
+                app.now += 2.0;
+                crate::agent_cursor::step(&mut app, &ctx);
+            }
+            assert!(app.agent.computing().is_some());
+        } else {
+            assert!(app.offload_control(&ctx, req).is_none());
+        }
+        gate.computed();
+        let doc = app.session.doc.clone();
+        let history = guarded_stop_history(&app);
+        let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        app.stop_agent_command();
+        let r = reply.try_recv().unwrap();
+        assert_eq!(r["stopped"], true);
+        assert_guarded_cancelled(&r, "engine.execute");
+        // The structured diagnostic must describe this command Stop, not a turn ending.
+        assert_eq!(r["errorDetails"]["message"], r["error"]);
+        assert!(active.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.agent_chat.turn.is_some());
+        assert_eq!(script.calls(), ["prompt: make a box"], "chip does not cancel the provider");
+        gate.release(); // The detached worker completes only AFTER Stop.
+        for _ in 0..8 {
+            app.now += 2.0;
+            crate::agent_cursor::step(&mut app, &ctx);
+            app.poll_control_jobs(&ctx);
+        }
+        assert!(reply.try_recv().is_err());
+        assert!(Arc::ptr_eq(&doc, &app.session.doc));
+        assert_eq!(guarded_stop_history(&app), history);
+        assert_eq!(app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"], checkpoint + 1);
+        app.run_control(&ctx, next);
+        assert_eq!(next_reply.try_recv().unwrap()["ok"], true);
+        assert_eq!(app.session.doc.features.len(), 1);
+        assert_eq!(app.session.undo.len(), 1);
+    }
+}
+
+fn assert_legacy_command_chip_reply(cursor: bool) {
+    let (mut app, script, ctx) = app_with_script();
+    send(&mut app, &ctx, "make a box".into());
+    let active = app.agent_chat.turn.as_ref().unwrap().active.clone();
+    app.apply_off_thread = Some(std::time::Duration::ZERO);
+    app.preferences.agent_off_thread = true;
+    let (mut req, reply) = ControlRequest::new("engine.execute", boxed(0.0));
+    req.chat_turn = Some(active.clone());
+    assert!(req.guarded.is_none() && req.params.get("expectedDocument").is_none());
+    let gate = crate::history_off_thread_tests::guarded_workers::gate();
+    if cursor {
+        app.ui.agent_cursor.show = true;
+        crate::scenario::publish_handle("toolbar:solid.box", egui::pos2(100.0, 100.0));
+        assert!(crate::agent_cursor::intercept(&mut app, &req));
+        for _ in 0..8 {
+            app.now += 2.0;
+            crate::agent_cursor::step(&mut app, &ctx);
+        }
+        assert!(app.agent.computing().is_some());
+    } else {
+        assert!(app.offload_control(&ctx, req).is_none());
+    }
+    gate.computed();
+    let doc = app.session.doc.clone();
+    let history = guarded_stop_history(&app);
+    let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+    app.stop_agent_command();
+    // Exact legacy object, not just the absence of one selected structured field.
+    assert_eq!(
+        reply.try_recv().unwrap(),
+        json!({
+            "ok":false,"stopped":true,
+            "error":"stopped: the person at the app stopped `Box` while it computed; nothing was applied"
+        })
+    );
+    assert!(active.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(script.calls(), ["prompt: make a box"]);
+    gate.release();
+    for _ in 0..8 {
+        app.now += 2.0;
+        crate::agent_cursor::step(&mut app, &ctx);
+        app.poll_control_jobs(&ctx);
+    }
+    assert!(reply.try_recv().is_err());
+    assert!(Arc::ptr_eq(&doc, &app.session.doc));
+    assert_eq!(guarded_stop_history(&app), history);
+    assert_eq!(app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"], checkpoint + 1);
+    let (mut next, next_reply) = ControlRequest::new("engine.execute", boxed(20.0));
+    next.chat_turn = Some(active);
+    app.run_control(&ctx, next);
+    assert_eq!(next_reply.try_recv().unwrap()["ok"], true);
+    assert_eq!(app.session.doc.features.len(), 1);
+    assert_eq!(app.session.undo.len(), 1);
+}
+
+#[test]
+fn guarded_command_chip_legacy_job_reply_is_unchanged() {
+    // Unconditionally adding CANCELLED also changes callers that never supplied a guard.
+    assert_legacy_command_chip_reply(false);
+}
+
+#[test]
+fn guarded_command_chip_legacy_cursor_reply_is_unchanged() {
+    assert_legacy_command_chip_reply(true);
+}
+
+fn ask_held_change(app: &mut SolveApp, tx: &Sender<ControlRequest>, guarded: bool, wire_active: bool) -> (u64, Receiver<Value>) {
+    app.preferences.ai_permissions = agents::Mode::Ask;
+    let mut params = boxed(0.0);
+    if guarded {
+        let stamp = app.session.document_stamp();
+        params["expectedDocument"] = json!({"documentId":stamp.document_id,"revision":stamp.revision.to_string()});
+    }
+    params["turnId"] = json!("untrusted-turn");
+    params["active"] = json!(wire_active);
+    let reply = ask(tx, "engine.execute", params);
+    pump_tools(app);
+    assert_eq!(app.agent_chat.held.len(), 1);
+    let held = &app.agent_chat.held[0];
+    assert!(held.req.guarded.is_none(), "Ask has not admitted or pinned a document yet");
+    assert!(Arc::ptr_eq(held.req.chat_turn.as_ref().unwrap(), &app.agent_chat.turn.as_ref().unwrap().active));
+    assert!(!held.req.started.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.control_held.is_empty() && reply.try_recv().is_err());
+    (held.id, reply)
+}
+
+#[test]
+fn guarded_stop_ask_held_request_gets_cancelled_without_admission() {
+    // Ask -> held -> actual Stop must not lose CANCELLED, even if the expected stamp is stale.
+    for stale in [false, true] {
+        let (mut app, tx) = app_in_a_turn();
+        let active = app.agent_chat.turn.as_ref().unwrap().active.clone();
+        let (id, reply) = ask_held_change(&mut app, &tx, true, true);
+        if stale {
+            app.run("parameters.add", json!({"name":"person","expression":"1 mm"})).unwrap();
+        }
+        let doc = app.session.doc.clone();
+        let history = guarded_stop_history(&app);
+        let checkpoint = app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"].as_u64().unwrap();
+        cancel(&mut app);
+        let r = reply.try_recv().unwrap();
+        assert_eq!(
+            r,
+            json!({"ok":false,"error":"not run: the user stopped the message",
+            "errorDetails":{"code":"CANCELLED","message":"not run: the user stopped the message",
+                "retry":"never","details":{"operation":"engine.execute"}}})
+        );
+        assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.agent_chat.turn.as_ref().is_some_and(|t| Arc::ptr_eq(&t.active, &active)));
+        assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Approval { id: x, answer: Some(false), .. } if *x == id)));
+        assert!(app.agent_chat.held.is_empty() && app.control_held.is_empty());
+        assert!(Arc::ptr_eq(&doc, &app.session.doc));
+        assert_eq!(guarded_stop_history(&app), history);
+        assert_eq!(app.run("edit.checkpoint", json!({})).unwrap()["checkpoint"], checkpoint + 1);
+        assert!(reply.try_recv().is_err());
+    }
+}
+
+#[test]
+fn guarded_stop_ask_manual_denial_and_legacy_stop_keep_exact_replies() {
+    // These are compatibility characterizations: a live guarded manual denial is not Stop,
+    // and an unguarded Stop must retain its old Stop-specific (not generic turn-ended) text.
+    for guarded in [false, true] {
+        let (mut app, tx) = app_in_a_turn();
+        let active = app.agent_chat.turn.as_ref().unwrap().active.clone();
+        let (id, reply) = ask_held_change(&mut app, &tx, guarded, false);
+        let doc = app.session.doc.clone();
+        let history = guarded_stop_history(&app);
+        if guarded {
+            approve(&mut app, id, false);
+            assert_eq!(reply.try_recv().unwrap(), json!({"ok":false,"error":"not run: the user declined it"}));
+            assert!(active.load(std::sync::atomic::Ordering::Relaxed), "wire active:false cannot revoke the native flag");
+        } else {
+            cancel(&mut app);
+            assert_eq!(reply.try_recv().unwrap(), json!({"ok":false,"error":"not run: the user stopped the message"}));
+            assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Approval { id: x, answer: Some(false), .. } if *x == id)));
+        assert!(app.agent_chat.held.is_empty() && app.control_held.is_empty());
+        assert!(Arc::ptr_eq(&doc, &app.session.doc));
+        assert_eq!(guarded_stop_history(&app), history);
+        assert!(reply.try_recv().is_err());
+    }
+}
+
+#[test]
+fn guarded_stop_ask_decline_uses_held_token_not_current_turn_or_reason() {
+    for own_active in [true, false] {
+        let (mut app, tx) = app_in_a_turn();
+        let own = app.agent_chat.turn.as_ref().unwrap().active.clone();
+        let (id, reply) = ask_held_change(&mut app, &tx, true, !own_active);
+        own.store(own_active, std::sync::atomic::Ordering::Relaxed);
+        // A different current token and contradictory why/JSON cannot decide this request's authority.
+        app.agent_chat.turn.as_mut().unwrap().active = Arc::new(std::sync::atomic::AtomicBool::new(!own_active));
+        assert!(Arc::ptr_eq(app.agent_chat.held[0].req.chat_turn.as_ref().unwrap(), &own));
+        let doc = app.session.doc.clone();
+        let history = guarded_stop_history(&app);
+        let why = if own_active { "the user stopped the message" } else { "the user declined it" };
+        approve_with(&mut app, id, false, why);
+        let r = reply.try_recv().unwrap();
+        if own_active {
+            assert_eq!(r, json!({"ok":false,"error":"not run: the user stopped the message"}));
+        } else {
+            assert_eq!(
+                r,
+                json!({"ok":false,"error":"not run: the user declined it",
+                "errorDetails":{"code":"CANCELLED","message":"not run: the user declined it",
+                    "retry":"never","details":{"operation":"engine.execute"}}})
+            );
+        }
+        assert_eq!(own.load(std::sync::atomic::Ordering::Relaxed), own_active);
+        assert!(app.agent_chat.held.is_empty() && app.control_held.is_empty());
+        assert!(Arc::ptr_eq(&doc, &app.session.doc));
+        assert_eq!(guarded_stop_history(&app), history);
+    }
 }
 
 #[test]

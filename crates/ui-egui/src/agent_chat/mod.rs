@@ -1680,6 +1680,11 @@ pub(crate) fn attach_dropped(app: &mut SolveApp, paths: impl Iterator<Item = std
 /// Stop: ask the agent to stop the message it is on; requests waiting for approval are declined.
 /// Messages queued meanwhile stay queued (they wait for Send).
 pub fn cancel(app: &mut SolveApp) {
+    // Revoke writes before any provider/permission callback, even if it never reports an end.
+    // The terminal event still owns finish_turn and its undo bookkeeping.
+    if let Some(turn) = &app.agent_chat.turn {
+        turn.active.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     app.agent_chat.steering = false;
     app.agent_chat.stopped = true;
     crate::edit_in_place::forget_after_turn(app);
@@ -1770,7 +1775,7 @@ fn on_permission(app: &mut SolveApp, key: u64, title: String, kind: Option<&str>
 fn approve_with(app: &mut SolveApp, id: u64, allow: bool, why: &str) {
     let chat = &mut app.agent_chat;
     let Some(i) = chat.held.iter().position(|h| h.id == id) else { return };
-    let h = chat.held.remove(i);
+    let mut h = chat.held.remove(i);
     for item in &mut chat.items {
         if let Item::Approval { id: x, answer, .. } = item
             && *x == id
@@ -1779,9 +1784,24 @@ fn approve_with(app: &mut SolveApp, id: u64, allow: bool, why: &str) {
         }
     }
     if allow {
-        app.control_held.push_back(h.req);
+        match crate::execution_guard::admit(app, &mut h.req) {
+            Ok(()) => app.control_held.push_back(h.req),
+            Err(error) => {
+                let _ = h.req.reply.send(crate::execution_guard::refusal_json(&error));
+            }
+        }
     } else {
-        let _ = h.req.reply.send(json!({"ok": false, "error": format!("not run: {why}")}));
+        let mut reply = json!({"ok": false, "error": format!("not run: {why}")});
+        // The held request owns its trusted revocation flag. Metadata only selects the carrier;
+        // declining must neither admit the request nor infer authority from why/the current turn.
+        if crate::control::chat_turn_cancelled(h.req.chat_turn.as_deref())
+            && let Some(details) =
+                crate::control::cancelled_request_response(&h.req.method, &h.req.params, h.req.guarded.is_some()).get("errorDetails")
+        {
+            reply["errorDetails"] = details.clone();
+            reply["errorDetails"]["message"] = reply["error"].clone();
+        }
+        let _ = h.req.reply.send(reply);
     }
 }
 
@@ -1919,7 +1939,12 @@ fn pump_tools(app: &mut SolveApp) {
                     }
                     turn.changes += 1;
                 }
-                app.control_held.push_back(req);
+                match crate::execution_guard::admit(app, &mut req) {
+                    Ok(()) => app.control_held.push_back(req),
+                    Err(error) => {
+                        let _ = req.reply.send(crate::execution_guard::refusal_json(&error));
+                    }
+                }
             }
             gate::Verdict::Ask(title) => {
                 let chat = &mut app.agent_chat;
